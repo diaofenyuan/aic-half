@@ -1,0 +1,10 @@
+data/
+outputs/
+tmp/*
+!tmp/.gitkeep
+models/
+__pycache__/
+*.pyc
+.venv/
+.idea/
+.pytest_cache/

@@ -1,0 +1,592 @@
+"""短期 2 小时预测：基线、Direct-H / Global-H LightGBM、折内选模与融合。
+
+短期与长期各自训练、各自选参；本文件只提供无状态的拟合/设计工具供 main_l
+复用，不共享任何已训练模型。
+"""
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+
+import lightgbm as lgb
+import main_nn
+import numpy as np
+import pandas as pd
+
+import config as C
+from data_cleaning import (PreparedData, build_base_features, fuel_level_ratio,
+                           last_valid_level, target_calendar,
+                           target_slot_profile)
+
+
+# ---------------------------------------------------------------------------
+# 通用工具（main_l 复用）
+# ---------------------------------------------------------------------------
+def _mape_weights(y: np.ndarray, weights: np.ndarray | None) -> np.ndarray:
+    """把训练权重对齐 1-MAPE：小负荷样本误差占比大，应放大其权重。"""
+    power = float(C.SAMPLE_WEIGHT_POWER or 0.0)
+    base = np.ones(len(y), dtype=np.float32) if weights is None else weights.astype(np.float32)
+    if power <= 0.0:
+        return base
+    scale = 1.0 / np.power(np.maximum(np.abs(y), 1.0), power)
+    scale = scale / max(float(np.mean(scale)), 1e-9)
+    return (base * scale).astype(np.float32)
+
+
+def fit_booster(X: np.ndarray, y: np.ndarray, feature_names: list[str],
+                params: dict, num_round: int, weights: np.ndarray | None = None) -> lgb.Booster:
+    weights = _mape_weights(y, weights)
+    dataset = lgb.Dataset(X, label=y, weight=weights, feature_name=feature_names,
+                          free_raw_data=True)
+    return lgb.train(params, dataset, num_boost_round=int(num_round))
+
+
+def training_weights(prepared: PreparedData, positions: np.ndarray,
+                     horizons: np.ndarray, ref_pos: int) -> np.ndarray:
+    """按目标时刻到训练截止点的时间衰减；归一化到均值 1，避免改变梯度尺度。"""
+    if C.DECAY_DAYS is None:
+        return np.ones((len(positions), len(horizons)), dtype=np.float32)
+    positions = np.asarray(positions, dtype=int)
+    horizons = np.asarray(horizons, dtype=int)
+    age_days = (ref_pos - (positions[:, None] + horizons[None, :])) / C.STEPS_PER_DAY
+    weights = np.power(0.5, np.maximum(age_days, 0.0) / float(C.DECAY_DAYS))
+    return (weights / max(float(np.mean(weights)), 1e-9)).astype(np.float32)
+
+
+def design_inputs(prepared: PreparedData, base: pd.DataFrame,
+                  positions: np.ndarray, horizons: tuple[int, ...],
+                  features: str) -> tuple[dict[str, np.ndarray], list[str]]:
+    """构造与提前量相关的目标时刻日历、画像特征。"""
+    extras = target_calendar(prepared, positions, horizons)
+    ratio = fuel_level_ratio(prepared, positions)
+    extras["fuel_profile_ratio"] = np.repeat(ratio[:, None], len(horizons), axis=1)
+    # 同槽位画像与最近可见水平都来自起报点之前的历史，部署时同样可得；
+    # 它们不是未来真值，放入所有特征集可避免树模型只靠当前气量外推。
+    for target in C.TARGETS:
+        extras[f"profile_{target}"] = target_slot_profile(
+            prepared, positions, horizons, target)
+    names = list(base.columns) + list(extras.keys()) + ["h"]
+    return extras, names
+
+
+def _block(base_values: np.ndarray, positions: np.ndarray, extras: dict,
+           extra_names: list[str], h: int, j: int) -> np.ndarray:
+    parts = [base_values[positions]]
+    for name in extra_names:
+        parts.append(extras[name][:, j][:, None])
+    parts.append(np.full((len(positions), 1), float(h), dtype=np.float32))
+    return np.hstack(parts).astype(np.float32)
+
+
+def build_training_block(prepared: PreparedData, base: pd.DataFrame,
+                         base_values: np.ndarray, extras: dict, extra_names: list[str],
+                         positions: np.ndarray, horizons: tuple[int, ...], j: int,
+                         target: str, weights: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    h = int(horizons[j])
+    X = _block(base_values, positions, extras, extra_names, h, j)
+    y = prepared.labels[target].to_numpy(dtype=float)[positions + h]
+    valid = np.isfinite(y)
+    if not valid.all():
+        X = X[valid]
+        y = y[valid]
+        weights = weights[:, j][valid]
+    return X, y, weights
+
+
+def stack_training(prepared: PreparedData, base_values: np.ndarray, extras: dict,
+                   extra_names: list[str], positions: np.ndarray,
+                   horizons: tuple[int, ...], target: str,
+                   weights: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n = len(positions)
+    width = base_values.shape[1] + len(extra_names) + 1
+    X = np.empty((n * len(horizons), width), dtype=np.float32)
+    y = np.empty(n * len(horizons), dtype=np.float64)
+    w = np.empty(n * len(horizons), dtype=np.float32)
+    for j, h in enumerate(horizons):
+        lo, hi = j * n, (j + 1) * n
+        X[lo:hi] = _block(base_values, positions, extras, extra_names, int(h), j)
+        y[lo:hi] = prepared.labels[target].to_numpy(dtype=float)[positions + int(h)]
+        w[lo:hi] = weights[:, j]
+    valid = np.isfinite(y)
+    return X[valid], y[valid], w[valid]
+
+
+def enforce_physics(cube: np.ndarray, fallback: np.ndarray | None = None) -> np.ndarray:
+    """只修正不可能值并保证 all>=g1；不掩盖模型误差。"""
+    cube = np.asarray(cube, dtype=float).copy()
+    if fallback is not None:
+        bad = ~np.isfinite(cube)
+        if bad.any():
+            cube[bad] = fallback[bad]
+    cube[..., 0] = np.clip(cube[..., 0], 0.0, C.CAPACITY["generator_1"])
+    cube[..., 1] = np.clip(cube[..., 1], 0.0, C.CAPACITY["generator_all"])
+    cube[..., 1] = np.maximum(cube[..., 1], cube[..., 0])
+    return cube
+
+
+def score_cell(pred: np.ndarray, truth: np.ndarray, target_idx: int,
+               horizon_indices: list[int]) -> float:
+    actual = truth[:, horizon_indices, target_idx]
+    estimate = pred[:, horizon_indices, target_idx]
+    valid = np.isfinite(actual) & (actual > 0) & np.isfinite(estimate)
+    if not valid.any():
+        return float("nan")
+    relative = np.abs(estimate[valid] - actual[valid]) / actual[valid]
+    return float(100.0 * (1.0 - np.mean(relative)))
+
+
+def score_cube(pred: np.ndarray, truth: np.ndarray,
+               horizons: tuple[int, ...]) -> dict:
+    """按赛题 1-MAPE 口径评分；零负荷真值单列，不参与 MAPE 分母。"""
+    pred = np.asarray(pred, dtype=float)
+    truth = np.asarray(truth, dtype=float)
+    result = {"targets": {}, "per_horizon": {}}
+    target_scores = []
+    for ti, target in enumerate(C.TARGETS):
+        actual = truth[:, :, ti]
+        estimate = pred[:, :, ti]
+        valid = np.isfinite(actual) & (actual > 0) & np.isfinite(estimate)
+        rel = np.abs(estimate - actual) / np.where(actual > 0, actual, np.nan)
+        score = 100.0 * (1.0 - float(np.nanmean(rel)))
+        zero_mask = np.isfinite(actual) & (actual == 0) & np.isfinite(estimate)
+        result["targets"][target] = {
+            "accuracy": score,
+            "mae": float(np.nanmean(np.abs(estimate[valid] - actual[valid]))) if valid.any() else None,
+            "zero_truth": int(zero_mask.sum()),
+            # 零负荷不进 MAPE 分母，但单列绝对误差，避免模型在停机段失控。
+            "zero_load_mae": (float(np.nanmean(np.abs(estimate[zero_mask])))
+                              if zero_mask.any() else None),
+            "valid_points": int(valid.sum()),
+        }
+        target_scores.append(score)
+        result["per_horizon"][target] = {
+            str(h): score_cell(pred, truth, ti, [j]) for j, h in enumerate(horizons)}
+    result["accuracy"] = float(np.mean(target_scores))
+    result["horizons"] = [int(horizons[0]), int(horizons[-1])]
+    return result
+
+
+def truth_cube(prepared: PreparedData, positions: np.ndarray,
+               horizons: tuple[int, ...]) -> np.ndarray:
+    """按目标时刻 t+h 取标签，供 1-MAPE 评价。
+
+    训练堆叠用的是 positions+h 的真值；评分若退回起报点标签会系统性
+    扭曲选模，长周期尤其失真。越界提前量保持 NaN，由 score_cube 排除。
+    """
+    labels = prepared.labels[list(C.TARGETS)].to_numpy(dtype=float)
+    n_pos = len(positions)
+    out = np.full((n_pos, len(horizons), len(C.TARGETS)), np.nan, dtype=float)
+    pos = np.asarray(positions, dtype=np.int64)
+    for j, h in enumerate(horizons):
+        idx = pos + int(h)
+        ok = (idx >= 0) & (idx < len(labels))
+        out[ok, j, :] = labels[idx[ok]]
+    return out
+
+
+def baseline_cubes(prepared: PreparedData, positions: np.ndarray,
+                   horizons: tuple[int, ...]) -> dict[str, np.ndarray]:
+    n, m = len(positions), len(horizons)
+    ratio = fuel_level_ratio(prepared, positions)[:, None]
+    cubes = {"lastvalid": np.empty((n, m, 2)),
+             "profile": np.empty((n, m, 2)),
+             "profile_fuel": np.empty((n, m, 2))}
+    for ti, target in enumerate(C.TARGETS):
+        last = last_valid_level(prepared, positions, target)
+        profile = target_slot_profile(prepared, positions, horizons, target)
+        cubes["lastvalid"][:, :, ti] = np.repeat(last[:, None], m, axis=1)
+        cubes["profile"][:, :, ti] = profile
+        cubes["profile_fuel"][:, :, ti] = profile * ratio
+    for name, cube in cubes.items():
+        cubes[name] = enforce_physics(cube, fallback=cubes["profile_fuel"])
+    return cubes
+
+
+def blend_cube(pred: np.ndarray, profile: np.ndarray, blend: dict,
+               horizons: tuple[int, ...], groups) -> np.ndarray:
+    result = pred.copy()
+    for ti, target in enumerate(C.TARGETS):
+        for gname, lo, hi in groups:
+            w = float(blend.get(target, {}).get(gname, 1.0))
+            indices = [j for j, h in enumerate(horizons) if lo <= h <= hi]
+            result[:, indices, ti] = (w * pred[:, indices, ti]
+                                      + (1.0 - w) * profile[:, indices, ti])
+    return enforce_physics(result, fallback=profile)
+
+
+def select_blend(fold_preds: list[np.ndarray], fold_profiles: list[np.ndarray],
+                 fold_truths: list[np.ndarray], horizons: tuple[int, ...],
+                 groups) -> dict:
+    blend: dict = {target: {} for target in C.TARGETS}
+    grid = C.SELECTION["blend_grid"]
+    for ti, target in enumerate(C.TARGETS):
+        for gname, lo, hi in groups:
+            indices = [j for j, h in enumerate(horizons) if lo <= h <= hi]
+            best = (-np.inf, 1.0)
+            for w in grid:
+                scores = []
+                for pred, profile, truth in zip(fold_preds, fold_profiles, fold_truths):
+                    blended = pred[:, indices, ti] * w + profile[:, indices, ti] * (1.0 - w)
+                    scores.append(score_cell(blended[:, :, None], truth[:, indices, ti][:, :, None],
+                                             0, list(range(len(indices)))))
+                mean = float(np.nanmean(scores))
+                if np.isfinite(mean) and mean > best[0]:
+                    best = (mean, float(w))
+            blend[target][gname] = best[1]
+    return blend
+
+
+def effective_model_name(kind: str, features: str, blend: dict) -> str:
+    """融合权重为 0 时如实报告纯画像基线，不把未部署的树模型写成主模型。"""
+    weights = [w for groups in blend.values() for w in groups.values()]
+    if max(weights, default=0.0) <= 0.0:
+        return "profile_fuel"
+    return f"{kind}/{features}+profile_fuel"
+
+
+# ---------------------------------------------------------------------------
+# 折内训练与评估
+# ---------------------------------------------------------------------------
+SHORT_CANDIDATES = (
+    {"kind": "direct", "features": "gas"},
+    {"kind": "global", "features": "gas"},
+)
+
+
+def _gas_columns(base: pd.DataFrame) -> list[str]:
+    return [c for c in base.columns if not c.startswith(("tgt_", "last_"))]
+
+
+def _feature_columns(base: pd.DataFrame, features: str) -> list[str]:
+    """按特征集取列。
+
+    - gas：纯气侧/工况，最稳。
+    - gaslast：气侧 + last_*（起报点前最后一次可见负荷水平与年龄）。
+      不含 tgt_* 原值——评测窗口内目标被遮挡，原值会变成 NaN，
+      训练/服务不一致，历史上 gaslast 的前身 target 集因此掉到 82 分。
+    - target：全列，仅作对照基线，不参与部署。
+    """
+    cols = list(base.columns)
+    if features == "gas":
+        return _gas_columns(base)
+    if features == "gaslast":
+        return [c for c in cols
+                if not c.startswith("tgt_") or c.endswith(("_last_level", "_age"))]
+    return cols
+
+
+def _groups_for(horizons: tuple[int, ...]):
+    return C.SHORT_GROUPS if max(horizons) <= max(C.HORIZONS_S) else C.LONG_GROUPS
+
+
+def _train_models(prepared: PreparedData, base_all: pd.DataFrame,
+                  positions: np.ndarray, horizons: tuple[int, ...],
+                  kind: str, features: str, num_round: int,
+                  ref_pos: int) -> tuple[dict, list[str]]:
+    columns = _feature_columns(base_all, features)
+    base = base_all[columns]
+    base_values = base.to_numpy(dtype=np.float32)
+    extras, names = design_inputs(prepared, base, positions, horizons, features)
+    extra_names = names[len(columns):-1]
+    weights = training_weights(prepared, positions, horizons, ref_pos)
+    models: dict = {}
+    params = {**C.LGBM_BASE, "num_threads": C.LGBM_BASE["num_threads"]}
+    if kind == "direct":
+        for target in C.TARGETS:
+            for j, h in enumerate(horizons):
+                X, y, w = build_training_block(
+                    prepared, base, base_values, extras, extra_names,
+                    positions, horizons, j, target, weights)
+                models[(target, int(h))] = fit_booster(X, y, names, params, num_round, w)
+    elif kind in ("global", "grouped"):
+        groups = _groups_for(horizons)
+        for target in C.TARGETS:
+            if kind == "global":
+                X, y, w = stack_training(prepared, base_values, extras, extra_names,
+                                         positions, horizons, target, weights)
+                models[target] = fit_booster(X, y, names, params, num_round, w)
+            else:
+                for gname, lo, hi in groups:
+                    subset = tuple(h for h in horizons if lo <= h <= hi)
+                    jidx = [horizons.index(h) for h in subset]
+                    sub_extras = {k: v[:, jidx] for k, v in extras.items()}
+                    X, y, w = stack_training(prepared, base_values, sub_extras, extra_names,
+                                             positions, subset, target, weights[:, jidx])
+                    models[(target, gname)] = fit_booster(X, y, names, params, num_round, w)
+    else:
+        raise ValueError(f"未知模型类型 {kind}")
+    return models, names
+
+
+def _predict_models(prepared: PreparedData, base_all: pd.DataFrame,
+                    positions: np.ndarray, horizons: tuple[int, ...],
+                    kind: str, features: str, models: dict,
+                    feature_names: list[str]) -> np.ndarray:
+    columns = _feature_columns(base_all, features)
+    base = base_all[columns]
+    base_values = base.to_numpy(dtype=np.float32)
+    extras, names = design_inputs(prepared, base, positions, horizons, features)
+    extra_names = names[len(columns):-1]
+    if names != feature_names:
+        raise ValueError("预测特征顺序与训练不一致")
+    out = np.empty((len(positions), len(horizons), 2), dtype=float)
+    if kind == "direct":
+        for ti, target in enumerate(C.TARGETS):
+            for j, h in enumerate(horizons):
+                X = _block(base_values, positions, extras, extra_names, int(h), j)
+                out[:, j, ti] = models[(target, int(h))].predict(X)
+    elif kind == "global":
+        for ti, target in enumerate(C.TARGETS):
+            X = np.empty((len(positions) * len(horizons), len(names)), dtype=np.float32)
+            for j, h in enumerate(horizons):
+                lo = j * len(positions)
+                X[lo:lo + len(positions)] = _block(
+                    base_values, positions, extras, extra_names, int(h), j)
+            out[:, :, ti] = models[target].predict(X).reshape(len(positions), len(horizons))
+    elif kind == "grouped":
+        for ti, target in enumerate(C.TARGETS):
+            for gname, lo_h, hi_h in _groups_for(horizons):
+                subset = [j for j, h in enumerate(horizons) if lo_h <= h <= hi_h]
+                X = np.empty((len(positions) * len(subset), len(names)), dtype=np.float32)
+                for k, j in enumerate(subset):
+                    lo = k * len(positions)
+                    X[lo:lo + len(positions)] = _block(
+                        base_values, positions, extras, extra_names,
+                        int(horizons[j]), j)
+                pred = models[(target, gname)].predict(X).reshape(len(positions), len(subset))
+                for k, j in enumerate(subset):
+                    out[:, j, ti] = pred[:, k]
+    else:
+        raise ValueError(f"未知模型类型 {kind}")
+    return out
+
+
+@dataclass
+class ShortBundle:
+    kind: str
+    features: str
+    horizons: tuple[int, ...]
+    blend: dict
+    models: dict
+    final_models: dict
+    feature_names: list[str]
+    nn_bundle: object | None = None
+    lgb_kind: str | None = None
+    lgb_features: str | None = None
+    selection: dict = field(default_factory=dict)
+    scores: dict = field(default_factory=dict)
+    train_rows: int = 0
+    train_seconds: float = 0.0
+    train_end: str | None = None
+
+
+def _fold_positions(prepared: PreparedData, fold: dict,
+                    hmax: int | None = None) -> tuple[np.ndarray, np.ndarray, int]:
+    start = pd.Timestamp(fold["start"])
+    end = start + pd.Timedelta(days=int(fold["days"])) - pd.Timedelta(minutes=C.STEP_MINUTES)
+    origins = pd.date_range(start, end, freq=f"{C.STEP_MINUTES}min")
+    eval_positions = prepared.index.get_indexer(origins)
+    if (eval_positions < 0).any():
+        missing = int((eval_positions < 0).sum())
+        raise ValueError(f"折 {fold['name']} 有 {missing} 个起报点不在数据网格内")
+    train_end = pd.Timestamp(fold["train_end"])
+    ref_pos = int(prepared.index.get_indexer([train_end])[0])
+    hmax = int(hmax or max(C.HORIZONS_L))
+    limit = ref_pos - hmax
+    positions = np.arange(max(0, C.PROFILE_DAYS * C.STEPS_PER_DAY), max(limit + 1, 0))
+    if len(positions) < 1000:
+        raise ValueError(f"折 {fold['name']} 训练样本不足: {len(positions)}")
+    return positions, eval_positions, ref_pos
+
+
+def train_short(prepared: PreparedData, folds: list[dict], quick: bool = False) -> ShortBundle:
+    tuning = [f for f in folds if f["role"] == "tuning"]
+    if quick:
+        tuning = tuning[:1]
+    stride = 1 if not quick else max(1, C.TRAIN_STRIDE_SHORT)
+    num_round = C.LGBM_TREES_QUICK if quick else C.LGBM_TREES_SHORT
+    started = time.time()
+    fold_cache = []
+    for fold in tuning:
+        masked = prepared.masked_copy(
+            fold["start"],
+            pd.Timestamp(fold["start"]) + pd.Timedelta(days=int(fold["days"])))
+        positions, eval_positions, ref_pos = _fold_positions(masked, fold, max(C.HORIZONS_S))
+        positions = positions[::stride]
+        base_all = build_base_features(masked, include_targets=True)
+        baselines = baseline_cubes(masked, eval_positions, C.HORIZONS_S)
+        fold_cache.append({"fold": fold, "prepared": masked, "base": base_all,
+                           "positions": positions, "eval": eval_positions,
+                           "ref_pos": ref_pos, "baselines": baselines})
+
+    candidates: list[dict] = []
+    rows_trained = 0
+    for cand in SHORT_CANDIDATES:
+        started_cand = time.time()
+        preds, truths = [], []
+        models_store = None
+        names_store = None
+        for item in fold_cache:
+            masked = item["prepared"]
+            models, names = _train_models(
+                masked, item["base"], item["positions"], C.HORIZONS_S,
+                cand["kind"], cand["features"], num_round, item["ref_pos"])
+            pred = _predict_models(masked, item["base"], item["eval"], C.HORIZONS_S,
+                                   cand["kind"], cand["features"], models, names)
+            pred = enforce_physics(pred, fallback=item["baselines"]["profile_fuel"])
+            preds.append(pred)
+            truths.append(truth_cube(masked, item["eval"], C.HORIZONS_S))
+            models_store = models
+            names_store = names
+            rows_trained += int(len(item["positions"]) * len(C.HORIZONS_S))
+        scores = [score_cube(pred, truth, C.HORIZONS_S) for pred, truth in zip(preds, truths)]
+        mean_score = float(np.mean([s["accuracy"] for s in scores]))
+        worst_score = float(min(s["accuracy"] for s in scores))
+        candidates.append({**cand, "preds": preds, "truths": truths,
+                           "scores": scores, "mean": mean_score,
+                           "worst": worst_score, "seconds": time.time() - started_cand})
+        del models_store, names_store
+
+    best_mean = max(c["mean"] for c in candidates)
+    feasible = [c for c in candidates
+                if c["worst"] >= best_mean - C.SELECTION["max_worst_fold_drop_pp"]]
+    chosen = max(feasible or candidates,
+                 key=lambda c: (c["mean"], -len(c["scores"]), c["features"] == "gas"))
+    profiles = [item["baselines"]["profile_fuel"] for item in fold_cache]
+    blend = select_blend(chosen["preds"], profiles, chosen["truths"],
+                         C.HORIZONS_S, C.SHORT_GROUPS)
+    blended_tuning = [blend_cube(p, prof, blend, C.HORIZONS_S, C.SHORT_GROUPS)
+                      for p, prof in zip(chosen["preds"], profiles)]
+    tuning_scores = [score_cube(p, t, C.HORIZONS_S)
+                     for p, t in zip(blended_tuning, chosen["truths"])]
+
+    confirm_fold = next(f for f in folds if f["role"] == "confirm")
+    confirm_masked = prepared.masked_copy(
+        confirm_fold["start"],
+        pd.Timestamp(confirm_fold["start"]) + pd.Timedelta(days=int(confirm_fold["days"])))
+    c_positions, c_eval, c_ref = _fold_positions(
+        confirm_masked, confirm_fold, max(C.HORIZONS_S))
+    is_nn = chosen["kind"] in ("dlinear", "nn_lgb_ens")
+    if is_nn:
+        solo = [{**confirm_fold, "role": "tuning"},
+                {**confirm_fold, "role": "confirm", "name": "val"}]
+        nn_c = main_nn.train_nn(prepared, solo, kind="dlinear",
+                                horizons=C.HORIZONS_S, quick=False)
+        confirm_pred = main_nn.predict_nn(nn_c, confirm_masked,
+                                          confirm_masked.index[c_eval])
+        confirm_models, confirm_names = {}, []
+        if chosen["kind"] == "nn_lgb_ens":
+            c_positions_x, c_eval_x, c_ref_x = _fold_positions(
+                confirm_masked, confirm_fold, max(C.HORIZONS_S))
+            c_base_x = build_base_features(confirm_masked, include_targets=True)
+            ens_models, ens_names = _train_models(
+                confirm_masked, c_base_x, c_positions_x, C.HORIZONS_S,
+                chosen.get("lgb_kind", "direct"), chosen.get("lgb_features", "gas"),
+                num_round, c_ref_x)
+            lgb_pred = _predict_models(
+                confirm_masked, c_base_x, c_eval_x, C.HORIZONS_S,
+                chosen.get("lgb_kind", "direct"), chosen.get("lgb_features", "gas"),
+                ens_models, ens_names)
+            confirm_pred = (confirm_pred + lgb_pred) / 2.0
+            confirm_names = ens_names
+    else:
+        c_positions = c_positions[::stride]
+        c_base = build_base_features(confirm_masked, include_targets=True)
+        confirm_models, confirm_names = _train_models(
+            confirm_masked, c_base, c_positions, C.HORIZONS_S,
+            chosen["kind"], chosen["features"], num_round, c_ref)
+        confirm_pred = _predict_models(
+            confirm_masked, c_base, c_eval, C.HORIZONS_S, chosen["kind"],
+            chosen["features"], confirm_models, confirm_names)
+    confirm_baseline = baseline_cubes(confirm_masked, c_eval, C.HORIZONS_S)
+    confirm_pred = enforce_physics(confirm_pred, fallback=confirm_baseline["profile_fuel"])
+    confirm_pred = blend_cube(confirm_pred, confirm_baseline["profile_fuel"], blend,
+                              C.HORIZONS_S, C.SHORT_GROUPS)
+    confirm_truth = truth_cube(confirm_masked, c_eval, C.HORIZONS_S)
+    confirm_score = score_cube(confirm_pred, confirm_truth, C.HORIZONS_S)
+
+    # 部署模型：用截至数据末尾的全部合法标签训练，供正式推理加载。
+    if is_nn:
+        labels = prepared.labels[list(C.TARGETS)].to_numpy(dtype=float)
+        valid_pos = np.where(np.isfinite(labels).all(axis=1))[0]
+        val_end_pos = int(valid_pos[-1]) - max(C.HORIZONS_S) - 1
+        val_start_pos = max(0, val_end_pos - 2 * C.STEPS_PER_DAY)
+        all_folds = [
+            {"name": "final", "role": "tuning", "start": str(prepared.index[0]),
+             "days": 1, "train_end": str(prepared.index[val_start_pos])},
+            {"name": "final_val", "role": "confirm",
+             "start": str(prepared.index[val_start_pos]), "days": 2,
+             "train_end": str(prepared.index[val_end_pos])},
+        ]
+        nn_final = main_nn.train_nn(prepared, all_folds, kind="dlinear",
+                                    horizons=C.HORIZONS_S, quick=False)
+        final_models, final_names = {}, []
+        if chosen["kind"] == "nn_lgb_ens":
+            fp = np.arange(max(0, C.PROFILE_DAYS * C.STEPS_PER_DAY),
+                           len(prepared.index) - max(C.HORIZONS_S))[::stride]
+            fb = build_base_features(prepared, include_targets=True)
+            final_models, final_names = _train_models(
+                prepared, fb, fp, C.HORIZONS_S,
+                chosen.get("lgb_kind", "direct"), chosen.get("lgb_features", "gas"),
+                num_round, len(prepared.index) - max(C.HORIZONS_S))
+    else:
+        final_positions = np.arange(max(0, C.PROFILE_DAYS * C.STEPS_PER_DAY),
+                                    len(prepared.index) - max(C.HORIZONS_S))
+        final_positions = final_positions[::stride]
+        final_base = build_base_features(prepared, include_targets=True)
+        final_ref = len(prepared.index) - max(C.HORIZONS_S)
+        final_models, final_names = _train_models(
+            prepared, final_base, final_positions, C.HORIZONS_S,
+            chosen["kind"], chosen["features"], num_round, final_ref)
+        if final_names != confirm_names:
+            raise ValueError("最终模型特征与确认模型不一致")
+        nn_final = None
+
+    return ShortBundle(
+        kind=chosen["kind"], features=chosen["features"], horizons=C.HORIZONS_S,
+        blend=blend, models=confirm_models, final_models=final_models,
+        feature_names=confirm_names,
+        nn_bundle=nn_final,
+        lgb_kind=chosen.get("lgb_kind"), lgb_features=chosen.get("lgb_features"),
+        selection={"chosen": {"kind": chosen["kind"], "features": chosen["features"],
+                              "effective": effective_model_name(
+                                  chosen["kind"], chosen["features"], blend)},
+                   "candidates": [{"kind": c["kind"], "features": c["features"],
+                                   "mean_score": c["mean"], "worst_score": c["worst"],
+                                   "scores": c["scores"], "seconds": c["seconds"]}
+                                  for c in candidates],
+                   "tuning_scores": tuning_scores},
+        scores={"tuning_mean": float(np.mean([s["accuracy"] for s in tuning_scores])),
+                "confirm": confirm_score},
+        train_rows=rows_trained, train_seconds=time.time() - started,
+        train_end=confirm_fold["train_end"])
+
+
+def predict_short(bundle: ShortBundle, prepared: PreparedData,
+                  origins: pd.DatetimeIndex, use_final: bool = False) -> np.ndarray:
+    positions = prepared.index.get_indexer(origins)
+    if (positions < 0).any():
+        raise ValueError("起报点不在数据网格内")
+    baselines = baseline_cubes(prepared, positions, C.HORIZONS_S)
+    if bundle.kind in ("dlinear", "nn_lgb_ens") and bundle.nn_bundle is not None:
+        pred = main_nn.predict_nn(bundle.nn_bundle, prepared, origins)
+        if bundle.kind == "nn_lgb_ens" and (bundle.final_models or bundle.models):
+            try:
+                base_all = build_base_features(prepared, include_targets=True)
+                lgb_pred = _predict_models(
+                    prepared, base_all, positions, C.HORIZONS_S,
+                    bundle.lgb_kind or "direct", bundle.lgb_features or "gas",
+                    bundle.final_models if use_final else bundle.models,
+                    bundle.feature_names)
+                pred = (pred + lgb_pred) / 2.0
+            except Exception:
+                pass
+    else:
+        base_all = build_base_features(prepared, include_targets=True)
+        models = bundle.final_models if use_final else bundle.models
+        pred = _predict_models(prepared, base_all, positions, C.HORIZONS_S,
+                               bundle.kind, bundle.features, models,
+                               bundle.feature_names)
+    pred = enforce_physics(pred, fallback=baselines["profile_fuel"])
+    return blend_cube(pred, baselines["profile_fuel"], bundle.blend,
+                      C.HORIZONS_S, C.SHORT_GROUPS)
