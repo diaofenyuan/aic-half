@@ -3,17 +3,23 @@
 ## 运行
 
 ```powershell
-python main.py            # 完整链路（历史 21 天盲测）——须由真人启动
+python main.py            # 完整链路（历史 21 天开发验证）——须由真人启动或明确授权
 python main.py infer      # 半决赛特征窗口干跑——须由真人启动
 python main.py --quick    # 单折开发模式
 python main.py infer --quick
+python main.py run --experiment # 获准后的全量开发实验，写入 tmp/tmp_outputs
+python main.py infer --experiment
 python main.py doctor     # 只读扫描数据目录
 python main.py self-check # 因果清洗与特征自检
 python main.py verify     # 校验最近一次输出
+python main.py verify --run-dir tmp/tmp_outputs/<run_id> # 校验指定实验目录
 ```
 
-全量 `run` / `infer` 训练耗时较长，**必须由真人发起**；Agent 侧只使用
-`--quick` 与诊断命令。详见 `AGENTS.md` §8。
+全量 `run` / `infer` 训练耗时较长，必须由真人发起或明确授权；当前轮已获得
+2026-10-23 全量训练授权。后续任务仍按 `AGENTS.md` §8 判断授权范围。
+
+`--quick` 的完整运行产物写入 `tmp/tmp_outputs/<run_id>/`。开发实验也必须使用
+该目录；`outputs/` 只保留用户明确归档的选定最终运行。
 
 ## 数据
 
@@ -34,14 +40,25 @@ python main.py verify     # 校验最近一次输出
   气柜 15%~90% 安全区（计划再留 5% 裕度）、江苏分时电价。焦炉/转炉没有
   独立柜位，不虚构库存。`availability_mode=point` 为默认确定性方案，
   `robust_low` 为保留的低分位研究模式。
-- 缺少官方 `opt_result.csv` 模板，当前只生成 `模拟评分包_不可提交.zip`。
+- 资源评价将真实零气量的误报计入 WAPE，并报告偏差和 24 小时累计误差。
+  A/B/C 前缀样本外逐气种选择 L1/L2；不在 D 窗口标定分位数或选择控制策略。
+- 连续代理回放比较每日与每小时重排，均从同一初始库存接续。目标时刻观察到
+  资源后才执行降载；代理库存变化计入收益调整。控制策略只在开发折前 48 小时
+  比较并设收益/降载晋级门槛。柜位不作为代理资源模型输入，避免注入历史控制状态。
+  所有执行收益仍是历史耗气包络仿真，不是完整气网或实际生产收益证明。
+- 压缩包统一命名为 `咕咕嘎嘎-半决赛.zip`。当前缺少官方 `opt_result.csv` 模板，
+  产物仍是模拟包，运行摘要标记 `submittable=false`。
 
 ## 输出
 
-`outputs/<run_id>/`：`s_result.csv`、`l_result.csv`、`opt_result.csv`（模拟）、
-`标定/资源标定.json`（模型选择、特征白名单、Top 特征重要性、热值映射）、
-`模拟评分包_不可提交.zip`、`源码/`、`模型/`、`报告/运行结果.json`、
+`outputs/<run_id>/`：`s_result.csv`、`l_result.csv`、`opt_result.csv`（有效模拟解才生成）、
+`咕咕嘎嘎-半决赛.zip`、`源码/`、`模型/`、`报告/运行结果.json`、
 `报告/运行日志.log`。
+
+标定、特征顺序和融合参数合并在 `模型/model_meta.json`，只归档本次实际用于
+预测的确认或最终模型；源码包含 `main_nn.py`。`--quick` 使用 A/B 开发折，NN
+最多 8 轮内部早停试验并按选定轮数重训，优化仅抽取前 2 天，不代表全量结果。
+历史多步错位修复前的分数不作新基线；D 窗口已参与历史开发，不声称独立盲测。
 
 `infer` 在 `data/half_test` 就绪时对准官方评测窗；否则用 `semi_test`
 （2025-10-01～10-10）做提交链路干跑，产物同样标记不可提交。

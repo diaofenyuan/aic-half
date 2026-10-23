@@ -15,6 +15,7 @@ DATA_ROOT = ROOT / "data"
 OUTPUT_ROOT = ROOT / "outputs"
 # 实验/调参/临时模型只允许放 tmp；不得写入 models/ 或正式 outputs 归档。
 TMP_ROOT = ROOT / "tmp"
+EXPERIMENT_OUTPUT_ROOT = TMP_ROOT / "tmp_outputs"
 
 # ---------------------------------------------------------------------------
 # 阶段与文件
@@ -185,9 +186,12 @@ LGBM_TREES_LONG = 450
 LGBM_TREES_QUICK = 180
 TRAIN_STRIDE_SHORT = 1
 TRAIN_STRIDE_LONG = 2
-# s/l 两份宽表独立提交；l_result 的前 8 步与 short 重叠，short 在该带更准，
-# 用 short 覆盖可抬 l 分数。官方未要求两表数值一致，只是都按各自提前量评分。
-LONG_HEAD_FROM_SHORT = True
+QUICK_TRAIN_STRIDE = 8
+NN_CONFIG = {"look_back": 96, "epochs": 80, "quick_epochs": 8,
+             "patience": 12, "quick_patience": 3, "early_stop_days": 7,
+             "batch_size": 64, "quick_batch_size": 256}
+# 默认独立输出；重叠带覆盖只作为在开发折验证过的可选策略，不推断官方要求。
+LONG_HEAD_FROM_SHORT = False
 LONG_GROUPS = (("short", 1, 8), ("medium", 9, 32), ("long", 33, 96))
 SHORT_GROUPS = (("head", 1, 4), ("tail", 5, 8))
 
@@ -235,7 +239,12 @@ OPT_CONFIG = {
     "gas_cap_quantile": 0.995,
     "gas_cap_headroom": 1.10,
     "solver_time_limit_s": 15,
+    "rolling_replan_steps": 4,
+    "rolling_solver_time_limit_s": 1.0,
     "mip_rel_gap": 0.01,
+    "power_tolerance_mw": 1e-4,
+    "gas_tolerance_m3h": 1.0,
+    "holder_tolerance_m3": 1.0,
     "vent_tolerance_m3": 1.0,      # 兼容旧参数；当前用放散罚金替代字典序
     # 官方未给放散罚金。基线 0.5 元/m³ 使高炉气在峰段发电收益仍高于放散，
     # 同时允许谷段把气存入气柜；正式提交前必须按官方口径复核。
@@ -268,8 +277,9 @@ OPT_CONFIG = {
 TEAM_CODE = "AIC-2026-68001720"
 TEAM_NAME = "咕咕嘎嘎"
 TEAM_LEADER = "朱泓宇"
-MOCK_ZIP_NAME = "模拟评分包_不可提交.zip"
-FORMAL_ZIP_NAME = "评分提交包.zip"
+# 包名按队伍约定统一；模拟/正式状态由运行摘要和 submittable 字段表达。
+MOCK_ZIP_NAME = f"{TEAM_NAME}-半决赛.zip"
+FORMAL_ZIP_NAME = MOCK_ZIP_NAME
 REPORT_JSON = "运行结果.json"
 REPORT_LOG = "运行日志.log"
 SOURCE_DIR = "源码"

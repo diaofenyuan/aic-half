@@ -68,7 +68,7 @@ def _future_perturbation_check() -> dict:
     origin = 300
     rng = np.random.default_rng(7)
     perturbed = copy.deepcopy(prepared)
-    future = perturbed.frame.index > prepared.index[origin + 4]
+    future = perturbed.frame.index > prepared.index[origin]
     for col in perturbed.frame.columns:
         values = perturbed.frame.loc[future, col].to_numpy(dtype=float)
         if values.size:
@@ -110,7 +110,7 @@ def _mask_check() -> dict:
     masked = prepared.masked_copy(prepared.index[100], prepared.index[-1])
     cols = [C.TARGET_COLUMN[t] for t in C.TARGETS]
     empty = masked.frame.loc[masked.index >= masked.index[100], cols].isna().all().all()
-    labels_kept = prepared.labels.notna().any().any()
+    labels_kept = prepared.labels.equals(masked.labels)
     return {"passed": bool(empty and labels_kept)}
 
 
@@ -122,7 +122,191 @@ def _profile_causality_check() -> dict:
     future = altered.frame.index > prepared.index[420]
     altered.frame.loc[future, C.TARGET_COLUMN["generator_1"]] = 0.0
     second = target_slot_profile(altered, positions, C.HORIZONS_S, "generator_1")
-    return {"passed": bool(np.allclose(first, second, equal_nan=True))}
+    from main_s import baseline_cubes
+    altered.frame.loc[altered.index[positions], "d_fuel_proxy"] = np.nan
+    baselines = baseline_cubes(altered, positions, C.HORIZONS_S)
+    neutral = (np.isfinite(baselines["profile_fuel"]).all()
+               and np.allclose(baselines["profile"], baselines["profile_fuel"]))
+    return {"passed": bool(np.allclose(first, second, equal_nan=True) and neutral),
+            "missing_fuel_unscaled_profile": bool(neutral)}
+
+
+def _multistep_alignment_check() -> dict:
+    from main_s import (_predict_models, _feature_columns, design_inputs,
+                        build_training_block, training_weights)
+    from main_opt import (_resource_base, _resource_design, ResourceBundle,
+                          forecast_resources, forecast_resources_quantile, _stack)
+
+    class Probe:
+        def predict(self, X):
+            return 100.0 + X[:, 0] / 100000.0 + X[:, -1] * 0.1
+
+    prepared = _synthetic_prepared(480)
+    positions = np.array([240, 300, 383])
+    base = build_base_features(prepared, include_targets=True)
+    checks = []
+    for horizons in (C.HORIZONS_S, C.HORIZONS_L):
+        subset = base[_feature_columns(base, "gas")]
+        extras, names = design_inputs(prepared, subset, positions, horizons, "gas")
+        for kind in ("global", "grouped"):
+            if kind == "global":
+                models = {t: Probe() for t in C.TARGETS}
+            else:
+                groups = C.SHORT_GROUPS if len(horizons) == 8 else C.LONG_GROUPS
+                models = {(t, g[0]): Probe() for t in C.TARGETS for g in groups}
+            bulk = _predict_models(prepared, base, positions, horizons, kind, "gas", models, names)
+            single = np.concatenate([_predict_models(prepared, base, np.array([p]), horizons,
+                                                     kind, "gas", models, names) for p in positions])
+            checks.append(np.allclose(bulk, single))
+        weights = training_weights(prepared, positions, np.asarray(horizons), 479)
+        X, y, w = build_training_block(prepared, subset, subset.to_numpy(), extras,
+                                       list(extras), positions, horizons, 0, C.TARGETS[0], weights)
+        checks.append(w.ndim == 1 and np.array_equal(w, weights[:, 0]))
+    rb = _resource_base(prepared)
+    _, names = _resource_design(prepared, rb, positions, C.HORIZONS_L)
+    pool = {g: Probe() for g in C.RESOURCE_NAMES}
+    bundle = ResourceBundle(pool, pool, names, quantile_models={"p10": pool})
+    for forecast in (lambda o: forecast_resources(bundle, prepared, o),
+                     lambda o: forecast_resources_quantile(bundle, prepared, o, "p10")):
+        bulk = forecast(prepared.index[positions])
+        single = np.concatenate([forecast(prepared.index[[p]]) for p in positions])
+        checks.append(np.allclose(bulk, single))
+    series = np.arange(480, dtype=float)
+    series[102] = np.nan
+    X, y, w = _stack(prepared, np.arange(480)[:, None], {}, [], np.array([100, 200]),
+                     (1, 2, 3), series, np.array([[10, 11, 12], [20, 21, 22]]))
+    checks.append(y.tolist() == [101, 201, 202, 103, 203]
+                  and w.tolist() == [10, 20, 21, 12, 22])
+    return {"passed": bool(all(checks)), "checks": len(checks)}
+
+
+def _nn_contract_check() -> dict:
+    import main_nn
+    from unittest.mock import patch
+
+    prepared = _synthetic_prepared(480)
+    # 极小前缀一轮训练用于核对截止点隔离，不跑历史全量 NN。
+    fold = [{"role": "tuning", "train_end": str(prepared.index[299])}]
+    with patch.dict(C.NN_CONFIG, {"look_back": 8, "early_stop_days": 2,
+                                  "quick_epochs": 1, "quick_patience": 1}), patch.object(C, "PROFILE_DAYS", 0):
+        first = main_nn.train_nn(prepared, fold, horizons=(1, 2), quick=True)
+        altered = copy.deepcopy(prepared)
+        altered.labels.iloc[300:] = 100000.0
+        altered.frame.iloc[300:] = 100000.0
+        second = main_nn.train_nn(altered, fold, horizons=(1, 2), quick=True)
+    same = all(np.array_equal(first.state_dict[k].numpy(), second.state_dict[k].numpy())
+               for k in first.state_dict)
+    origins = prepared.index[[300, 479]]
+    bulk = main_nn.predict_nn(first, prepared, origins)
+    singles = np.concatenate([main_nn.predict_nn(first, prepared, origins[[i]]) for i in range(2)])
+    return {"passed": bool(same and np.isfinite(bulk).all() and np.allclose(bulk, singles, atol=1e-5)),
+            "prefix_model_unchanged": bool(same), "tail_shape": list(bulk.shape)}
+
+
+def _model_role_check() -> dict:
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import main_nn
+    from main_s import ShortBundle, predict_short
+    from main_l import LongBundle, predict_long
+
+    prepared = _synthetic_prepared(480)
+    checks = []
+    for cls, forecast, horizons, groups in ((ShortBundle, predict_short, C.HORIZONS_S, C.SHORT_GROUPS),
+                                            (LongBundle, predict_long, C.HORIZONS_L, C.LONG_GROUPS)):
+        bundle = cls(kind="dlinear", features="nn", horizons=horizons,
+                     blend={t: {g[0]: 1.0 for g in groups} for t in C.TARGETS},
+                     models={}, final_models={}, feature_names=[],
+                     nn_bundle=SimpleNamespace(value=100), final_nn_bundle=SimpleNamespace(value=120))
+        with patch.object(main_nn, "predict_nn", side_effect=lambda b, p, o: np.full((len(o), len(horizons), 2), b.value)):
+            checks.append(np.all(forecast(bundle, prepared, prepared.index[[300]]) == 100))
+            checks.append(np.all(forecast(bundle, prepared, prepared.index[[300]], use_final=True) == 120))
+    return {"passed": bool(all(checks))}
+
+
+def _optimizer_contract_check() -> dict:
+    from main_opt import (_fallback_day, _solve_day, _gas_caps, _price_vector, validate_day,
+                          _execute_proxy_step, score_resources)
+    prepared = _synthetic_prepared(480)
+    prepared.frame[C.GAS_HOLDER["column"]] = prepared.frame["d_holder_level"]
+    heat = {"coefficients_mw_per_m3h": {"blast": 0.000346, "coke": 0.0019, "converter": 0.00059}}
+    caps = np.array([1e6, 1e5, 1e5])
+    zero = np.zeros((4, 3))
+    fallback = _fallback_day(prepared, 300, zero, caps, heat,
+                             holder0=100000.0, initial_power=np.zeros(6))
+    supply = np.tile([8e5, 3e4, 7e4], (4, 1))
+    result = _solve_day(supply, np.array([0.2, 0.2, 1., 1.]), 100000., np.zeros(6), caps, heat)
+    feasible = result.get("validation", {}).get("passed", False)
+    tampered = copy.deepcopy(result)
+    if feasible:
+        tampered["power"] += 10
+    detected = feasible and not validate_day(tampered, supply, 100000., np.zeros(6), caps, heat)["passed"]
+    frozen = _gas_caps(prepared, 300)
+    prepared.frame.loc[prepared.index[301]:, "d_use_blast"] = 1e12
+    prefix = frozen == _gas_caps(prepared, 300)
+    price = _price_vector({9: np.ones(96), 10: np.full(96, 2.)}, pd.Timestamp("2025-09-30 23:45"), 2)
+    curtailed = _execute_proxy_step(np.full(6, 50.), np.array([8e5, 3e4, 7e4]),
+                                    np.zeros(3), 30000., np.zeros(6), caps, heat)
+    resource_truth = np.zeros((1, 96, 3))
+    resource_truth[:, 48:, :] = 10
+    scores = score_resources(np.full_like(resource_truth, 10), resource_truth)
+    zero_counted = all(abs(m["wape"] - 1.) < 1e-9 and m["zero_fraction"] == .5
+                       for m in scores.values())
+    rng = np.random.default_rng(41)
+    level, previous = 100000., np.zeros(6)
+    for _ in range(1200):
+        executed = _execute_proxy_step(np.array([50., 50., 50., 50., 100., 100.]),
+            np.array([8e5, 3e4, 7e4]), rng.random(3) * [8e5, 3e4, 7e4],
+            level, previous, caps, heat)
+        level, previous = executed["holder"], executed["power"]
+    stress_passed = 30000. <= level <= 180000.
+    return {"passed": bool(fallback["status"] == "FALLBACK_SAFE"
+                            and np.all(fallback["power"] == 0) and detected and prefix
+                            and np.all(curtailed["power"] == 0) and curtailed["holder"] == 30000.
+                            and zero_counted
+                            and stress_passed
+                            and price.tolist() == [1.0, 2.0]),
+            "solver_status": result["status"], "tamper_detected": bool(detected),
+            "continuous_resource_shock_steps": 1200,
+            "zero_resource_curtailment": True, "resource_zeros_counted": bool(zero_counted)}
+
+
+def _rolling_causality_check() -> dict:
+    from unittest.mock import patch
+    import main_opt
+    prepared = _synthetic_prepared(480)
+    prepared.frame[C.GAS_HOLDER["column"]] = 100000.
+    heat = {"ok": True, "coefficients_mw_per_m3h": {"blast": .000346, "coke": .0019, "converter": .00059}}
+    caps = {"blast": 1e6, "coke": 1e5, "converter": 1e5}
+    bundle = main_opt.ResourceBundle({}, {}, [], heat_rate=heat, gas_caps=caps,
+                                     dispatch_selection={"chosen": "rolling_proxy"})
+    origins = prepared.index[300:308]
+    forecast = np.tile([8e5, 3e4, 7e4], (len(origins), 96, 1))
+    observed_states = []
+
+    def solve(avail, price, holder, previous, limits, mapping, cfg):
+        observed_states.append(holder)
+        return main_opt._fallback_day(prepared, 300, avail, limits, mapping, cfg,
+                                       holder0=holder, initial_power=previous)
+
+    def run(data):
+        return main_opt.optimize(forecast, data, origins, np.zeros((len(origins), 96, 2)), bundle)
+
+    with patch.object(main_opt, "load_prices", return_value={1: np.ones(96)}), patch.object(main_opt, "_solve_day", side_effect=solve):
+        original = run(prepared)
+        changed_holder = copy.deepcopy(prepared)
+        changed_holder.frame.loc[origins[0] + pd.Timedelta(minutes=15):, C.GAS_HOLDER["column"]] = 170000.
+        same_holder = run(changed_holder)
+        changed_future = copy.deepcopy(prepared)
+        changed_future.frame.loc[origins[0] + pd.Timedelta(minutes=15):,
+                                 ["d_use_blast", "d_use_coke", "d_use_converter"]] = 0.
+        same_first_commit = run(changed_future)
+    holder_not_injected = original["schedule"].equals(same_holder["schedule"])
+    no_oracle = original["schedule"].iloc[:4].equals(same_first_commit["schedule"].iloc[:4])
+    continuous = bool(len(observed_states) == 6 and observed_states[1] != 100000.)
+    return {"passed": bool(holder_not_injected and no_oracle and continuous),
+            "historical_holder_not_injected": holder_not_injected,
+            "first_commit_future_independent": no_oracle, "continuous_state": continuous}
 
 
 def run_self_checks(config=C) -> dict:
@@ -132,6 +316,11 @@ def run_self_checks(config=C) -> dict:
         "zero_preservation": _zero_preservation_check(),
         "target_mask": _mask_check(),
         "profile_causality": _profile_causality_check(),
+        "multistep_alignment": _multistep_alignment_check(),
+        "nn_prefix_and_tail": _nn_contract_check(),
+        "model_roles": _model_role_check(),
+        "optimizer_contract": _optimizer_contract_check(),
+        "rolling_causality": _rolling_causality_check(),
     }
     checks["passed"] = all(v.get("passed", False) for v in checks.values())
     return checks

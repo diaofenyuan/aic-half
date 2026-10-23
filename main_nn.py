@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 import time
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,7 +22,6 @@ import torch.nn as nn
 
 import config as C
 from data_cleaning import PreparedData, build_base_features
-from main_s import _feature_columns, score_cube, truth_cube, enforce_physics
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -53,7 +53,8 @@ class NNTensor:
 def _normalize_fit(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     mean = np.nanmean(values, axis=0)
     std = np.nanstd(values, axis=0)
-    std = np.where(std < 1e-8, 1.0, std)
+    mean = np.where(np.isfinite(mean), mean, 0.0)
+    std = np.where(np.isfinite(std) & (std >= 1e-8), std, 1.0)
     return mean.astype(np.float32), std.astype(np.float32)
 
 
@@ -61,13 +62,18 @@ def build_nn_dataset(prepared: PreparedData, positions: np.ndarray,
                      horizons: tuple[int, ...], look_back: int,
                      mean: np.ndarray | None = None,
                      std: np.ndarray | None = None,
-                     require_target: bool = True) -> NNTensor:
+                      require_target: bool = True,
+                      feature_names: list[str] | None = None) -> NNTensor:
     """把起报点转成滑窗样本；mean/std 不传则用本集合统计（仅训练时合法）。
 
     require_target=False 用于推理：目标可为 NaN，Y 用 0 占位，只取 X。
     """
+    from main_s import _feature_columns
+
     base = build_base_features(prepared, include_targets=True)
     cols = _feature_columns(base, "gas")
+    if feature_names and cols != feature_names:
+        raise ValueError("NN 特征列顺序与训练不一致")
     values = base[cols].to_numpy(dtype=np.float32)
     labels = prepared.labels[list(C.TARGETS)].to_numpy(dtype=float)
 
@@ -77,13 +83,15 @@ def build_nn_dataset(prepared: PreparedData, positions: np.ndarray,
     pos_list, xs, ys = [], [], []
     for p in positions:
         p = int(p)
-        if p - look_back + 1 < 0 or p + h_max >= len(labels):
+        if p - look_back + 1 < 0 or p >= len(values):
+            continue
+        if require_target and p + h_max >= len(labels):
             continue
         window = values[p - look_back + 1: p + 1]
-        target = labels[p + np.asarray(horizons, dtype=int)]
-        if not np.isfinite(window).all():
-            # 窗口内 NaN 用列均值临时填；正式归一化后再填一次。
-            window = np.nan_to_num(window, nan=0.0)
+        target = (labels[p + np.asarray(horizons, dtype=int)] if require_target
+                  else np.zeros((len(horizons), len(C.TARGETS)), dtype=float))
+        # 缺失值在标准化后填零，即训练均值；避免先补原始零污染均值和方差。
+        window = np.where(np.isfinite(window), window, np.nan)
         if require_target and not np.isfinite(target).all():
             continue
         if not require_target:
@@ -222,6 +230,8 @@ class NNBundle:
     scores: dict = field(default_factory=dict)
     train_seconds: float = 0.0
     train_rows: int = 0
+    train_end: str | None = None
+    feature_names: list[str] = field(default_factory=list)
 
 
 def _mape_l1_loss(pred: torch.Tensor, target: torch.Tensor,
@@ -237,120 +247,116 @@ def _mape_l1_loss(pred: torch.Tensor, target: torch.Tensor,
 def train_nn(prepared: PreparedData, folds: list[dict], kind: str = "dlinear",
              horizons: tuple[int, ...] | None = None, quick: bool = False,
              n_seeds: int = 1) -> NNBundle:
+    """单个训练截止点拟合：前缀内早停选轮数，再按固定轮数重训合法前缀。"""
     horizons = tuple(horizons or C.HORIZONS_L)
-    look_back = 96
-    epochs = 40 if quick else 80
-    lr = 1e-3
-    batch = 64 if not quick else 256
+    cfg = C.NN_CONFIG
+    look_back = int(cfg["look_back"])
+    epochs = int(cfg["quick_epochs"] if quick else cfg["epochs"])
+    patience = int(cfg["quick_patience"] if quick else cfg["patience"])
+    batch = int(cfg["quick_batch_size"] if quick else cfg["batch_size"])
+    stride = C.QUICK_TRAIN_STRIDE if quick else 1
     started = time.time()
-
     tuning = [f for f in folds if f["role"] == "tuning"]
-    confirm = next(f for f in folds if f["role"] == "confirm")
+    if len(tuning) != 1:
+        raise ValueError("NN 每次仅拟合一个训练截止点，跨折评估由调用方组织")
+    cutoff = int(prepared.index.get_indexer([pd.Timestamp(tuning[0]["train_end"])])[0])
+    logger = logging.getLogger("aic-half")
+    logger.info("NN %s 开始，截止=%s，预算=%d轮，设备=%s", kind,
+                tuning[0]["train_end"], epochs, DEVICE)
+    if cutoff < 0:
+        raise ValueError("NN 训练截止点不在数据网格")
+    hmax = max(horizons)
+    first = max(look_back - 1, C.PROFILE_DAYS * C.STEPS_PER_DAY)
+    val_start = cutoff - int(cfg["early_stop_days"] * C.STEPS_PER_DAY) + 1
+    train_pos = np.arange(first, val_start - hmax, stride)
+    val_pos = np.arange(max(first, val_start), cutoff - hmax + 1, stride)
+    if not len(train_pos) or not len(val_pos):
+        raise ValueError("NN 训练前缀不足以构造带目标间隔的内部早停集")
+    ds = build_nn_dataset(prepared, train_pos, horizons, look_back)
+    val_ds = build_nn_dataset(prepared, val_pos, horizons, look_back,
+                              ds.feat_mean, ds.feat_std)
+    n_feat = ds.X.shape[-1]
 
-    # 用第一折训练段拟合归一化
-    f0 = tuning[0]
-    train_end = int(prepared.index.get_indexer([pd.Timestamp(f0["train_end"])])[0])
-    train_pos = np.arange(max(0, C.PROFILE_DAYS * C.STEPS_PER_DAY),
-                          max(train_end - max(horizons), 0))
-    if quick:
-        train_pos = train_pos[::8]
-    ds0 = build_nn_dataset(prepared, train_pos, horizons, look_back)
-    mean, std = ds0.feat_mean, ds0.feat_std
-
-    datasets = []
-    for fold in tuning:
-        end = int(prepared.index.get_indexer([pd.Timestamp(fold["train_end"])])[0])
-        pos = np.arange(max(0, C.PROFILE_DAYS * C.STEPS_PER_DAY),
-                        max(end - max(horizons), 0))
-        if quick:
-            pos = pos[::8]
-        datasets.append(build_nn_dataset(prepared, pos, horizons, look_back, mean, std))
-
-    # 验证集：确认折起报点（仅用于早停参考，不参与调参决策）
-    c_start = pd.Timestamp(confirm["start"])
-    c_end = c_start + pd.Timedelta(days=int(confirm["days"]))
-    c_origins = pd.date_range(c_start,
-                              c_end - pd.Timedelta(minutes=C.STEP_MINUTES),
-                              freq=f"{C.STEP_MINUTES}min")
-    c_pos = prepared.index.get_indexer(c_origins)
-    c_pos = c_pos[c_pos >= 0]
-    if quick:
-        c_pos = c_pos[::8]
-    val_ds = build_nn_dataset(prepared, c_pos, horizons, look_back, mean, std)
-
-    n_feat = ds0.X.shape[-1]
-
-    def to_t(arr: np.ndarray) -> torch.Tensor:
-        return torch.from_numpy(arr).to(DEVICE)
-
-    def train_one(seed: int) -> dict:
+    def make_model(seed):
         torch.manual_seed(seed)
-        np.random.seed(seed % (2 ** 31 - 1))
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
-        model = MODEL_ZOO[kind](look_back, len(horizons), n_feat).to(DEVICE)
-        opt = torch.optim.Adam(model.parameters(), lr=lr)
-        best_val = math.inf
-        best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-        patience, bad = 20, 0
+        return MODEL_ZOO[kind](look_back, len(horizons), n_feat).to(DEVICE)
+
+    def epoch_fit(model, opt, X, Y):
+        model.train()
+        perm = torch.randperm(len(X), device=DEVICE)
+        for i in range(0, len(X), batch):
+            idx = perm[i:i + batch]
+            loss = _mape_l1_loss(model(X[idx]), Y[idx], horizons)
+            if not torch.isfinite(loss):
+                raise ValueError("NN 训练损失出现非有限值")
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+
+    X = torch.from_numpy(ds.X).to(DEVICE)
+    Y = torch.from_numpy(ds.Y).to(DEVICE)
+    VX = torch.from_numpy(val_ds.X).to(DEVICE)
+    VY = torch.from_numpy(val_ds.Y).to(DEVICE)
+    seeds = [20261021 + i for i in range(max(1, n_seeds))]
+    selected_epochs, val_losses = [], []
+    for seed in seeds:
+        model = make_model(seed)
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+        best, best_epoch, bad = math.inf, 1, 0
         for epoch in range(epochs):
-            model.train()
-            for ds in datasets:
-                X, Y = to_t(ds.X), to_t(ds.Y)
-                perm = torch.randperm(len(X), device=DEVICE)
-                for i in range(0, len(X), batch):
-                    idx = perm[i:i + batch]
-                    pred = model(X[idx])
-                    loss = _mape_l1_loss(pred, Y[idx], horizons)
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
+            epoch_fit(model, opt, X, Y)
             model.eval()
+            total = 0.0
             with torch.no_grad():
-                val_loss = _mape_l1_loss(model(to_t(val_ds.X)), to_t(val_ds.Y), horizons)
-            v = float(val_loss)
-            if v < best_val - 1e-5:
-                best_val = v
-                best_state = {k: t.detach().clone() for k, t in model.state_dict().items()}
-                bad = 0
+                for i in range(0, len(VX), batch):
+                    loss = _mape_l1_loss(model(VX[i:i + batch]), VY[i:i + batch], horizons)
+                    total += float(loss) * len(VX[i:i + batch])
+            value = total / len(VX)
+            if not math.isfinite(value):
+                raise ValueError("NN 内部早停损失出现非有限值")
+            if value < best - 1e-5:
+                best, best_epoch, bad = value, epoch + 1, 0
             else:
                 bad += 1
                 if bad >= patience:
                     break
-        model.load_state_dict(best_state)
-        return {k: v.cpu() for k, v in best_state.items()}
+        selected_epochs.append(best_epoch)
+        val_losses.append(best)
+        logger.info("NN %s 内部早停完成: seed=%d, 选定%d轮, loss=%.5f", kind, seed, best_epoch, best)
+    del X, Y, VX, VY, model, opt
 
-    seeds = [20261021 + i for i in range(max(1, n_seeds))]
-    seed_states = [train_one(s) for s in seeds]
-    rows = sum(len(ds.X) for ds in datasets)
-
-    # 确认折评分（只作记录）：多种子预测平均
-    def predict_states(states, X):
-        acc = None
-        for st in states:
-            m = MODEL_ZOO[kind](look_back, len(horizons), n_feat).to(DEVICE)
-            m.load_state_dict({k: v.to(DEVICE) for k, v in st.items()})
-            m.eval()
-            with torch.no_grad():
-                pr = m(to_t(X)).cpu().numpy()
-            acc = pr if acc is None else acc + pr
-        return acc / len(states)
-
-    pred = predict_states(seed_states, val_ds.X)
-    pred = enforce_physics(pred, fallback=None)
-    sc = score_cube(pred, val_ds.Y, horizons)
+    # 只按已冻结轮数拟合，确认窗口既不参与梯度，也不参与早停或归一化。
+    full_pos = np.arange(first, cutoff - hmax + 1, stride)
+    full_ds = build_nn_dataset(prepared, full_pos, horizons, look_back)
+    X = torch.from_numpy(full_ds.X).to(DEVICE)
+    Y = torch.from_numpy(full_ds.Y).to(DEVICE)
+    states = []
+    for seed, rounds in zip(seeds, selected_epochs):
+        model = make_model(seed)
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+        for _ in range(rounds):
+            epoch_fit(model, opt, X, Y)
+        states.append({k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
+    from main_s import _feature_columns
+    names = _feature_columns(build_base_features(prepared, include_targets=True), "gas")
     return NNBundle(kind=kind, look_back=look_back, horizons=horizons,
-                    feat_mean=mean, feat_std=std,
-                    state_dict=seed_states[0],
-                    seed_states=seed_states,
-                    scores={"confirm": sc},
-                    train_seconds=time.time() - started,
-                    train_rows=rows)
+                    feat_mean=full_ds.feat_mean, feat_std=full_ds.feat_std,
+                    state_dict=states[0], seed_states=states,
+                    scores={"early_stop": {"origin_start": str(prepared.index[val_pos[0]]),
+                                           "max_target_time": str(prepared.index[cutoff]),
+                                           "epochs": selected_epochs, "loss": val_losses}},
+                    train_seconds=time.time() - started, train_rows=len(full_ds.positions),
+                    train_end=str(prepared.index[cutoff]), feature_names=names)
 
 
 def predict_nn(bundle: NNBundle, prepared: PreparedData,
                origins: pd.DatetimeIndex) -> np.ndarray:
     """输出 (n_origins, n_horizons, 2)；越界起报点自动跳过并回退 profile。"""
+    from main_s import enforce_physics
+
     positions = prepared.index.get_indexer(origins)
     n, m = len(origins), len(bundle.horizons)
     out = np.full((n, m, 2), np.nan, dtype=float)
@@ -359,7 +365,7 @@ def predict_nn(bundle: NNBundle, prepared: PreparedData,
         return out
     ds = build_nn_dataset(prepared, positions[valid_mask], bundle.horizons,
                           bundle.look_back, bundle.feat_mean, bundle.feat_std,
-                          require_target=False)
+                          require_target=False, feature_names=bundle.feature_names)
     n_feat = ds.X.shape[-1]
     states = bundle.seed_states or [bundle.state_dict]
     pred = None
@@ -372,7 +378,11 @@ def predict_nn(bundle: NNBundle, prepared: PreparedData,
         pred = pr if pred is None else pred + pr
     pred = pred / len(states)
     pred = enforce_physics(pred, fallback=None)
-    out[valid_mask] = pred
+    # 按实际保留位置回填，不能假设张量构造永远保留所有候选行。
+    slots = {int(p): row for row, p in enumerate(ds.positions)}
+    for row, p in enumerate(positions):
+        if int(p) in slots:
+            out[row] = pred[slots[int(p)]]
     return out
 
 
@@ -386,6 +396,20 @@ def save_nn(bundle: NNBundle, directory: Path) -> str:
         "feat_mean": bundle.feat_mean,
         "feat_std": bundle.feat_std,
         "state_dict": bundle.state_dict,
+        "seed_states": bundle.seed_states,
         "scores": bundle.scores,
+        "train_end": bundle.train_end,
+        "feature_names": bundle.feature_names,
     }, path)
     return str(path)
+
+
+def load_nn(path: Path) -> NNBundle:
+    """仅重载本工程保存的本地权重，CPU 端可复验实际多种子预测。"""
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    return NNBundle(kind=payload["kind"], look_back=payload["look_back"],
+                    horizons=tuple(payload["horizons"]),
+                    feat_mean=payload["feat_mean"], feat_std=payload["feat_std"],
+                    state_dict=payload["state_dict"], seed_states=payload.get("seed_states", []),
+                    scores=payload.get("scores", {}), train_end=payload.get("train_end"),
+                    feature_names=payload.get("feature_names", []))

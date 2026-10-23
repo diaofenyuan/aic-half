@@ -42,9 +42,13 @@ def _setup_logger(log_path: Path | None = None) -> None:
         LOGGER.addHandler(file_handler)
 
 
-def build_folds(prepared, config=C) -> list[dict]:
+def build_folds(prepared, config=C, quick: bool = False) -> list[dict]:
     folds = []
-    for spec in config.FOLDS:
+    specs = config.FOLDS
+    if quick:
+        # 开发反复运行只使用 A/B，不能把 D 冻结窗口当成日常调参反馈。
+        specs = (config.FOLDS[0], {**config.FOLDS[1], "role": "confirm"})
+    for spec in specs:
         start = pd.Timestamp(spec["start"])
         end = start + pd.Timedelta(days=int(spec["days"])) - pd.Timedelta(minutes=config.STEP_MINUTES)
         origins = pd.date_range(start, end, freq=f"{config.STEP_MINUTES}min")
@@ -111,25 +115,46 @@ def run_self_check() -> int:
     return 0 if checks.get("passed") else 1
 
 
-def run_verify() -> int:
+def run_verify(directory: Path | None = None) -> int:
     _setup_logger()
-    candidates = sorted(C.OUTPUT_ROOT.glob("*"))
-    if not candidates:
-        print("没有输出目录")
-        return 1
-    directory = candidates[-1]
+    from zipfile import ZipFile
+    if directory is None:
+        candidates = sorted(p for p in C.OUTPUT_ROOT.glob("*") if p.is_dir() and not p.name.startswith("_"))
+        if not candidates:
+            print("没有选定运行目录；实验结果请使用 verify --run-dir 指定")
+            return 1
+        directory = candidates[-1]
+    directory = Path(directory)
     problems = []
-    for name in ("s_result.csv", "l_result.csv"):
+    for name in ("s_result.csv", "l_result.csv", "opt_result.csv"):
         path = directory / name
         if not path.is_file():
-            problems.append(f"缺少 {name}")
+            if name != "opt_result.csv":
+                problems.append(f"缺少 {name}")
             continue
         frame = pd.read_csv(path)
-        if frame.empty or not np.isfinite(frame.drop(columns=["datetime"]).to_numpy(dtype=float)).all():
-            problems.append(f"{name} 为空或含非有限值")
-    zip_paths = list(directory.glob("*评分包*.zip"))
+        check = output.validate_official_frame(name, frame)
+        problems.extend(check["problems"])
+        if frame.empty:
+            problems.append(f"{name} 为空")
+    zip_paths = [directory / name for name in {C.MOCK_ZIP_NAME, C.FORMAL_ZIP_NAME}
+                 if (directory / name).is_file()]
     if not zip_paths:
-        problems.append("缺少模拟/正式评分包")
+        zip_paths = list(directory.glob("*评分包*.zip"))
+    if not zip_paths:
+        problems.append("缺少模拟评分包")
+    else:
+        try:
+            with ZipFile(zip_paths[0]) as packed:
+                if packed.testzip() is not None:
+                    problems.append("ZIP CRC 检查失败")
+                if f"{C.SOURCE_DIR}/main_nn.py" not in packed.namelist():
+                    problems.append("ZIP 源码缺少 main_nn.py")
+                for name in ("s_result.csv", "l_result.csv", "opt_result.csv"):
+                    if (directory / name).is_file() and packed.read(name) != (directory / name).read_bytes():
+                        problems.append(f"ZIP 内 {name} 与磁盘不一致")
+        except Exception as exc:
+            problems.append(f"ZIP 读取失败: {exc}")
     print(json.dumps({"directory": str(directory), "passed": not problems,
                       "problems": problems}, ensure_ascii=False, indent=2))
     return 0 if not problems else 1
@@ -156,14 +181,15 @@ def _inference_window(prepared) -> tuple[pd.DatetimeIndex, str]:
     return origins, "semi_test_dryrun"
 
 
-def run_infer(quick: bool = False) -> int:
+def run_infer(quick: bool = False, experimental: bool = False) -> int:
     """半决赛预开发：在官方特征窗口上滚动预测并生成提交格式文件。"""
     started = time.time()
-    ctx = output.begin_run(C, mode="infer")
+    ctx = output.begin_run(C, mode="infer", experimental=quick or experimental)
     _setup_logger(ctx.log_path)
     LOGGER.info("推理运行目录: %s", ctx.root)
     summary = {"run_id": ctx.run_id, "status": "FAILED", "mode": "INFER",
-               "quick": bool(quick), "errors": []}
+               "experimental": bool(quick or experimental), "output_root": str(ctx.root),
+               "quick": bool(quick), "validation_scope": "A/B开发验证" if quick else "历史开发验证，D已被多次查看", "errors": []}
     try:
         scan = scan_sources()
         prepared = prepare_data(C)
@@ -173,16 +199,17 @@ def run_infer(quick: bool = False) -> int:
         if not _sources_unchanged(scan):
             raise ValueError("源数据在读取后被修改")
 
-        folds = build_folds(prepared)
-        short_bundle = main_s.train_short(prepared, folds, quick=quick)
-        long_bundle = main_l.train_long(prepared, folds, quick=quick)
-        resource_bundle = main_opt.train_resources(prepared, folds, quick=quick)
+        origins, window = _inference_window(prepared)
+        training = prepared.prefix_copy(origins[0] - pd.Timedelta(minutes=C.STEP_MINUTES))
+        folds = build_folds(training, quick=quick)
+        short_bundle = main_s.train_short(training, folds, quick=quick)
+        long_bundle = main_l.train_long(training, folds, quick=quick)
+        resource_bundle = main_opt.train_resources(training, folds, quick=quick)
         LOGGER.info("训练完成: short=%s/%s long=%s/%s heat_rate_ok=%s",
                     short_bundle.kind, short_bundle.features,
                     long_bundle.kind, long_bundle.features,
                     resource_bundle.heat_rate.get("ok"))
 
-        origins, window = _inference_window(prepared)
         LOGGER.info("推理窗口: %s, 起报点=%d (%s .. %s)",
                     window, len(origins), origins[0], origins[-1])
         # 官方推理没有标签可见；评测窗口目标必须整体遮挡。
@@ -201,15 +228,17 @@ def run_infer(quick: bool = False) -> int:
         resource_forecast = main_opt.forecast_resources(
             resource_bundle, masked, origins, use_final=True)
         optimization = main_opt.optimize(resource_forecast, masked, origins,
-                                         long_pred, resource_bundle, quick=quick)
+                                         long_pred, resource_bundle, quick=quick,
+                                         use_final=True)
         optimization_report = output.write_optimization(ctx, optimization.get("schedule"))
 
         model_report = output.save_models(ctx, short_bundle, long_bundle,
-                                          resource_bundle, optimization.get("summary", {}))
+                                          resource_bundle, optimization.get("summary", {}),
+                                          use_final=True)
         calibration_report = output.write_calibration(
-            ctx, short_bundle, long_bundle, resource_bundle)
+            ctx, short_bundle, long_bundle, resource_bundle, use_final=True)
         source_report = output.write_source_snapshot(ctx, C)
-        official = window == "half_test" and C.OPT_CONFIG.get("template_confirmed")
+        official = False  # 当前用户仅授权预开发，不因目录或模板开关自动进入正式交付。
         zip_report = output.build_zip(ctx, submittable=bool(official), config=C)
 
         summary.update({
@@ -217,9 +246,16 @@ def run_infer(quick: bool = False) -> int:
             "window": window,
             "origins": int(len(origins)),
             "origin_range": [str(origins[0]), str(origins[-1])],
+            "short": {"scores": short_bundle.scores, "selection": short_bundle.selection,
+                      "train_seconds": short_bundle.train_seconds},
+            "long": {"scores": long_bundle.scores, "selection": long_bundle.selection,
+                     "train_seconds": long_bundle.train_seconds},
             "prediction": prediction_report,
             "optimization": optimization_report,
             "optimization_summary": optimization.get("summary", {}),
+            "resource_metrics": resource_bundle.metrics,
+            "resource_selection": resource_bundle.selection,
+            "resource_quantiles": resource_bundle.quantile_metrics,
             "models": model_report,
             "calibration": calibration_report,
             "source": source_report,
@@ -249,13 +285,14 @@ def run_infer(quick: bool = False) -> int:
         return 1
 
 
-def run_full(quick: bool = False) -> int:
+def run_full(quick: bool = False, experimental: bool = False) -> int:
     started = time.time()
-    ctx = output.begin_run(C, mode="backtest")
+    ctx = output.begin_run(C, mode="backtest", experimental=quick or experimental)
     _setup_logger(ctx.log_path)
     LOGGER.info("运行目录: %s", ctx.root)
     summary = {"run_id": ctx.run_id, "status": "FAILED", "mode": "BACKTEST",
-               "quick": bool(quick), "errors": []}
+               "experimental": bool(quick or experimental), "output_root": str(ctx.root),
+               "quick": bool(quick), "validation_scope": "A/B开发验证" if quick else "历史开发验证，D已被多次查看", "errors": []}
     try:
         scan = scan_sources()
         LOGGER.info("扫描完成: %d 个阶段目录, %d 个文件",
@@ -270,7 +307,7 @@ def run_full(quick: bool = False) -> int:
                     prepared.quality["time_range"], prepared.quality["rows"],
                     prepared.quality["target_valid"])
 
-        folds = build_folds(prepared)
+        folds = build_folds(prepared, quick=quick)
         LOGGER.info("时序折: %s", [(f["name"], f["role"], round(f["label_coverage"], 3))
                                   for f in folds])
         short_bundle = main_s.train_short(prepared, folds, quick=quick)
@@ -301,6 +338,7 @@ def run_full(quick: bool = False) -> int:
             LOGGER.info("长期覆盖前 8 步后重评: %.3f (原 %.3f)",
                         rescored["accuracy"],
                         long_bundle.scores["confirm"]["accuracy"])
+            long_bundle.scores["confirm"] = rescored
         prediction_report = output.write_predictions(ctx, origins, short_pred, long_pred)
         LOGGER.info("预测输出: %d 个起报点, 短期/长期校验通过", len(origins))
 
@@ -325,11 +363,15 @@ def run_full(quick: bool = False) -> int:
         LOGGER.info("优化状态: %s, 原因=%s", optimization.get("status"),
                     optimization.get("summary", {}).get("reason"))
         opt_summary = optimization.get("summary", {})
-        if opt_summary.get("planned_revenue_cny"):
-            LOGGER.info("优化回测: plan_feasible=%s, 收益提升=%.3f%%, 实际低柜步数=%s",
+        if opt_summary.get("revenue_improvement_ratio") is not None:
+            LOGGER.info("优化回测: plan_feasible=%s, 计划收益对照=%.3f%%, 包络回放低柜步数=%s",
                         opt_summary.get("plan_feasible"),
                         100.0 * (opt_summary.get("revenue_improvement_ratio") or 0.0),
                         opt_summary.get("realized_holder_low_steps"))
+        elif opt_summary.get("dispatch_mode") == "rolling_proxy":
+            LOGGER.info("连续代理控制: 核验=%s，代理执行收益=%s，降载MWh=%.3f",
+                        opt_summary.get("plan_validation_passed"), opt_summary.get("proxy_executed_revenue_cny"),
+                        opt_summary.get("proxy_curtailed_generation_mwh", 0))
 
         model_report = output.save_models(ctx, short_bundle, long_bundle,
                                           resource_bundle, optimization.get("summary", {}))
@@ -341,7 +383,7 @@ def run_full(quick: bool = False) -> int:
         summary.update({
             "status": "SUCCESS_MOCK",
             "data": {
-                "train_range": prepared.quality["time_range"],
+                "available_data_range": prepared.quality["time_range"],
                 "eval_range": [str(origins[0]), str(origins[-1])],
                 "rows": prepared.quality["rows"],
                 "target_valid": prepared.quality["target_valid"],
@@ -349,7 +391,7 @@ def run_full(quick: bool = False) -> int:
                 "target_invalid": prepared.quality["target_invalid"],
                 "duplicate_conflicts": prepared.quality["duplicate_conflicts"],
                 "key_missing_ratio": prepared.quality["key_missing_ratio"],
-                "causal_contract": {"passed": True, "target_mask": "整个确认窗口",
+                "causal_contract": {"passed": True, "target_mask": "整个开发验证窗口" if quick else "整个历史确认窗口",
                                     "future_dynamic_fields": "forbidden"},
                 "sources_unchanged": True,
             },
@@ -378,6 +420,8 @@ def run_full(quick: bool = False) -> int:
             "optimization": optimization.get("summary", {"status": optimization.get("status")}),
             "optimization_robust_low": robust_opt.get("summary", {}),
             "resource_quantiles": resource_bundle.quantile_metrics,
+            "resource_metrics": resource_bundle.metrics,
+            "resource_selection": resource_bundle.selection,
             "output": {
                 "prediction": prediction_report,
                 "optimization": optimization_report,
@@ -399,8 +443,7 @@ def run_full(quick: bool = False) -> int:
         print(f"  长期 1-MAPE: 调参 {long_bundle.scores['tuning_mean']:.3f} | "
               f"确认 {long_bundle.scores['confirm']['accuracy']:.3f}")
         print(f"  优化状态: {optimization.get('status')} | "
-              f"计划可行={optimization.get('summary', {}).get('plan_feasible')} | "
-              f"收益 {100 * (optimization.get('summary', {}).get('revenue_improvement_ratio') or 0):.2f}%")
+              f"计划可行={optimization.get('summary', {}).get('plan_feasible')}（收益口径见 JSON）")
         print(f"  输出目录: {ctx.root}")
         print(f"  评分包: {zip_report['name']}（不可提交）")
         return 0
@@ -420,18 +463,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="AIC 半决赛煤气发电预测与优化")
     parser.add_argument("command", nargs="?", default="run",
                         choices=("run", "infer", "doctor", "self-check", "verify"))
+    parser.add_argument("--run-dir", type=Path, help="verify 指定选定运行或实验结果目录")
     parser.add_argument("--quick", action="store_true", help="单折、低迭代的开发模式")
+    parser.add_argument("--experiment", action="store_true", help="全量开发实验写入 tmp/tmp_outputs")
     parser.add_argument("--fresh", action="store_true", help="保留参数，当前无训练缓存")
     args = parser.parse_args(argv)
     if args.command == "doctor":
         return run_doctor()
     if args.command == "infer":
-        return run_infer(quick=args.quick)
+        return run_infer(quick=args.quick, experimental=args.experiment)
     if args.command == "self-check":
         return run_self_check()
     if args.command == "verify":
-        return run_verify()
-    return run_full(quick=args.quick)
+        return run_verify(args.run_dir)
+    return run_full(quick=args.quick, experimental=args.experiment)
 
 
 if __name__ == "__main__":

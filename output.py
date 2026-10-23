@@ -32,9 +32,11 @@ def _run_id(mode: str) -> str:
     return f"{pd.Timestamp.now():%Y%m%d_%H%M%S}_{mode.lower()}"
 
 
-def begin_run(config=C, mode: str = "backtest") -> RunContext:
+def begin_run(config=C, mode: str = "backtest", experimental: bool = False) -> RunContext:
     run_id = _run_id(mode)
-    root = config.OUTPUT_ROOT / run_id
+    # 实验复用完整归档链路，但整个目录必须隔离，避免干扰选定运行结果。
+    base = config.EXPERIMENT_OUTPUT_ROOT if experimental else config.OUTPUT_ROOT
+    root = base / run_id
     source = root / config.SOURCE_DIR
     models = root / config.MODEL_DIR
     report = root / config.REPORT_DIR
@@ -228,61 +230,69 @@ def _save_boosters(directory: Path, prefix: str, models: dict,
 
 
 def save_models(ctx: RunContext, short_bundle, long_bundle,
-                resource_bundle, opt_summary: dict) -> dict:
-    summary = {"short": {}, "long": {}, "resource": {}, "reload_ok": True}
+                resource_bundle, opt_summary: dict, use_final: bool = False) -> dict:
+    """只归档实际用于本次结果的角色，候选与另一角色留在实验流程中。"""
+    import main_nn
+
+    role = "final" if use_final else "confirm"
+    summary = {"role": role, "short": {}, "long": {}, "resource": {}, "reload_ok": True}
     temp_dir = ctx.root / "_model_tmp"
-    for name, bundle in (("confirm", short_bundle.models),
-                         ("final", short_bundle.final_models)):
-        info = _save_boosters(ctx.model_dir / "short" / name,
-                              f"{short_bundle.kind}_{short_bundle.features}",
-                              bundle, short_bundle.feature_names, temp_dir)
-        summary["short"][name] = info
-        summary["reload_ok"] &= info["reload_ok"]
-    for name, bundle in (("confirm", long_bundle.models),
-                         ("final", long_bundle.final_models)):
-        info = _save_boosters(ctx.model_dir / "long" / name,
-                              f"{long_bundle.kind}_{long_bundle.features}",
-                              bundle, long_bundle.feature_names, temp_dir)
-        summary["long"][name] = info
-        summary["reload_ok"] &= info["reload_ok"]
-    nn_obj = getattr(long_bundle, "nn_bundle", None)
-    if nn_obj is not None:
-        import main_nn
-        nn_path = main_nn.save_nn(nn_obj, ctx.model_dir / "nn")
-        summary["long"]["nn"] = {"path": nn_path, "kind": nn_obj.kind}
-    nn_s = getattr(short_bundle, "nn_bundle", None)
-    if nn_s is not None:
-        import main_nn
-        nn_path_s = main_nn.save_nn(nn_s, ctx.model_dir / "nn")
-        summary["short"]["nn"] = {"path": nn_path_s, "kind": nn_s.kind}
-    for name, bundle in (("confirm", resource_bundle.models),
-                         ("final", resource_bundle.final_models)):
-        info = _save_boosters(ctx.model_dir / "resource" / name, "resource",
-                              bundle, resource_bundle.feature_names, temp_dir)
-        summary["resource"][name] = info
-        summary["reload_ok"] &= info["reload_ok"]
-    # P2：分位数资源模型一并归档，缺了正式推理就只能退回点预测。
-    summary["resource_quantile"] = {}
-    for label, pool in (("confirm", resource_bundle.quantile_models),
-                        ("final", resource_bundle.final_quantile_models)):
-        summary["resource_quantile"][label] = {}
-        for qname, qbundle in (pool or {}).items():
-            info = _save_boosters(
-                ctx.model_dir / "resource" / f"{label}_{qname}", f"resource_{qname}",
-                qbundle, resource_bundle.feature_names, temp_dir)
-            summary["resource_quantile"][label][qname] = info
+    for name, bundle in (("short", short_bundle), ("long", long_bundle),
+                         ("resource", resource_bundle)):
+        models = bundle.final_models if use_final else bundle.models
+        prefix = "resource" if name == "resource" else f"{bundle.kind}_{bundle.features}"
+        if models:
+            info = _save_boosters(ctx.model_dir / name / role, prefix, models,
+                                  bundle.feature_names, temp_dir)
+            summary[name][role] = info
             summary["reload_ok"] &= info["reload_ok"]
-    shutil.rmtree(temp_dir, ignore_errors=True)
+        nn = getattr(bundle, "final_nn_bundle" if use_final else "nn_bundle", None)
+        if nn is not None:
+            path = main_nn.save_nn(nn, ctx.model_dir / name / role)
+            loaded = main_nn.load_nn(Path(path))
+            same = (len(loaded.seed_states) == len(nn.seed_states)
+                    and np.array_equal(loaded.feat_mean, nn.feat_mean)
+                    and all(np.array_equal(loaded.state_dict[k].numpy(), v.numpy())
+                            for k, v in nn.state_dict.items()))
+            summary[name]["nn"] = {"path": str(Path(path).relative_to(ctx.model_dir)), "kind": nn.kind, "reload_ok": bool(same)}
+            summary["reload_ok"] &= bool(same)
+    summary["resource_quantile"] = {}
+    if opt_summary.get("availability_mode") == "robust_low":
+        pool = resource_bundle.final_quantile_models if use_final else resource_bundle.quantile_models
+        for label, models in pool.items():
+            info = _save_boosters(ctx.model_dir / "resource" / f"{role}_{label}",
+                                  f"resource_{label}", models, resource_bundle.feature_names, temp_dir)
+            summary["resource_quantile"][label] = info
+            summary["reload_ok"] &= info["reload_ok"]
+    if temp_dir.exists():
+        if not temp_dir.resolve().is_relative_to(ctx.root.resolve()):
+            raise ValueError("临时模型目录超出当次运行路径")
+        shutil.rmtree(temp_dir)
+    if not summary["reload_ok"]:
+        raise ValueError("实际模型保存后重载不一致")
+
+    def forecast_meta(bundle):
+        nn = getattr(bundle, "final_nn_bundle" if use_final else "nn_bundle", None)
+        return {"kind": bundle.kind, "features": bundle.features,
+                "blend": bundle.blend, "feature_names": bundle.feature_names,
+                "lgb_kind": bundle.lgb_kind, "lgb_features": bundle.lgb_features,
+                "scores": bundle.scores,
+                "train_end": nn.train_end if nn is not None else
+                             (bundle.final_train_end if use_final else bundle.train_end)}
 
     meta = {
-        "short": {"kind": short_bundle.kind, "features": short_bundle.features,
-                  "blend": short_bundle.blend, "feature_names": short_bundle.feature_names,
-                  "scores": short_bundle.scores, "train_end": short_bundle.train_end},
-        "long": {"kind": long_bundle.kind, "features": long_bundle.features,
-                 "blend": long_bundle.blend, "feature_names": long_bundle.feature_names,
-                 "scores": long_bundle.scores, "train_end": long_bundle.train_end},
+        "role": role, "artifacts": summary,
+        "short": forecast_meta(short_bundle), "long": forecast_meta(long_bundle),
         "resource": {"metrics": resource_bundle.metrics,
-                     "heat_rate": resource_bundle.heat_rate,
+                     "selection": {k: resource_bundle.selection.get(k)
+                                   for k in ("objectives", "selection_scope")},
+                     "dispatch_selection": {k: resource_bundle.dispatch_selection.get(k)
+                                            for k in ("chosen", "scope", "promotion")},
+                     "heat_rate": resource_bundle.final_heat_rate if use_final else resource_bundle.heat_rate,
+                     "gas_caps": resource_bundle.final_gas_caps if use_final else resource_bundle.gas_caps,
+                     "quantile_metrics": (resource_bundle.quantile_metrics
+                                          if opt_summary.get("availability_mode") == "robust_low" else {}),
+                     "train_end": resource_bundle.final_train_end if use_final else resource_bundle.train_end,
                      "blocker": resource_bundle.blocker},
         "optimization": opt_summary,
         "data_contract": {"target_mask": "整个评测窗口", "step_minutes": C.STEP_MINUTES,
@@ -312,37 +322,40 @@ def _top_features(models: dict, names: list[str], top_k: int = 20) -> list[dict]
 
 
 def write_calibration(ctx: RunContext, short_bundle, long_bundle,
-                      resource_bundle) -> dict:
+                      resource_bundle, use_final: bool = False) -> dict:
     """标定产物：模型选择、特征白名单、特征重要性、物理映射，供正式推理直接加载。"""
-    directory = ctx.root / "标定"
+    directory = ctx.model_dir
     directory.mkdir(parents=True, exist_ok=True)
     payload = {
         "generated_at": pd.Timestamp.now().isoformat(timespec="seconds"),
         "short": {"kind": short_bundle.kind, "features": short_bundle.features,
                   "blend": short_bundle.blend, "feature_names": short_bundle.feature_names,
-                  "top_features": _top_features(short_bundle.final_models,
+                  "top_features": _top_features(short_bundle.final_models if use_final else short_bundle.models,
                                                 short_bundle.feature_names)},
         "long": {"kind": long_bundle.kind, "features": long_bundle.features,
                  "blend": long_bundle.blend, "feature_names": long_bundle.feature_names,
-                 "top_features": _top_features(long_bundle.final_models,
+                 "top_features": _top_features(long_bundle.final_models if use_final else long_bundle.models,
                                                long_bundle.feature_names)},
         "resource": {"feature_names": resource_bundle.feature_names,
-                     "heat_rate": resource_bundle.heat_rate,
+                     "heat_rate": resource_bundle.final_heat_rate if use_final else resource_bundle.heat_rate,
                      "metrics": resource_bundle.metrics,
-                     "top_features": _top_features(resource_bundle.final_models,
+                     "top_features": _top_features(resource_bundle.final_models if use_final else resource_bundle.models,
                                                    resource_bundle.feature_names)},
         "note": "LightGBM 树模型不做特征标准化；白名单即训练时实际列序。",
     }
-    path = directory / "资源标定.json"
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n",
-                    encoding="utf-8")
+    path = directory / "model_meta.json"
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    meta["calibration"] = payload
+    path.write_text(json.dumps(meta, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
     return {"path": str(path), "short_features": len(short_bundle.feature_names),
             "long_features": len(long_bundle.feature_names)}
 
 
 def write_source_snapshot(ctx: RunContext, config=C) -> dict:
-    files = ["main.py", "main_s.py", "main_l.py", "main_opt.py", "config.py", "output.py",
-             "requirements.txt", "README.md", ".gitignore"]
+    files = ["main.py", "main_s.py", "main_l.py", "main_nn.py", "main_opt.py", "config.py", "output.py",
+             "requirements.txt", "README.md"]
+    # 仓库保留 Git 忽略规则；提交源码快照不携带，并清理旧快照的遗留文件。
+    (ctx.source_dir / ".gitignore").unlink(missing_ok=True)
     copied = []
     for name in files:
         source = config.ROOT / name
@@ -370,10 +383,10 @@ def build_zip(ctx: RunContext, submittable: bool, config=C) -> dict:
     with ZipFile(temp_path, "w", ZIP_DEFLATED) as packed:
         for member in members:
             packed.write(ctx.root / member, member)
-        for folder in (config.SOURCE_DIR, config.MODEL_DIR, "标定"):
+        for folder in (config.SOURCE_DIR, config.MODEL_DIR):
             base = ctx.root / folder
             for path in sorted(base.rglob("*")):
-                if path.is_file():
+                if path.is_file() and path.name != ".gitignore":
                     packed.write(path, path.relative_to(ctx.root).as_posix())
     with ZipFile(temp_path) as packed:
         bad = packed.testzip()

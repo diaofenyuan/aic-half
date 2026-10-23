@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import time
+import logging
 from dataclasses import dataclass, field
 
 import lightgbm as lgb
@@ -86,11 +87,7 @@ def build_training_block(prepared: PreparedData, base: pd.DataFrame,
     X = _block(base_values, positions, extras, extra_names, h, j)
     y = prepared.labels[target].to_numpy(dtype=float)[positions + h]
     valid = np.isfinite(y)
-    if not valid.all():
-        X = X[valid]
-        y = y[valid]
-        weights = weights[:, j][valid]
-    return X, y, weights
+    return X[valid], y[valid], weights[:, j][valid]
 
 
 def stack_training(prepared: PreparedData, base_values: np.ndarray, extras: dict,
@@ -121,6 +118,7 @@ def enforce_physics(cube: np.ndarray, fallback: np.ndarray | None = None) -> np.
     cube[..., 0] = np.clip(cube[..., 0], 0.0, C.CAPACITY["generator_1"])
     cube[..., 1] = np.clip(cube[..., 1], 0.0, C.CAPACITY["generator_all"])
     cube[..., 1] = np.maximum(cube[..., 1], cube[..., 0])
+    cube[..., 1] = np.minimum(cube[..., 1], cube[..., 0] + C.STRUCTURAL_CAPACITY["generator_big"])
     return cube
 
 
@@ -140,6 +138,8 @@ def score_cube(pred: np.ndarray, truth: np.ndarray,
     """按赛题 1-MAPE 口径评分；零负荷真值单列，不参与 MAPE 分母。"""
     pred = np.asarray(pred, dtype=float)
     truth = np.asarray(truth, dtype=float)
+    if pred.shape != truth.shape or not np.isfinite(pred).all():
+        raise ValueError("评分预测形状不匹配或含非有限值，禁止通过丢弃预测缺失抬高分数")
     result = {"targets": {}, "per_horizon": {}}
     target_scores = []
     for ti, target in enumerate(C.TARGETS):
@@ -187,7 +187,9 @@ def truth_cube(prepared: PreparedData, positions: np.ndarray,
 def baseline_cubes(prepared: PreparedData, positions: np.ndarray,
                    horizons: tuple[int, ...]) -> dict[str, np.ndarray]:
     n, m = len(positions), len(horizons)
-    ratio = fuel_level_ratio(prepared, positions)[:, None]
+    raw_ratio = fuel_level_ratio(prepared, positions)
+    # 燃料缺测时使用未缩放画像；只处理融合回退，不改模型输入或实际资源观测。
+    ratio = np.where(np.isfinite(raw_ratio), raw_ratio, 1.0)[:, None]
     cubes = {"lastvalid": np.empty((n, m, 2)),
              "profile": np.empty((n, m, 2)),
              "profile_fuel": np.empty((n, m, 2))}
@@ -223,6 +225,10 @@ def select_blend(fold_preds: list[np.ndarray], fold_profiles: list[np.ndarray],
         for gname, lo, hi in groups:
             indices = [j for j, h in enumerate(horizons) if lo <= h <= hi]
             best = (-np.inf, 1.0)
+            reference = [score_cell(p[:, indices, ti][:, :, None],
+                                    t[:, indices, ti][:, :, None], 0,
+                                    list(range(len(indices))))
+                         for p, t in zip(fold_preds, fold_truths)]
             for w in grid:
                 scores = []
                 for pred, profile, truth in zip(fold_preds, fold_profiles, fold_truths):
@@ -230,7 +236,9 @@ def select_blend(fold_preds: list[np.ndarray], fold_profiles: list[np.ndarray],
                     scores.append(score_cell(blended[:, :, None], truth[:, indices, ti][:, :, None],
                                              0, list(range(len(indices)))))
                 mean = float(np.nanmean(scores))
-                if np.isfinite(mean) and mean > best[0]:
+                protected = all(a >= b - C.SELECTION["max_worst_fold_drop_pp"]
+                                for a, b in zip(scores, reference))
+                if protected and np.isfinite(mean) and mean > best[0]:
                     best = (mean, float(w))
             blend[target][gname] = best[1]
     return blend
@@ -242,6 +250,31 @@ def effective_model_name(kind: str, features: str, blend: dict) -> str:
     if max(weights, default=0.0) <= 0.0:
         return "profile_fuel"
     return f"{kind}/{features}+profile_fuel"
+
+
+def select_candidate(candidates: list[dict], reference_kind: str) -> dict:
+    """相对同一基线逐折保护，避免把最差折与最高平均分混为一谈。"""
+    reference = next(c for c in candidates if c["kind"] == reference_kind)
+    tolerance = C.SELECTION["max_worst_fold_drop_pp"]
+    eligible = [c for c in candidates
+                if c["mean"] >= reference["mean"] + C.SELECTION["min_mean_gain_pp"]
+                and all(a["accuracy"] >= b["accuracy"] - tolerance
+                        for a, b in zip(c["scores"], reference["scores"]))]
+    return max(eligible or [reference], key=lambda c: c["mean"])
+
+
+def evaluate_blended_candidates(candidates: list[dict], profiles: list[np.ndarray],
+                                horizons: tuple[int, ...], groups) -> None:
+    """以实际部署的融合结果排名，避免先淘汰互补候选再给赢家单独融合。"""
+    for candidate in candidates:
+        candidate["raw_mean"] = candidate["mean"]
+        blend = select_blend(candidate["preds"], profiles, candidate["truths"], horizons, groups)
+        predictions = [blend_cube(p, prof, blend, horizons, groups)
+                       for p, prof in zip(candidate["preds"], profiles)]
+        scores = [score_cube(p, t, horizons) for p, t in zip(predictions, candidate["truths"])]
+        candidate.update(blend=blend, scores=scores,
+                         mean=float(np.mean([s["accuracy"] for s in scores])),
+                         worst=float(min(s["accuracy"] for s in scores)))
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +375,7 @@ def _predict_models(prepared: PreparedData, base_all: pd.DataFrame,
                 lo = j * len(positions)
                 X[lo:lo + len(positions)] = _block(
                     base_values, positions, extras, extra_names, int(h), j)
-            out[:, :, ti] = models[target].predict(X).reshape(len(positions), len(horizons))
+            out[:, :, ti] = models[target].predict(X).reshape(len(horizons), len(positions)).T
     elif kind == "grouped":
         for ti, target in enumerate(C.TARGETS):
             for gname, lo_h, hi_h in _groups_for(horizons):
@@ -353,7 +386,7 @@ def _predict_models(prepared: PreparedData, base_all: pd.DataFrame,
                     X[lo:lo + len(positions)] = _block(
                         base_values, positions, extras, extra_names,
                         int(horizons[j]), j)
-                pred = models[(target, gname)].predict(X).reshape(len(positions), len(subset))
+                pred = models[(target, gname)].predict(X).reshape(len(subset), len(positions)).T
                 for k, j in enumerate(subset):
                     out[:, j, ti] = pred[:, k]
     else:
@@ -371,6 +404,7 @@ class ShortBundle:
     final_models: dict
     feature_names: list[str]
     nn_bundle: object | None = None
+    final_nn_bundle: object | None = None
     lgb_kind: str | None = None
     lgb_features: str | None = None
     selection: dict = field(default_factory=dict)
@@ -378,6 +412,7 @@ class ShortBundle:
     train_rows: int = 0
     train_seconds: float = 0.0
     train_end: str | None = None
+    final_train_end: str | None = None
 
 
 def _fold_positions(prepared: PreparedData, fold: dict,
@@ -403,7 +438,7 @@ def train_short(prepared: PreparedData, folds: list[dict], quick: bool = False) 
     tuning = [f for f in folds if f["role"] == "tuning"]
     if quick:
         tuning = tuning[:1]
-    stride = 1 if not quick else max(1, C.TRAIN_STRIDE_SHORT)
+    stride = C.TRAIN_STRIDE_SHORT if not quick else C.QUICK_TRAIN_STRIDE
     num_round = C.LGBM_TREES_QUICK if quick else C.LGBM_TREES_SHORT
     started = time.time()
     fold_cache = []
@@ -428,6 +463,8 @@ def train_short(prepared: PreparedData, folds: list[dict], quick: bool = False) 
         names_store = None
         for item in fold_cache:
             masked = item["prepared"]
+            logging.getLogger("aic-half").info("短期候选 %s/%s，折=%s", cand["kind"],
+                                              cand["features"], item["fold"]["name"])
             models, names = _train_models(
                 masked, item["base"], item["positions"], C.HORIZONS_S,
                 cand["kind"], cand["features"], num_round, item["ref_pos"])
@@ -447,14 +484,10 @@ def train_short(prepared: PreparedData, folds: list[dict], quick: bool = False) 
                            "worst": worst_score, "seconds": time.time() - started_cand})
         del models_store, names_store
 
-    best_mean = max(c["mean"] for c in candidates)
-    feasible = [c for c in candidates
-                if c["worst"] >= best_mean - C.SELECTION["max_worst_fold_drop_pp"]]
-    chosen = max(feasible or candidates,
-                 key=lambda c: (c["mean"], -len(c["scores"]), c["features"] == "gas"))
     profiles = [item["baselines"]["profile_fuel"] for item in fold_cache]
-    blend = select_blend(chosen["preds"], profiles, chosen["truths"],
-                         C.HORIZONS_S, C.SHORT_GROUPS)
+    evaluate_blended_candidates(candidates, profiles, C.HORIZONS_S, C.SHORT_GROUPS)
+    chosen = select_candidate(candidates, "direct")
+    blend = chosen["blend"]
     blended_tuning = [blend_cube(p, prof, blend, C.HORIZONS_S, C.SHORT_GROUPS)
                       for p, prof in zip(chosen["preds"], profiles)]
     tuning_scores = [score_cube(p, t, C.HORIZONS_S)
@@ -471,13 +504,14 @@ def train_short(prepared: PreparedData, folds: list[dict], quick: bool = False) 
         solo = [{**confirm_fold, "role": "tuning"},
                 {**confirm_fold, "role": "confirm", "name": "val"}]
         nn_c = main_nn.train_nn(prepared, solo, kind="dlinear",
-                                horizons=C.HORIZONS_S, quick=False)
+                                horizons=C.HORIZONS_S, quick=quick)
         confirm_pred = main_nn.predict_nn(nn_c, confirm_masked,
                                           confirm_masked.index[c_eval])
         confirm_models, confirm_names = {}, []
         if chosen["kind"] == "nn_lgb_ens":
             c_positions_x, c_eval_x, c_ref_x = _fold_positions(
                 confirm_masked, confirm_fold, max(C.HORIZONS_S))
+            c_positions_x = c_positions_x[::stride]
             c_base_x = build_base_features(confirm_masked, include_targets=True)
             ens_models, ens_names = _train_models(
                 confirm_masked, c_base_x, c_positions_x, C.HORIZONS_S,
@@ -488,7 +522,7 @@ def train_short(prepared: PreparedData, folds: list[dict], quick: bool = False) 
                 chosen.get("lgb_kind", "direct"), chosen.get("lgb_features", "gas"),
                 ens_models, ens_names)
             confirm_pred = (confirm_pred + lgb_pred) / 2.0
-            confirm_names = ens_names
+            confirm_models, confirm_names = ens_models, ens_names
     else:
         c_positions = c_positions[::stride]
         c_base = build_base_features(confirm_masked, include_targets=True)
@@ -507,19 +541,14 @@ def train_short(prepared: PreparedData, folds: list[dict], quick: bool = False) 
 
     # 部署模型：用截至数据末尾的全部合法标签训练，供正式推理加载。
     if is_nn:
-        labels = prepared.labels[list(C.TARGETS)].to_numpy(dtype=float)
-        valid_pos = np.where(np.isfinite(labels).all(axis=1))[0]
-        val_end_pos = int(valid_pos[-1]) - max(C.HORIZONS_S) - 1
-        val_start_pos = max(0, val_end_pos - 2 * C.STEPS_PER_DAY)
-        all_folds = [
-            {"name": "final", "role": "tuning", "start": str(prepared.index[0]),
-             "days": 1, "train_end": str(prepared.index[val_start_pos])},
-            {"name": "final_val", "role": "confirm",
-             "start": str(prepared.index[val_start_pos]), "days": 2,
-             "train_end": str(prepared.index[val_end_pos])},
-        ]
+        legal_end = min(pd.Timestamp(C.TRAIN_END), prepared.index[-1])
+        valid = prepared.labels.loc[:legal_end, list(C.TARGETS)].dropna()
+        if valid.empty:
+            raise ValueError("最终 NN 缺少合法训练标签")
+        all_folds = [{"name": "final", "role": "tuning",
+                      "train_end": str(valid.index[-1])}]
         nn_final = main_nn.train_nn(prepared, all_folds, kind="dlinear",
-                                    horizons=C.HORIZONS_S, quick=False)
+                                    horizons=C.HORIZONS_S, quick=quick)
         final_models, final_names = {}, []
         if chosen["kind"] == "nn_lgb_ens":
             fp = np.arange(max(0, C.PROFILE_DAYS * C.STEPS_PER_DAY),
@@ -546,7 +575,7 @@ def train_short(prepared: PreparedData, folds: list[dict], quick: bool = False) 
         kind=chosen["kind"], features=chosen["features"], horizons=C.HORIZONS_S,
         blend=blend, models=confirm_models, final_models=final_models,
         feature_names=confirm_names,
-        nn_bundle=nn_final,
+        nn_bundle=nn_c if is_nn else None, final_nn_bundle=nn_final,
         lgb_kind=chosen.get("lgb_kind"), lgb_features=chosen.get("lgb_features"),
         selection={"chosen": {"kind": chosen["kind"], "features": chosen["features"],
                               "effective": effective_model_name(
@@ -559,7 +588,8 @@ def train_short(prepared: PreparedData, folds: list[dict], quick: bool = False) 
         scores={"tuning_mean": float(np.mean([s["accuracy"] for s in tuning_scores])),
                 "confirm": confirm_score},
         train_rows=rows_trained, train_seconds=time.time() - started,
-        train_end=confirm_fold["train_end"])
+        train_end=confirm_fold["train_end"],
+        final_train_end=str(prepared.labels[list(C.TARGETS)].dropna().index[-1]))
 
 
 def predict_short(bundle: ShortBundle, prepared: PreparedData,
@@ -568,19 +598,21 @@ def predict_short(bundle: ShortBundle, prepared: PreparedData,
     if (positions < 0).any():
         raise ValueError("起报点不在数据网格内")
     baselines = baseline_cubes(prepared, positions, C.HORIZONS_S)
-    if bundle.kind in ("dlinear", "nn_lgb_ens") and bundle.nn_bundle is not None:
-        pred = main_nn.predict_nn(bundle.nn_bundle, prepared, origins)
-        if bundle.kind == "nn_lgb_ens" and (bundle.final_models or bundle.models):
-            try:
-                base_all = build_base_features(prepared, include_targets=True)
-                lgb_pred = _predict_models(
-                    prepared, base_all, positions, C.HORIZONS_S,
-                    bundle.lgb_kind or "direct", bundle.lgb_features or "gas",
-                    bundle.final_models if use_final else bundle.models,
-                    bundle.feature_names)
-                pred = (pred + lgb_pred) / 2.0
-            except Exception:
-                pass
+    if bundle.kind in ("dlinear", "nn_lgb_ens"):
+        nn = bundle.final_nn_bundle if use_final else bundle.nn_bundle
+        if nn is None:
+            raise ValueError("缺少所选角色的 NN 模型")
+        pred = main_nn.predict_nn(nn, prepared, origins)
+        if bundle.kind == "nn_lgb_ens":
+            models = bundle.final_models if use_final else bundle.models
+            if not models:
+                raise ValueError("融合缺少同角色 LightGBM 分量")
+            base_all = build_base_features(prepared, include_targets=True)
+            lgb_pred = _predict_models(
+                prepared, base_all, positions, C.HORIZONS_S,
+                bundle.lgb_kind or "direct", bundle.lgb_features or "gas",
+                models, bundle.feature_names)
+            pred = (pred + lgb_pred) / 2.0
     else:
         base_all = build_base_features(prepared, include_targets=True)
         models = bundle.final_models if use_final else bundle.models

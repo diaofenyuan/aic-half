@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import time
+import logging
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -16,7 +17,8 @@ from data_cleaning import (PreparedData, build_base_features, target_slot_profil
 import main_nn
 from main_s import (_fold_positions, _predict_models, _train_models,
                     baseline_cubes, blend_cube, effective_model_name,
-                    enforce_physics, score_cube, select_blend, truth_cube)
+                    enforce_physics, score_cube, select_blend, select_candidate, truth_cube,
+                    evaluate_blended_candidates)
 
 
 LONG_CANDIDATES = (
@@ -36,6 +38,7 @@ class LongBundle:
     feature_names: list[str]
     # NN 支路：浅层 DLinear 为长周期主力候选；kind 含 'dlinear' 时启用。
     nn_bundle: object | None = None
+    final_nn_bundle: object | None = None
     lgb_kind: str | None = None
     lgb_features: str | None = None
     selection: dict = field(default_factory=dict)
@@ -43,13 +46,14 @@ class LongBundle:
     train_rows: int = 0
     train_seconds: float = 0.0
     train_end: str | None = None
+    final_train_end: str | None = None
 
 
 def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -> LongBundle:
     tuning = [f for f in folds if f["role"] == "tuning"]
     if quick:
         tuning = tuning[:1]
-        stride = 4
+        stride = C.QUICK_TRAIN_STRIDE
         num_round = C.LGBM_TREES_QUICK
     else:
         stride = C.TRAIN_STRIDE_LONG
@@ -78,9 +82,9 @@ def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -
         # 只用该折 train_end 之前的数据，避免串折泄漏
         solo = [{**fold, "role": "tuning"},
                 {**fold, "role": "confirm", "name": fold["name"] + "_val"}]
-        # DLinear 单折仅 ~15s，候选评估不走 quick，避免欠拟合误判。
+        # 开发预算逐层传递；quick 的分数只用于链路和候选初筛。
         nb = main_nn.train_nn(prepared, solo, kind="dlinear",
-                              horizons=C.HORIZONS_L, quick=False)
+                              horizons=C.HORIZONS_L, quick=quick)
         pred = main_nn.predict_nn(nb, item["prepared"], item["prepared"].index[item["eval"]])
         pred = enforce_physics(pred, fallback=item["baselines"]["profile_fuel"])
         nn_preds.append(pred)
@@ -99,6 +103,8 @@ def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -
         preds, truths = [], []
         for item in fold_cache:
             masked = item["prepared"]
+            logging.getLogger("aic-half").info("长期候选 %s/%s，折=%s", cand["kind"],
+                                              cand["features"], item["fold"]["name"])
             models, names = _train_models(
                 masked, item["base"], item["positions"], C.HORIZONS_L,
                 cand["kind"], cand["features"], num_round, item["ref_pos"])
@@ -134,13 +140,10 @@ def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -
             "lgb_kind": lgb_c["kind"], "lgb_features": lgb_c["features"],
         })
 
-    best_mean = max(c["mean"] for c in candidates)
-    feasible = [c for c in candidates
-                if c["worst"] >= best_mean - C.SELECTION["max_worst_fold_drop_pp"]]
-    chosen = max(feasible or candidates, key=lambda c: (c["mean"], c["features"] == "gas"))
     profiles = [item["baselines"]["profile_fuel"] for item in fold_cache]
-    blend = select_blend(chosen["preds"], profiles, chosen["truths"],
-                         C.HORIZONS_L, C.LONG_GROUPS)
+    evaluate_blended_candidates(candidates, profiles, C.HORIZONS_L, C.LONG_GROUPS)
+    chosen = select_candidate(candidates, "global")
+    blend = chosen["blend"]
     blended_tuning = [blend_cube(p, prof, blend, C.HORIZONS_L, C.LONG_GROUPS)
                       for p, prof in zip(chosen["preds"], profiles)]
     tuning_scores = [score_cube(p, t, C.HORIZONS_L)
@@ -161,7 +164,7 @@ def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -
         solo = [{**confirm_fold, "role": "tuning"},
                 {**confirm_fold, "role": "confirm", "name": "val"}]
         nn_c = main_nn.train_nn(prepared, solo, kind="dlinear",
-                                horizons=C.HORIZONS_L, quick=False)
+                                horizons=C.HORIZONS_L, quick=quick)
         nn_pred = main_nn.predict_nn(nn_c, confirm_masked,
                                      confirm_masked.index[c_eval])
         confirm_pred = nn_pred
@@ -169,16 +172,18 @@ def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -
             # 训练同折 LGBM 分量再平均
             c_positions_x, c_eval_x, c_ref_x = _fold_positions(
                 confirm_masked, confirm_fold, max(C.HORIZONS_L))
+            c_positions_x = c_positions_x[::stride]
             c_base_x = build_base_features(confirm_masked, include_targets=True)
             ens_models, ens_names = _train_models(
                 confirm_masked, c_base_x, c_positions_x, C.HORIZONS_L,
                 chosen.get("lgb_kind", "global"), chosen.get("lgb_features", "gas"),
-                300, c_ref_x)
+                num_round, c_ref_x)
             lgb_pred = _predict_models(
                 confirm_masked, c_base_x, c_eval_x, C.HORIZONS_L,
                 chosen.get("lgb_kind", "global"), chosen.get("lgb_features", "gas"),
                 ens_models, ens_names)
             confirm_pred = (nn_pred + lgb_pred) / 2.0
+            confirm_models, confirm_names = ens_models, ens_names
         confirm_baseline = baseline_cubes(confirm_masked, c_eval, C.HORIZONS_L)
         confirm_pred = enforce_physics(confirm_pred, fallback=confirm_baseline["profile_fuel"])
         confirm_pred = blend_cube(confirm_pred, confirm_baseline["profile_fuel"], blend,
@@ -187,22 +192,15 @@ def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -
         confirm_score = score_cube(confirm_pred, confirm_truth, C.HORIZONS_L)
         final_models, final_names = {}, []
         ens_final_models, ens_final_names = {}, []
-        # 部署包：用全部有标签数据再训一次。验证窗必须有标签，
-        # 否则 build_nn_dataset 会把样本全滤掉——取 semi_train 末尾 2 天。
-        labels = prepared.labels[list(C.TARGETS)].to_numpy(dtype=float)
-        valid_pos = np.where(np.isfinite(labels).all(axis=1))[0]
-        val_end_pos = int(valid_pos[-1]) - max(C.HORIZONS_L) - 1
-        val_start_pos = max(0, val_end_pos - 2 * C.STEPS_PER_DAY)
-        val_start = prepared.index[val_start_pos]
-        val_end = prepared.index[val_end_pos]
-        all_folds = [
-            {"name": "final", "role": "tuning", "start": str(prepared.index[0]),
-             "days": 1, "train_end": str(val_start)},
-            {"name": "final_val", "role": "confirm", "start": str(val_start),
-             "days": 2, "train_end": str(val_end)},
-        ]
+        # 部署包只使用实际可见的合法标签，内部早停不触及未来推理窗口。
+        legal_end = min(pd.Timestamp(C.TRAIN_END), prepared.index[-1])
+        valid = prepared.labels.loc[:legal_end, list(C.TARGETS)].dropna()
+        if valid.empty:
+            raise ValueError("最终 NN 缺少合法训练标签")
+        all_folds = [{"name": "final", "role": "tuning",
+                      "train_end": str(valid.index[-1])}]
         nn_final = main_nn.train_nn(prepared, all_folds, kind="dlinear",
-                                    horizons=C.HORIZONS_L, quick=False)
+                                    horizons=C.HORIZONS_L, quick=quick)
         if chosen["kind"] == "nn_lgb_ens":
             # 融合还需要一个全量训练的 LGBM 分量
             fp = np.arange(max(0, C.PROFILE_DAYS * C.STEPS_PER_DAY),
@@ -248,7 +246,7 @@ def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -
                       and ens_final_models else final_models),
         feature_names=(ens_final_names if chosen["kind"] == "nn_lgb_ens"
                        and ens_final_names else confirm_names),
-        nn_bundle=nn_final,
+        nn_bundle=nn_c if is_nn else None, final_nn_bundle=nn_final,
         lgb_kind=chosen.get("lgb_kind"), lgb_features=chosen.get("lgb_features"),
         selection={"chosen": {"kind": chosen["kind"], "features": chosen["features"],
                               "effective": effective_model_name(
@@ -261,7 +259,8 @@ def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -
         scores={"tuning_mean": float(np.mean([s["accuracy"] for s in tuning_scores])),
                 "confirm": confirm_score},
         train_rows=rows_trained, train_seconds=time.time() - started,
-        train_end=confirm_fold["train_end"])
+        train_end=confirm_fold["train_end"],
+        final_train_end=str(prepared.labels[list(C.TARGETS)].dropna().index[-1]))
 
 
 def predict_long(bundle: LongBundle, prepared: PreparedData,
@@ -270,21 +269,21 @@ def predict_long(bundle: LongBundle, prepared: PreparedData,
     if (positions < 0).any():
         raise ValueError("起报点不在数据网格内")
     baselines = baseline_cubes(prepared, positions, C.HORIZONS_L)
-    if bundle.kind in ("dlinear", "nn_lgb_ens") and bundle.nn_bundle is not None:
-        pred = main_nn.predict_nn(bundle.nn_bundle, prepared, origins)
-        if bundle.kind == "nn_lgb_ens" and bundle.models:
-            # LGBM 分量：final_models 存的是同折 LGBM，没有则退回纯 NN
-            try:
-                base_all = build_base_features(prepared, include_targets=True)
-                lgb_pred = _predict_models(
-                    prepared, base_all, positions, C.HORIZONS_L,
-                    getattr(bundle, "lgb_kind", "global"),
-                    getattr(bundle, "lgb_features", "gas"),
-                    bundle.final_models or bundle.models,
-                    bundle.feature_names)
-                pred = (pred + lgb_pred) / 2.0
-            except Exception:
-                pass
+    if bundle.kind in ("dlinear", "nn_lgb_ens"):
+        nn = bundle.final_nn_bundle if use_final else bundle.nn_bundle
+        if nn is None:
+            raise ValueError("缺少所选角色的 NN 模型")
+        pred = main_nn.predict_nn(nn, prepared, origins)
+        if bundle.kind == "nn_lgb_ens":
+            models = bundle.final_models if use_final else bundle.models
+            if not models:
+                raise ValueError("融合缺少同角色 LightGBM 分量")
+            base_all = build_base_features(prepared, include_targets=True)
+            lgb_pred = _predict_models(
+                prepared, base_all, positions, C.HORIZONS_L,
+                bundle.lgb_kind or "global", bundle.lgb_features or "gas",
+                models, bundle.feature_names)
+            pred = (pred + lgb_pred) / 2.0
     else:
         base_all = build_base_features(prepared, include_targets=True)
         models = bundle.final_models if use_final else bundle.models

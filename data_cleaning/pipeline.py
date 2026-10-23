@@ -52,6 +52,19 @@ class PreparedData:
         obj.mask_end = end
         return obj
 
+    def prefix_copy(self, end: pd.Timestamp | str) -> "PreparedData":
+        """推理拟合只拿首个起报点之前的前缀，资源标签也不能跨进干跑窗口。"""
+        stop = int(self.index.searchsorted(pd.Timestamp(end), side="right"))
+        if stop == 0:
+            raise ValueError("训练前缀为空")
+        obj = copy.copy(self)
+        obj.index = self.index[:stop]
+        obj.frame = self.frame.iloc[:stop].copy()
+        obj.labels = self.labels.iloc[:stop].copy()
+        obj.quality = {**self.quality, "rows": stop,
+                       "time_range": [str(obj.index[0]), str(obj.index[-1])]}
+        return obj
+
 
 # ---------------------------------------------------------------------------
 # 扫描与读取
@@ -222,6 +235,10 @@ def _build_derived(frame: pd.DataFrame) -> None:
     air_heaters = [f"gas_air_heater_{i}" for i in range(1, 6)]
     blast_users = [f"gas_user_blast_furnace_user{i}" for i in range(1, 5)]
     converter_users = [f"gas_user_converter_user{i}" for i in range(1, 3)]
+    for name, columns in (("gen_blast", gen_blast), ("air_heater", air_heaters),
+                          ("blast_user", blast_users), ("converter_user", converter_users)):
+        present = [c for c in columns if c in frame]
+        frame[f"d_{name}_valid_fraction"] = (frame[present].notna().sum(axis=1) / len(columns))
 
     frame["d_gen_blast"] = _sum_columns(frame, gen_blast)
     frame["d_gen_coke"] = frame.get("gas_coke_oven_1", np.nan)
@@ -244,15 +261,16 @@ def _build_derived(frame: pd.DataFrame) -> None:
     frame["d_use_coke"] = frame.get("load_generator_use_coke_gas", np.nan)
     frame["d_use_converter"] = frame.get("load_generator_use_converter_gas", np.nan)
     frame["d_use_total"] = frame[["d_use_blast", "d_use_coke", "d_use_converter"]].sum(
-        axis=1, min_count=1)
+        axis=1, min_count=3)
+    frame["d_use_valid_fraction"] = frame[["d_use_blast", "d_use_coke", "d_use_converter"]].notna().mean(axis=1)
     # 发电气种占比：比绝对量更稳，对负荷水平漂移不敏感。
     for gas in ("blast", "coke", "converter"):
         frame[f"d_use_share_{gas}"] = (frame[f"d_use_{gas}"] / frame["d_use_total"]
                                        .replace(0.0, np.nan))
     weights = C.FUEL_PROXY_WEIGHTS
-    frame["d_fuel_proxy"] = (frame["d_use_blast"].fillna(0.0) * weights["blast"]
-                             + frame["d_use_coke"].fillna(0.0) * weights["coke"]
-                             + frame["d_use_converter"].fillna(0.0) * weights["converter"])
+    frame["d_fuel_proxy"] = (frame["d_use_blast"] * weights["blast"]
+                             + frame["d_use_coke"] * weights["coke"]
+                             + frame["d_use_converter"] * weights["converter"])
     holder = C.GAS_HOLDER["column"]
     frame["d_holder_level"] = frame.get(holder, np.nan)
     frame["d_holder_ratio"] = frame["d_holder_level"] / C.GAS_HOLDER["capacity_m3"]
@@ -398,11 +416,18 @@ def build_base_features(prepared: PreparedData, include_targets: bool) -> pd.Dat
     for col in BASE_CURRENT_COLUMNS:
         if col in frame.columns:
             out[col] = frame[col].to_numpy(dtype=float)
+    for col in frame:
+        if col.startswith("d_") and col.endswith("_valid_fraction"):
+            out[col] = frame[col].to_numpy(dtype=float)
 
     for col in C.FEATURE_WINDOW_COLUMNS:
         if col not in frame.columns:
             continue
         series = frame[col]
+        # 缺测与零供气是不同工况；年龄封顶一天，避免长缺口被当作稳定观测。
+        _, observation_age = _last_valid(series)
+        out[f"obs_{col}_missing"] = series.isna().to_numpy(dtype=float)
+        out[f"obs_{col}_staleness"] = np.minimum(observation_age, C.STEPS_PER_DAY)
         for lag in C.FEATURE_LAGS:
             out[f"{col}_lag{lag}"] = series.shift(lag).to_numpy(dtype=float)
         for window in C.FEATURE_ROLLS:
@@ -600,6 +625,7 @@ def fuel_level_ratio(prepared: PreparedData, positions: np.ndarray,
     ratio = np.divide(fuel[positions], base,
                       out=np.ones(len(positions), dtype=float),
                       where=np.isfinite(base) & (base > 0))
+    # 当前燃料缺测保留为缺失特征；画像融合侧单独禁用该次缩放。
     low, high = C.PROFILE_RATIO_CLIP
     return np.clip(ratio, low, high)
 
