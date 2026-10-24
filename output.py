@@ -286,8 +286,11 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
         "resource": {"metrics": resource_bundle.metrics,
                      "selection": {k: resource_bundle.selection.get(k)
                                    for k in ("objectives", "selection_scope")},
+                     "head_selection": {k: resource_bundle.selection.get("head_selection", {}).get(k)
+                                        for k in ("gases", "weight", "horizons", "method")},
                      "dispatch_selection": {k: resource_bundle.dispatch_selection.get(k)
-                                            for k in ("chosen", "scope", "promotion")},
+                                            for k in ("chosen", "candidate", "replan_steps",
+                                                      "control_options", "scope", "promotion")},
                      "heat_rate": resource_bundle.final_heat_rate if use_final else resource_bundle.heat_rate,
                      "gas_caps": resource_bundle.final_gas_caps if use_final else resource_bundle.gas_caps,
                      "quantile_metrics": (resource_bundle.quantile_metrics

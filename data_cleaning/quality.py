@@ -171,6 +171,21 @@ def _multistep_alignment_check() -> dict:
         bulk = forecast(prepared.index[positions])
         single = np.concatenate([forecast(prepared.index[[p]]) for p in positions])
         checks.append(np.allclose(bulk, single))
+    class HeadProbe:
+        def predict(self, X):
+            return 200. + X[:, -1]
+
+    original = forecast_resources(bundle, prepared, prepared.index[positions])
+    pool["blast__head"] = HeadProbe()
+    with_head = forecast_resources(bundle, prepared, prepared.index[positions])
+    expected_head = np.tile(200. + np.asarray(C.HORIZONS_S), (len(positions), 1))
+    checks.append(np.allclose(with_head[:, :8, 0], expected_head)
+                  and np.array_equal(with_head[:, 8:], original[:, 8:])
+                  and np.array_equal(with_head[:, :, 1:], original[:, :, 1:]))
+    bundle.selection = {"head_selection": {"weight": .5}}
+    blended = forecast_resources(bundle, prepared, prepared.index[positions])
+    checks.append(np.allclose(blended[:, :8, 0], (expected_head + original[:, :8, 0]) / 2.)
+                  and np.array_equal(blended[:, 8:], original[:, 8:]))
     series = np.arange(480, dtype=float)
     series[102] = np.nan
     X, y, w = _stack(prepared, np.arange(480)[:, None], {}, [], np.array([100, 200]),
@@ -225,8 +240,10 @@ def _model_role_check() -> dict:
 
 
 def _optimizer_contract_check() -> dict:
+    from types import SimpleNamespace
     from main_opt import (_fallback_day, _solve_day, _gas_caps, _price_vector, validate_day,
-                          _execute_proxy_step, score_resources)
+                          _execute_proxy_step, score_resources, _dispatch_metrics,
+                          calibrate_resources_online)
     prepared = _synthetic_prepared(480)
     prepared.frame[C.GAS_HOLDER["column"]] = prepared.frame["d_holder_level"]
     heat = {"coefficients_mw_per_m3h": {"blast": 0.000346, "coke": 0.0019, "converter": 0.00059}}
@@ -260,14 +277,60 @@ def _optimizer_contract_check() -> dict:
             level, previous, caps, heat)
         level, previous = executed["holder"], executed["power"]
     stress_passed = 30000. <= level <= 180000.
+    cfg = SimpleNamespace(**vars(C))
+    cfg.OPT_CONFIG = {**C.OPT_CONFIG, "execution_gas_mode": "substitute"}
+    request = np.array([50., 50., 50., 50., 0., 0.])
+    mapping = {"coefficients_mw_per_m3h": {"blast": .0004, "coke": .002, "converter": .0006}}
+    clipped = _execute_proxy_step(request, np.array([2.5e5, 5e4, 0.]),
+        np.array([6e5, 0., 0.]), 1e5, request, caps, mapping)
+    substituted = _execute_proxy_step(request, np.array([2.5e5, 5e4, 0.]),
+        np.array([6e5, 0., 0.]), 1e5, request, caps, mapping, cfg)
+    recovered = (substituted["shortfall_mwh"] < clipped["shortfall_mwh"]
+                 and abs(substituted["power"].sum() - request.sum()) < 1e-6)
+    overflow_request = np.array([40., 36., 30., 0., 0., 0.])
+    overflow_gas = np.array([1e5, 3e4, 1e4])
+    overflowing = np.array([5e5, 3e4, 1e4])
+    before = _execute_proxy_step(overflow_request, overflow_gas, overflowing,
+                                 180000., overflow_request, caps, mapping, cfg)
+    cfg.OPT_CONFIG["execution_gas_mode"] = "substitute_vent"
+    after = _execute_proxy_step(overflow_request, overflow_gas, overflowing,
+                                180000., overflow_request, caps, mapping, cfg)
+    overflow_recovered = (np.allclose(before["power"], after["power"])
+                          and abs(before["holder"] - after["holder"]) < 1e-6
+                          and after["vent_blast_m3h"] < before["vent_blast_m3h"])
+    for _ in range(1200):
+        executed = _execute_proxy_step(np.array([50., 50., 50., 50., 100., 100.]),
+            np.array([8e5, 3e4, 7e4]), rng.random(3) * [8e5, 3e4, 7e4],
+            level, previous, caps, heat, cfg)
+        level, previous = executed["holder"], executed["power"]
+    substitute_safe = 30000. <= level <= 180000.
+    times = pd.date_range("2025-01-01 23:45", periods=2, freq="15min")
+    tariff = {1: np.r_[np.full(95, .2), 1.]}
+    metrics = _dispatch_metrics(times, np.array([100., 200.]), tariff)
+    expected = 140. / (tariff[1].mean() * 300.)
+    metrics_ok = (abs(metrics["price_weighted_load_ratio"] - expected) < 1e-9
+                  and len(metrics["daily"]) == 2
+                  and not _dispatch_metrics(times, np.array([100., np.nan]), tariff)["complete"])
+    paths = np.full((8, 96, 3), 100.)
+    observations = np.full((12, 3), 120.)
+    calibrated = calibrate_resources_online(paths, observations, np.arange(8))
+    observations[4:] = 0.
+    perturbed = calibrate_resources_online(paths, observations, np.arange(8))
+    calibration_causal = (np.array_equal(calibrated[:4], perturbed[:4])
+                          and calibrated[-1, 0, 0] > 100.)
     return {"passed": bool(fallback["status"] == "FALLBACK_SAFE"
                             and np.all(fallback["power"] == 0) and detected and prefix
                             and np.all(curtailed["power"] == 0) and curtailed["holder"] == 30000.
                             and zero_counted
                             and stress_passed
+                            and substitute_safe and recovered and overflow_recovered and metrics_ok and calibration_causal
                             and price.tolist() == [1.0, 2.0]),
             "solver_status": result["status"], "tamper_detected": bool(detected),
             "continuous_resource_shock_steps": 1200,
+            "substitute_resource_shock_steps": 1200, "fuel_substitution_recovered_power": bool(recovered),
+            "overflow_substitution_preserves_power_and_holder": bool(overflow_recovered),
+            "daily_price_metric_and_missing_values": bool(metrics_ok),
+            "online_resource_calibration_causal": bool(calibration_causal),
             "zero_resource_curtailment": True, "resource_zeros_counted": bool(zero_counted)}
 
 

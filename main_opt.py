@@ -89,12 +89,14 @@ def _stack(prepared: PreparedData, base_values: np.ndarray, cal: dict,
 def _fit_resource_models(prepared: PreparedData, positions: np.ndarray,
                          num_round: int, ref_pos: int,
                          alpha: float | None = None,
-                         objectives: dict | None = None) -> tuple[dict, list[str]]:
+                         objectives: dict | None = None,
+                         horizons: tuple[int, ...] = C.HORIZONS_L,
+                         gases: tuple[str, ...] = C.RESOURCE_NAMES) -> tuple[dict, list[str]]:
     base = _resource_base(prepared)
     base_values = base.to_numpy(dtype=np.float32)
-    cal, names = _resource_design(prepared, base, positions, C.HORIZONS_L)
+    cal, names = _resource_design(prepared, base, positions, horizons)
     series = resource_series(prepared)
-    age = (ref_pos - positions[:, None] - np.asarray(C.HORIZONS_L)[None, :]) / C.STEPS_PER_DAY
+    age = (ref_pos - positions[:, None] - np.asarray(horizons)[None, :]) / C.STEPS_PER_DAY
     decay = (np.power(0.5, np.maximum(age, 0.0) / float(C.DECAY_DAYS))
              if C.DECAY_DAYS else np.ones_like(age))
     decay = decay / max(float(decay.mean()), 1e-9)
@@ -104,9 +106,9 @@ def _fit_resource_models(prepared: PreparedData, positions: np.ndarray,
         params = {**params, "objective": "quantile", "alpha": float(alpha),
                   "metric": "quantile"}
     models = {}
-    for gas in C.RESOURCE_NAMES:
+    for gas in gases:
         X, y, weights = _stack(prepared, base_values, cal, names, positions,
-                               C.HORIZONS_L, series[gas].to_numpy(dtype=float), decay)
+                               horizons, series[gas].to_numpy(dtype=float), decay)
         gas_params = {**params}
         if alpha is None and objectives:
             gas_params["objective"] = objectives[gas]
@@ -143,6 +145,13 @@ def forecast_resources(bundle: ResourceBundle, prepared: PreparedData,
     for gi, gas in enumerate(C.RESOURCE_NAMES):
         pred = models[gas].predict(X).reshape(len(C.HORIZONS_L), n).T
         out[:, :, gi] = np.maximum(pred, 0.0)
+        head = models.get(gas + "__head")
+        if head is not None:
+            # 短资源头独立拟合八步，仅替换控制近期；96步尾部仍由长期模型提供。
+            k = len(C.HORIZONS_S)
+            weight = float(bundle.selection.get("head_selection", {}).get("weight", 1.))
+            estimate = head.predict(X[:k * n]).reshape(k, n).T
+            out[:, :k, gi] = (1. - weight) * out[:, :k, gi] + weight * np.maximum(estimate, 0.)
     return out
 
 
@@ -260,6 +269,43 @@ def score_resources(forecast: np.ndarray, truth: np.ndarray) -> dict:
     return metrics
 
 
+def _select_dispatch(controls: list[dict], candidates: dict) -> dict:
+    """以完整同窗回放晋级，收益改善不能以增加降载或代理释放换取。"""
+    ranking = []
+    for name, (steps, options) in candidates.items():
+        gains, releases, passed = [], [], bool(controls)
+        for item in controls:
+            baseline, trial = item["comparison"]["daily"], item["comparison"][name]
+            before, after = (x.get("proxy_inventory_adjusted_revenue_cny") for x in (baseline, trial))
+            valid = (baseline.get("plan_validation_passed") and baseline.get("replay_complete")
+                     and trial.get("plan_validation_passed") and trial.get("replay_complete")
+                     and before is not None and before > 0 and after is not None)
+            if not valid:
+                passed = False
+                continue
+            gains.append(after / before - 1.)
+            releases.append(trial["proxy_blast_vent_m3"])
+            passed = (passed
+                and trial["proxy_curtailed_generation_mwh"] <= baseline["proxy_curtailed_generation_mwh"] + 1e-5
+                and trial["proxy_blast_vent_m3"] <= baseline["proxy_blast_vent_m3"] + 1.
+                and (trial["price_weighted_load_ratio"] or 0.) >= (baseline["price_weighted_load_ratio"] or 0.) - .001)
+        accepted = (name != "daily" and passed and len(gains) == len(controls)
+                    and np.mean(gains) >= .002 and min(gains) >= -.01)
+        ranking.append({"candidate": name, "accepted": bool(accepted),
+                        "mean_gain_ratio": float(np.mean(gains)) if gains else None,
+                        "worst_gain_ratio": float(min(gains)) if gains else None,
+                        "mean_proxy_blast_release_m3": float(np.mean(releases)) if releases else None})
+    accepted = [row for row in ranking if row["accepted"]]
+    # 收益数值等价时优先少释放的方案，不靠未确认的罚金权重打破平局。
+    winner = max(accepted, key=lambda row: (round(row["mean_gain_ratio"], 8),
+                 -row["mean_proxy_blast_release_m3"]))["candidate"] if accepted else "daily"
+    steps, options = candidates[winner]
+    return {"chosen": "daily" if steps == C.STEPS_PER_DAY else "rolling_proxy",
+            "candidate": winner, "replan_steps": steps, "control_options": options,
+            "scope": "first_48h_per_tuning_fold_only", "oof": controls, "ranking": ranking,
+            "promotion": "mean>=0.2%, every_fold>=-1%, no_fold_curtailment_or_release_increase, E_drop<=0.001"}
+
+
 def _resource_oof(prepared: PreparedData, folds: list[dict], quick: bool, num_round: int) -> dict:
     """只在 A/B/C 前缀样本外选择逐气种损失函数，确认窗口不参加选择。"""
     results = {"regression_l1": [], "regression_l2": []}
@@ -270,6 +316,7 @@ def _resource_oof(prepared: PreparedData, folds: list[dict], quick: bool, num_ro
         truth = resource_series(masked).to_numpy()[eval_positions[:, None] + np.asarray(C.HORIZONS_L)]
         cached = {"fold": fold["name"], "prepared": masked,
                   "origins": masked.index[eval_positions], "predictions": {}, "ref": ref}
+        baseline_models = None
         for objective in results:
             logging.getLogger("aic-half").info("资源开发折 %s: %s", fold["name"], objective)
             models, names = _fit_resource_models(masked, positions, num_round, ref,
@@ -278,6 +325,18 @@ def _resource_oof(prepared: PreparedData, folds: list[dict], quick: bool, num_ro
             pred = forecast_resources(bundle, masked, masked.index[eval_positions])
             cached["predictions"][objective] = pred
             results[objective].append({"fold": fold["name"], "metrics": score_resources(pred, truth)})
+            if objective == "regression_l1":
+                baseline_models = models
+        head_positions = _resource_head_positions(ref, quick)
+        head_models, head_names = _fit_resource_models(masked, head_positions, num_round, ref,
+            objectives={g: "regression_l1" for g in C.RESOURCE_NAMES}, horizons=C.HORIZONS_S)
+        if head_names != names:
+            raise ValueError("短资源头与长期资源特征顺序不一致")
+        pool = {**baseline_models, **{gas + "__head": model for gas, model in head_models.items()}}
+        head_prediction = forecast_resources(ResourceBundle(pool, {}, names), masked, masked.index[eval_positions])
+        cached["head_prediction"] = head_prediction[:, :len(C.HORIZONS_S)]
+        cached["head_metrics"] = score_resources(head_prediction, truth)
+        cached["head_max_training_target"] = str(masked.index[head_positions[-1] + max(C.HORIZONS_S)])
         caches.append(cached)
     chosen = {}
     for gas in C.RESOURCE_NAMES:
@@ -287,37 +346,112 @@ def _resource_oof(prepared: PreparedData, folds: list[dict], quick: bool, num_ro
         promote = (valid and np.mean(alternative) < np.mean(baseline)
                    and all(a <= b + .02 for a, b in zip(alternative, baseline)))
         chosen[gas] = "regression_l2" if promote else "regression_l1"
+    head_gases = []
+    for gas in C.RESOURCE_NAMES:
+        baseline = [r["metrics"][gas]["groups"]["short"]["wape"] for r in results[chosen[gas]]]
+        head = [item["head_metrics"][gas]["groups"]["short"]["wape"] for item in caches]
+        if (all(v is not None for v in baseline + head)
+                and np.mean(head) <= np.mean(baseline) - .005
+                and all(a <= b + .02 for a, b in zip(head, baseline))):
+            head_gases.append(gas)
     controls = []
+    candidates = {"daily": (C.STEPS_PER_DAY, {}),
+                  "hour_clip": (C.OPT_CONFIG["rolling_replan_steps"], {}),
+                  "hour_substitute": (C.OPT_CONFIG["rolling_replan_steps"],
+                                      {"execution_gas_mode": "substitute"}),
+                  "hour_substitute_vent": (C.OPT_CONFIG["rolling_replan_steps"],
+                                           {"execution_gas_mode": "substitute_vent"})}
+    if head_gases:
+        candidates["head_hour_substitute_vent"] = (C.OPT_CONFIG["rolling_replan_steps"],
+                                                   {"execution_gas_mode": "substitute_vent"})
+        candidates["head_half_hour_substitute_vent"] = (C.OPT_CONFIG["rolling_replan_steps"],
+                                                        {"execution_gas_mode": "substitute_vent"})
+    head_weights = {"head_hour_substitute_vent": 1., "head_half_hour_substitute_vent": .5}
     for item in caches:
         data, ref = item["prepared"], item["ref"]
         heat, caps = estimate_heat_rate(data, ref), _gas_caps(data, ref)
         frozen = ResourceBundle({}, {}, [], heat_rate=heat, gas_caps=caps)
         forecast = np.stack([item["predictions"][chosen[g]][:, :, gi]
                              for gi, g in enumerate(C.RESOURCE_NAMES)], axis=2)
+        head_forecast = forecast.copy()
+        for gi, gas in enumerate(C.RESOURCE_NAMES):
+            if gas in head_gases:
+                head_forecast[:, :len(C.HORIZONS_S), gi] = item["head_prediction"][:, :, gi]
+        item["selected_forecast"], item["head_forecast"] = forecast, head_forecast
         comparisons = {}
-        for interval in (C.STEPS_PER_DAY, C.OPT_CONFIG["rolling_replan_steps"]):
-            replay = optimize_rolling(forecast, data, item["origins"], frozen,
-                                      quick=True, replan_steps=interval)
-            comparisons[str(interval)] = replay["summary"]
+        for name, (interval, options) in candidates.items():
+            weight = head_weights.get(name, 0.)
+            trial = (forecast * (1. - weight) + head_forecast * weight) if weight else forecast
+            replay = optimize_rolling(trial,
+                                      data, item["origins"], frozen,
+                                      quick=True, replan_steps=interval, control_options=options)
+            comparisons[name] = replay["summary"]
         controls.append({"fold": item["fold"], "comparison": comparisons})
-    improvements, curtailed = [], []
-    for item in controls:
-        daily = item["comparison"][str(C.STEPS_PER_DAY)]
-        rolling = item["comparison"][str(C.OPT_CONFIG["rolling_replan_steps"])]
-        before, after = daily.get("proxy_inventory_adjusted_revenue_cny"), rolling.get("proxy_inventory_adjusted_revenue_cny")
-        if before is None or after is None or before <= 0:
-            continue
-        improvements.append(after / before - 1)
-        curtailed.append(rolling["proxy_curtailed_generation_mwh"] <= daily["proxy_curtailed_generation_mwh"] + 1e-5)
-    promote = (len(improvements) == len(controls) and bool(improvements)
-               and np.mean(improvements) >= .002 and min(improvements) >= -.01 and all(curtailed))
-    dispatch = {"chosen": "rolling_proxy" if promote else "daily",
-                "scope": "first_48h_per_tuning_fold_only", "oof": controls,
-                "mean_proxy_revenue_gain_ratio": float(np.mean(improvements)) if improvements else None,
-                "promotion": "mean>=0.2%, every_fold>=-1%, no_fold_curtailment_increase"}
+    dispatch = _select_dispatch(controls, candidates)
+    confirmation = {}
+    if not quick and head_gases:
+        # 48小时只做初筛；资源头必须在完整开发折上避免增加已部署策略的降载。
+        screen_ranking = dispatch["ranking"]
+        raw_candidates = {name: spec for name, spec in candidates.items() if name not in head_weights}
+        base_dispatch = _select_dispatch(controls, raw_candidates)
+        screened = {row["candidate"] for row in dispatch["ranking"] if row["accepted"]}
+        eligible = [name for name in head_weights if name in screened]
+        full_controls = []
+        base_name = base_dispatch["candidate"]
+        for item in caches if eligible else []:
+            comparisons = {}
+            for name in dict.fromkeys(["daily", base_name, *eligible]):
+                interval, options = candidates[name]
+                weight = head_weights.get(name, 0.)
+                forecast = item["selected_forecast"]
+                trial = (forecast * (1. - weight) + item["head_forecast"] * weight) if weight else forecast
+                replay = optimize_rolling(trial, item["prepared"], item["origins"],
+                    ResourceBundle({}, {}, [], heat_rate=estimate_heat_rate(item["prepared"], item["ref"]),
+                                   gas_caps=_gas_caps(item["prepared"], item["ref"])),
+                    replan_steps=interval, control_options=options)
+                comparisons[name] = replay["summary"]
+            full_controls.append({"fold": item["fold"], "comparison": comparisons})
+        full_candidates = {name: candidates[name] for name in dict.fromkeys(["daily", base_name, *eligible])}
+        checked = _select_dispatch(full_controls, full_candidates)
+        accepted = []
+        for row in checked["ranking"]:
+            name = row["candidate"]
+            if name not in eligible or not row["accepted"]:
+                continue
+            gains, safe = [], True
+            for item in full_controls:
+                baseline, trial = item["comparison"][base_name], item["comparison"][name]
+                gains.append(trial["proxy_inventory_adjusted_revenue_cny"] /
+                             baseline["proxy_inventory_adjusted_revenue_cny"] - 1.)
+                safe &= trial["proxy_curtailed_generation_mwh"] <= baseline["proxy_curtailed_generation_mwh"] + 1e-5
+            row["gain_vs_existing_control"] = gains
+            row["head_gate_passed"] = bool(safe and np.mean(gains) >= .002 and min(gains) >= -.01)
+            if row["head_gate_passed"]:
+                accepted.append(row)
+        dispatch = base_dispatch
+        if accepted:
+            winner = max(accepted, key=lambda row: row["mean_gain_ratio"])["candidate"]
+            dispatch = {**dispatch, "candidate": winner, "chosen": "rolling_proxy",
+                        "replan_steps": candidates[winner][0], "control_options": candidates[winner][1]}
+        dispatch["scope"] = "first_48h_screen_then_full_development_head_gate"
+        dispatch["ranking"] = screen_ranking
+        confirmation = {"scope": "complete_development_folds_only; no_D_reselection",
+                        "oof": full_controls, "ranking": checked["ranking"]}
+    head_selection = {"gases": head_gases if dispatch["candidate"].startswith("head_") else [],
+        "candidate_gases": head_gases, "horizons": list(C.HORIZONS_S),
+        "weight": head_weights.get(dispatch["candidate"], 0.), "confirmation": confirmation,
+        "method": "independent_L1_8_steps; short_WAPE_screen_then_joint_dispatch_gate",
+        "oof": [{"fold": item["fold"], "metrics": item["head_metrics"],
+                 "max_training_target": item["head_max_training_target"]} for item in caches]}
     return {"objectives": chosen, "oof": results, "selection_scope": "tuning_folds_only",
             "metric": "all_finite_wape_including_zero", "max_fold_wape_drop": .02,
-            "dispatch_selection": dispatch}
+            "dispatch_selection": dispatch, "head_selection": head_selection}
+
+
+def _resource_head_positions(ref_pos: int, quick: bool) -> np.ndarray:
+    stride = C.QUICK_TRAIN_STRIDE if quick else C.TRAIN_STRIDE_LONG
+    return np.arange(C.PROFILE_DAYS * C.STEPS_PER_DAY,
+                     max(ref_pos - max(C.HORIZONS_S) + 1, 0))[::stride]
 
 
 def train_resources(prepared: PreparedData, folds: list[dict],
@@ -330,6 +464,9 @@ def train_resources(prepared: PreparedData, folds: list[dict],
     positions, eval_positions, ref_pos = _resource_positions(masked, confirm, quick)
     num_round = C.LGBM_TREES_QUICK if quick else C.LGBM_TREES_LONG
     selection = _resource_oof(prepared, folds, quick, num_round)
+    logging.getLogger("aic-half").info("资源头=%s，融合权重=%s，控制候选=%s",
+        selection["head_selection"]["gases"], selection["head_selection"]["weight"],
+        selection["dispatch_selection"]["candidate"])
     models, names = _fit_resource_models(masked, positions, num_round, ref_pos,
                                         objectives=selection["objectives"])
 
@@ -339,6 +476,14 @@ def train_resources(prepared: PreparedData, folds: list[dict],
     final_ref = len(prepared.index) - max(C.HORIZONS_L)
     final_models, _ = _fit_resource_models(prepared, final_positions, num_round, final_ref,
                                           objectives=selection["objectives"])
+    head_gases = tuple(selection["head_selection"]["gases"])
+    if head_gases:
+        for pool, data, ref in ((models, masked, ref_pos),
+                                (final_models, prepared, len(prepared.index) - 1)):
+            head_models, _ = _fit_resource_models(data, _resource_head_positions(ref, quick),
+                num_round, ref, objectives={g: "regression_l1" for g in head_gases},
+                horizons=C.HORIZONS_S, gases=head_gases)
+            pool.update({gas + "__head": model for gas, model in head_models.items()})
 
     bundle = ResourceBundle(models=models, final_models=final_models,
                             feature_names=names,
@@ -622,15 +767,21 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
     for i in range(n_u):
         for k in range(n_h):
             if k == 0:
-                # 首步相对初始状态的开关：这里从 0 计，避免依赖未给出的 z_{-1}
+                # 连续重规划也要计首步切换，否则每次换窗都能免费启停。
+                initial_on = float(initial_power[i] > config.OPT_CONFIG["power_tolerance_mw"])
+                add({off_sw + i * n_h: 1.0, off_z + i * n_h: -1.0}, -initial_on, np.inf)
+                add({off_sw + i * n_h: 1.0, off_z + i * n_h: 1.0}, initial_on, np.inf)
                 continue
             zk = off_z + i * n_h + k
             zk1 = off_z + i * n_h + k - 1
             sw = off_sw + i * n_h + k
             add({sw: 1.0, zk: -1.0, zk1: 1.0}, 0.0, np.inf)   # sw >= z_{k-1}-z_k
             add({sw: 1.0, zk: 1.0, zk1: -1.0}, 0.0, np.inf)   # sw >= z_k-z_{k-1}
+    terminal_policy = config.OPT_CONFIG.get("terminal_policy", "return")
     if config.OPT_CONFIG.get("terminal_holder") and low <= holder0 <= high:
-        add({off_s + n_h - 1: 1.0}, holder0, holder0)
+        band = (capacity * config.OPT_CONFIG.get("terminal_band_ratio", .10)
+                if terminal_policy == "band_value" else 0.)
+        add({off_s + n_h - 1: 1.0}, max(low, holder0 - band), min(high, holder0 + band))
     for k in range(n_h):
         coeffs = {off_p + i * n_h + k: 1.0 for i in range(n_u)}
         for g in range(n_g):
@@ -671,6 +822,9 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
     objective[off_dd:off_sw] = 0.25 * hold_pen
     switch_pen = float(config.OPT_CONFIG.get("unit_switch_penalty_cny", 0.0))
     objective[off_sw:n_var] = switch_pen
+    if terminal_policy == "band_value":
+        # 存气价值只由冻结热耗与已知电价估计；评价时仍单列库存差额。
+        objective[off_s + n_h - 1] -= float(np.mean(price)) * beta[0] * 1000.
     solution = milp(objective, integrality=integrality, bounds=Bounds(lb, ub),
                     constraints=constraints, options=options)
     if solution.x is None or solution.status not in (0, 1):
@@ -737,8 +891,10 @@ def validate_day(result: dict, avail: np.ndarray, holder0: float,
         problems.append("燃料与功率不守恒")
     if np.max(np.abs(balance)) > st or (holder < low - st).any() or (holder > high + st).any():
         problems.append("代理库存平衡或安全边界违规")
+    terminal_band = (capacity * config.OPT_CONFIG.get("terminal_band_ratio", .10)
+                     if config.OPT_CONFIG.get("terminal_policy", "return") == "band_value" else 0.)
     if (config.OPT_CONFIG["terminal_holder"] and low <= holder0 <= high
-            and abs(holder[-1] - holder0) > st):
+            and abs(holder[-1] - holder0) > terminal_band + st):
         problems.append("末端库存不一致")
     return {"passed": not problems, "problems": problems,
             "power_balance_max_mw": float(np.max(np.abs(energy))),
@@ -821,7 +977,9 @@ def _execute_proxy_step(request_power: np.ndarray, request_gas: np.ndarray,
         raise ValueError("执行回放的气量或连续柜位无效")
     available = actual.copy()
     available[0] += max(holder - low, 0) * 4.0
-    usable = np.minimum(np.minimum(request_gas, available), caps)
+    execution_mode = config.OPT_CONFIG.get("execution_gas_mode", "clip")
+    substitute = execution_mode in ("substitute", "substitute_vent")
+    usable = np.minimum(available if substitute else np.minimum(request_gas, available), caps)
     budget = min(float(beta @ usable), float(np.sum(request_power)))
     ramp = units * config.OPT_CONFIG["ramp_fraction_per_min"] * config.STEP_MINUTES
     best = None
@@ -846,8 +1004,35 @@ def _execute_proxy_step(request_power: np.ndarray, request_gas: np.ndarray,
         increment = min(remaining, upper[i] - power[i])
         power[i] += increment
         remaining -= increment
-    energy = float(beta @ usable)
-    gas = usable * (target / energy if energy > 0 else 0)
+    if substitute:
+        # 先保留可执行的原配比；缺气后仅利用当前已观察的其他气种补偿。
+        gas = np.minimum(request_gas, usable).copy()
+        energy = float(beta @ gas)
+        if energy > target:
+            gas *= target / energy
+        else:
+            remaining = target - energy
+            overflow_flow = max(actual[0] + 4. * (holder - high), 0.)
+            extra = min(max(min(overflow_flow, usable[0]) - gas[0], 0.), remaining / beta[0])
+            gas[0] += extra
+            remaining -= extra * beta[0]
+            for g in (1, 2, 0):
+                extra = min(max(usable[g] - gas[g], 0.), max(remaining, 0.) / beta[g])
+                gas[g] += extra
+                remaining -= extra * beta[g]
+    else:
+        energy = float(beta @ usable)
+        gas = usable * (target / energy if energy > 0 else 0)
+    if execution_mode == "substitute_vent":
+        # 仅置换原本必须释放的高炉气，保持功率和释放后的柜位不变。
+        # 无柜气种仍是供气上界，未用量另记，不能称为真实总放散减少。
+        overflow_flow = max(actual[0] + 4. * (holder - high) - gas[0], 0.)
+        other_energy = float(beta[1:] @ gas[1:])
+        replacement = min(overflow_flow * beta[0], other_energy,
+                          max(usable[0] - gas[0], 0.) * beta[0])
+        if replacement > 0. and other_energy > 0.:
+            gas[0] += replacement / beta[0]
+            gas[1:] *= max(1. - replacement / other_energy, 0.)
     level = holder + .25 * (actual[0] - gas[0])
     vent = max(level - high, 0) * 4.0
     level -= .25 * vent
@@ -859,10 +1044,56 @@ def _execute_proxy_step(request_power: np.ndarray, request_gas: np.ndarray,
             "shortfall_mwh": max(float(request_power.sum() - target), 0) * .25}
 
 
+def _dispatch_metrics(times: pd.DatetimeIndex, power: np.ndarray,
+                      prices: dict[int, np.ndarray]) -> dict:
+    """按自然日平均电价统计利用效率，残缺窗口不补造负荷或标签。"""
+    power = np.asarray(power, dtype=float)
+    times = pd.DatetimeIndex(times)
+    if power.shape != (len(times),) or not np.isfinite(power).all():
+        return {"complete": False, "generation_mwh": None,
+                "generation_revenue_cny": None, "price_weighted_load_ratio": None}
+    price = _price_vector(prices, times[0], len(times))
+    mean_price = np.array([float(prices[t.month].mean()) for t in times])
+    denominator = float(mean_price @ power)
+    daily = []
+    for day in times.normalize().unique():
+        pick = times.normalize() == day
+        denom = float(mean_price[pick] @ power[pick])
+        daily.append({"day": str(day.date()), "steps": int(pick.sum()),
+                      "generation_mwh": float(power[pick].sum() * .25),
+                      "price_weighted_load_ratio": float(price[pick] @ power[pick] / denom)
+                      if denom > 0 else None})
+    return {"complete": True, "generation_mwh": float(power.sum() * .25),
+            "generation_revenue_cny": float(price @ power * .25 * 1000.),
+            "price_weighted_load_ratio": float(price @ power / denominator)
+            if denominator > 0 else None, "daily": daily}
+
+
+def calibrate_resources_online(forecast: np.ndarray, actual: np.ndarray,
+                               positions: np.ndarray, strength: float = .5,
+                               half_life_steps: int = 16) -> np.ndarray:
+    """仅用已经到达的单步误差跟踪资源偏差，不用负荷标签或未来资源。"""
+    if not 0. <= strength <= 1. or half_life_steps < 1:
+        raise ValueError("在线资源校准参数无效")
+    corrected = np.array(forecast, dtype=float, copy=True)
+    error, scale = np.zeros(3), np.zeros(3)
+    alpha = 1. - .5 ** (1. / half_life_steps)
+    for row in range(len(positions)):
+        if row > 0 and positions[row] == positions[row - 1] + 1:
+            seen, previous = actual[positions[row]], forecast[row - 1, 0]
+            valid = np.isfinite(seen) & np.isfinite(previous)
+            error[valid] = (1. - alpha) * error[valid] + alpha * (seen[valid] - previous[valid])
+            scale[valid] = (1. - alpha) * scale[valid] + alpha * previous[valid]
+        ratio = np.clip(1. + strength * error / np.maximum(scale, 1.), .5, 1.5)
+        corrected[row] = np.maximum(forecast[row] * ratio, 0.)
+    return corrected
+
+
 def optimize_rolling(resource_forecast: np.ndarray, prepared: PreparedData,
                      origins: pd.DatetimeIndex, resource_bundle: ResourceBundle,
                      quick: bool = False, use_final: bool = False,
-                     replan_steps: int | None = None) -> dict:
+                     replan_steps: int | None = None,
+                     control_options: dict | None = None) -> dict:
     """连续柜位的代理 MPC；每小时重排 96 步，仅执行前四步。
 
     预测器只观察起报点及之前的历史包络；执行降载在目标时刻观察到资源之后发生。
@@ -882,7 +1113,18 @@ def optimize_rolling(resource_forecast: np.ndarray, prepared: PreparedData,
     if not 1 <= steps <= len(C.HORIZONS_L):
         raise ValueError("重规划间隔必须在 1~96 步内")
     cfg = SimpleNamespace(**vars(C))
-    cfg.OPT_CONFIG = {**C.OPT_CONFIG, "solver_time_limit_s": C.OPT_CONFIG["rolling_solver_time_limit_s"]}
+    options = control_options or {}
+    allowed = {"terminal_policy", "terminal_band_ratio", "execution_gas_mode",
+               "holder_penalty_cny_per_m3", "unit_switch_penalty_cny",
+               "resource_bias_strength"}
+    if set(options) - allowed:
+        raise ValueError("不支持的控制参数: " + str(sorted(set(options) - allowed)))
+    if options.get("terminal_policy", "return") not in ("return", "band_value"):
+        raise ValueError("末端库存策略无效")
+    if options.get("execution_gas_mode", "clip") not in ("clip", "substitute", "substitute_vent"):
+        raise ValueError("执行气种策略无效")
+    cfg.OPT_CONFIG = {**C.OPT_CONFIG, **options,
+                      "solver_time_limit_s": C.OPT_CONFIG["rolling_solver_time_limit_s"]}
     caps = np.array([cap_info.get(g, np.nan) for g in C.RESOURCE_NAMES])
     prices = load_prices()
     if not prices or not np.isfinite(caps).all():
@@ -898,8 +1140,13 @@ def optimize_rolling(resource_forecast: np.ndarray, prepared: PreparedData,
         return {"status": "BLOCKED_OPT", "schedule": None, "summary": {"reason": "NO_INITIAL_POWER"}}
     previous = np.array([g1 / 4] * 4 + [max(total - g1, 0) / 2] * 2)
     actual = resource_series(prepared).to_numpy(dtype=float)
+    if options.get("resource_bias_strength", 0.):
+        resource_forecast = calibrate_resources_online(resource_forecast, actual, positions,
+                                                       float(options["resource_bias_strength"]))
     limit = min(len(origins), 2 * C.STEPS_PER_DAY) if quick else len(origins)
     records, statuses, validations = [], [], []
+    executed_power, unused = [], []
+    gaps = []
     revenue, shortfall, vent_volume, realized_steps = 0., 0., 0., 0
     holder_min, holder_max = holder, holder
     started = time.time()
@@ -915,6 +1162,8 @@ def optimize_rolling(resource_forecast: np.ndarray, prepared: PreparedData,
             return {"status": "BLOCKED_OPT", "schedule": None,
                     "summary": {"reason": result.get("message"), "failed_origin": str(origin)}}
         statuses.append(result["status"])
+        if result.get("mip_gap") is not None:
+            gaps.append(float(result["mip_gap"]))
         validations.append(result["validation"]["passed"])
         for k in range(min(steps, limit - row)):
             target = origin + pd.Timedelta(minutes=C.STEP_MINUTES * (k + 1))
@@ -922,15 +1171,19 @@ def optimize_rolling(resource_forecast: np.ndarray, prepared: PreparedData,
             records.append([target, *gas, power[:4].sum(), power.sum()])
             target_pos = int(positions[row]) + k + 1
             if target_pos < len(actual) and np.isfinite(actual[target_pos]).all():
-                executed = _execute_proxy_step(power, gas, actual[target_pos], holder, previous, caps, heat)
+                executed = _execute_proxy_step(power, gas, actual[target_pos], holder, previous, caps, heat, cfg)
                 holder, previous = executed["holder"], executed["power"]
                 revenue += price[k] * previous.sum() * .25 * 1000
                 shortfall += executed["shortfall_mwh"]
                 vent_volume += executed["vent_blast_m3h"] * .25
                 realized_steps += 1
+                executed_power.append(float(previous.sum()))
+                unused.append(np.maximum(actual[target_pos, 1:] - executed["gas"][1:], 0.) * .25)
             else:
                 # 无已发布资源时只接续预测计划，不能制造实测执行收益。
                 holder, previous = float(result["holder"][k]), power.copy()
+                executed_power.append(np.nan)
+                unused.append(np.full(2, np.nan))
             holder_min, holder_max = min(holder_min, holder), max(holder_max, holder)
         if row % C.STEPS_PER_DAY == 0:
             logging.getLogger("aic-half").info("连续包络回放 %s，重规划间隔=%d步", origin, steps)
@@ -942,13 +1195,44 @@ def optimize_rolling(resource_forecast: np.ndarray, prepared: PreparedData,
     # 防止以耗尽库存冒充经济收益，代理末端存气按平均电价折算单列。
     inventory_adjustment = ((holder - holder0) * heat["coefficients_mw_per_m3h"]["blast"]
                             * 1000 * float(prices_used.mean()))
+    times = pd.DatetimeIndex(schedule.datetime)
+    planned_metrics = _dispatch_metrics(times, schedule.opt_generator_all.to_numpy(), prices)
+    executed_metrics = _dispatch_metrics(times, np.asarray(executed_power), prices)
+    historical_metrics = _dispatch_metrics(times,
+        prepared.labels["generator_all"].reindex(times).to_numpy(dtype=float), prices)
+    historical_revenue = historical_metrics["generation_revenue_cny"]
+    # 包络溢出只是代理释放；无柜气种的未用上界不是实际放散，不能一并计罚。
+    penalty_sensitivity = []
+    for penalty in C.OPT_CONFIG.get("evaluation_release_penalties", (0., .5, 1.)):
+        cost = float(penalty) * vent_volume if complete else None
+        penalty_sensitivity.append({"assumed_cny_per_m3": float(penalty),
+            "proxy_blast_release_penalty_cny": cost,
+            "proxy_net_benefit_cny": revenue - cost if complete else None,
+            "proxy_inventory_adjusted_net_benefit_cny": revenue - cost + inventory_adjustment
+            if complete else None})
     summary = {"status": "SIMULATED_NOT_SUBMITTABLE", "resource_mode": "historical_consumption_envelope",
         "availability_mode": "point", "dispatch_mode": "daily_proxy" if steps == C.STEPS_PER_DAY else "rolling_proxy", "replan_steps": steps,
+        "control_options": options, "execution_gas_mode": cfg.OPT_CONFIG.get("execution_gas_mode", "clip"),
         "plan_feasible": all(validations), "plan_validation_passed": all(validations),
         "physical_feasibility_certified": False, "forecast_uses_historical_holder": False,
         "replay_scope": "continuous_envelope_with_observed_resource_curtailment",
         "replay_complete": complete, "realized_steps": realized_steps, "planned_steps": len(schedule),
         "planned_revenue_cny": planned_revenue,
+        "planned_generation_mwh": planned_metrics["generation_mwh"],
+        "price_weighted_load_ratio": planned_metrics["price_weighted_load_ratio"],
+        "planned_metrics": planned_metrics, "proxy_executed_metrics": executed_metrics,
+        "historical_metrics": historical_metrics,
+        "historical_generation_revenue_cny": historical_revenue,
+        "revenue_improvement_ratio": (planned_revenue / historical_revenue - 1.)
+        if historical_revenue is not None and historical_revenue > 0 else None,
+        "proxy_executed_revenue_improvement_ratio": (revenue / historical_revenue - 1.)
+        if complete and historical_revenue is not None and historical_revenue > 0 else None,
+        "revenue_basis": "gross_generation_value; historical_flare_penalty_unobservable",
+        "proxy_release_penalty_sensitivity": penalty_sensitivity,
+        "official_net_benefit_improvement_ratio": None,
+        "official_net_benefit_unavailable_reason": "无真实净余气、历史放散量及官方罚金",
+        "proxy_unused_no_holder_envelope_m3": {gas: float(np.asarray(unused)[:, gi].sum())
+        if complete else None for gi, gas in enumerate(C.RESOURCE_NAMES[1:])},
         "proxy_executed_revenue_cny": revenue if complete else None,
         "proxy_inventory_adjusted_revenue_cny": revenue + inventory_adjustment if complete else None,
         "inventory_adjustment_cny": inventory_adjustment if complete else None,
@@ -956,6 +1240,7 @@ def optimize_rolling(resource_forecast: np.ndarray, prepared: PreparedData,
         "initial_holder_m3": holder0, "terminal_holder_m3": holder,
         "proxy_holder_min_m3": holder_min, "proxy_holder_max_m3": holder_max,
         "solver_status_counts": {s: statuses.count(s) for s in set(statuses)},
+        "solver_max_mip_gap": max(gaps) if gaps else None,
         "duration_seconds": time.time() - started,
         "time_semantics": "target_time; instructions issued before target observation",
         "note": "历史机组耗气是代理供气，执行降载发生在观察到资源之后；所有收益为模拟，不能证明真实气网可执行。"}
@@ -979,8 +1264,9 @@ def optimize(resource_forecast: np.ndarray, prepared: PreparedData,
     if mode == "point" and control in ("daily", "rolling_proxy"):
         return optimize_rolling(resource_forecast, prepared, origins, resource_bundle,
                                  quick=quick, use_final=use_final,
-                                 replan_steps=(C.STEPS_PER_DAY if control == "daily"
-                                               else C.OPT_CONFIG["rolling_replan_steps"]))
+                                 replan_steps=resource_bundle.dispatch_selection.get("replan_steps",
+                                     C.STEPS_PER_DAY if control == "daily" else C.OPT_CONFIG["rolling_replan_steps"]),
+                                 control_options=resource_bundle.dispatch_selection.get("control_options"))
     heat_rate = resource_bundle.final_heat_rate if use_final else resource_bundle.heat_rate
     gas_caps = resource_bundle.final_gas_caps if use_final else resource_bundle.gas_caps
     if resource_bundle.blocker and (not use_final or resource_bundle.blocker != "PHYSICAL_MAPPING_UNCERTAIN"):

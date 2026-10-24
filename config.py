@@ -236,6 +236,11 @@ OPT_CONFIG = {
     "holder_margin_ratio": 0.05,
     # 日末回到初始柜位，避免计划靠净放空/净充满气柜获得虚假收益。
     "terminal_holder": True,
+    "terminal_policy": "return",
+    "terminal_band_ratio": 0.10,
+    "execution_gas_mode": "clip",  # 替代配比须经开发折验证后晋级
+    # 仅用于代理溢出的敏感性评价，不能冒充官方放散罚金。
+    "evaluation_release_penalties": (0.0, 0.5, 1.0),
     "gas_cap_quantile": 0.995,
     "gas_cap_headroom": 1.10,
     "solver_time_limit_s": 15,
