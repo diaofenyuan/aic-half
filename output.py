@@ -256,6 +256,19 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
                             for k, v in nn.state_dict.items()))
             summary[name]["nn"] = {"path": str(Path(path).relative_to(ctx.model_dir)), "kind": nn.kind, "reload_ok": bool(same)}
             summary["reload_ok"] &= bool(same)
+        if name == "resource":
+            resource_nn = bundle.final_resource_nn if use_final else bundle.resource_nn
+            if resource_nn is not None:
+                path = main_nn.save_resource_nn(resource_nn, ctx.model_dir / name / role / "resource_nn.pt")
+                loaded = main_nn.load_resource_nn(path)
+                same = (loaded["feature_names"] == resource_nn["feature_names"]
+                    and all(np.array_equal(loaded[k], resource_nn[k]) for k in ("center", "scale", "gas_scale"))
+                    and all(np.array_equal(loaded["state_dict"][k].numpy(), value.cpu().numpy())
+                            for k, value in resource_nn["state_dict"].items()))
+                summary[name]["nn"] = {"path": str(path.relative_to(ctx.model_dir)),
+                    "kind": resource_nn["kind"], "train_end": resource_nn["train_end"],
+                    "max_training_target": resource_nn["max_training_target"], "reload_ok": bool(same)}
+                summary["reload_ok"] &= bool(same)
     summary["resource_quantile"] = {}
     if opt_summary.get("availability_mode") == "robust_low":
         pool = resource_bundle.final_quantile_models if use_final else resource_bundle.quantile_models
@@ -285,7 +298,7 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
         "short": forecast_meta(short_bundle), "long": forecast_meta(long_bundle),
         "resource": {"metrics": resource_bundle.metrics,
                      "selection": {k: resource_bundle.selection.get(k)
-                                   for k in ("objectives", "selection_scope")},
+                                   for k in ("objectives", "selection_scope", "availability_adjustment")},
                      "head_selection": {k: resource_bundle.selection.get("head_selection", {}).get(k)
                                         for k in ("gases", "weight", "horizons", "method")},
                      "dispatch_selection": {k: resource_bundle.dispatch_selection.get(k)

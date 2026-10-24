@@ -48,6 +48,8 @@ class ResourceBundle:
     blocker: str | None = None
     selection: dict = field(default_factory=dict)
     dispatch_selection: dict = field(default_factory=dict)
+    resource_nn: dict | None = None
+    final_resource_nn: dict | None = None
 
 
 def _resource_base(prepared: PreparedData) -> pd.DataFrame:
@@ -152,6 +154,62 @@ def forecast_resources(bundle: ResourceBundle, prepared: PreparedData,
             weight = float(bundle.selection.get("head_selection", {}).get("weight", 1.))
             estimate = head.predict(X[:k * n]).reshape(k, n).T
             out[:, :k, gi] = (1. - weight) * out[:, :k, gi] + weight * np.maximum(estimate, 0.)
+    adjustment = bundle.selection.get("availability_adjustment", {})
+    if adjustment:
+        heat = bundle.final_heat_rate if use_final else bundle.heat_rate
+        expert = None
+        if adjustment.get("method") == "positive_nn_peak":
+            import main_nn
+            pack = bundle.final_resource_nn if use_final else bundle.resource_nn
+            if pack is None:
+                raise ValueError("选定的资源网络缺失，禁止冒用持久性预测")
+            expert = main_nn.predict_resource_nn(pack, base, resource_series(prepared), positions)
+        out = _adjust_available_resources(out, prepared, origins, heat, adjustment, expert=expert)
+    return out
+
+
+def _adjust_available_resources(forecast: np.ndarray, prepared: PreparedData,
+                                origins: pd.DatetimeIndex, heat: dict,
+                                params: dict, prices: dict | None = None,
+                                expert: np.ndarray | None = None) -> np.ndarray:
+    """高价段仅用起报点供气修正短端低估；缺测时保留原预测，不构造实际供气。"""
+    out = np.array(forecast, dtype=float, copy=True)
+    if not params or not heat.get("ok"):
+        return out
+    if params.get("method") not in ("positive_persistence_peak", "positive_nn_peak"):
+        raise ValueError("未知的资源修正策略")
+    threshold, weight = float(params["threshold_ratio"]), float(params["weight"])
+    if not 0. <= threshold <= 1. or not 0. <= weight <= 1.:
+        raise ValueError("资源修正参数超出范围")
+    positions = prepared.index.get_indexer(origins)
+    if out.ndim != 3 or out.shape[0] != len(positions) or out.shape[2] != 3 or (positions < 0).any():
+        raise ValueError("资源修正输入与起报点不一致")
+    beta = np.array([heat["coefficients_mw_per_m3h"][g] for g in C.RESOURCE_NAMES])
+    if not np.isfinite(beta).all() or (beta <= 0).any():
+        raise ValueError("资源修正缺少有效气电标定")
+    k = min(len(C.HORIZONS_S), out.shape[1])
+    observed = resource_series(prepared).to_numpy(dtype=float)[positions]
+    valid = np.isfinite(observed).all(axis=1) & (observed >= 0).all(axis=1)
+    candidate = observed[:, None, :]
+    if params["method"] == "positive_nn_peak":
+        if expert is None or expert.shape != (len(positions), k, 3):
+            raise ValueError("资源网络预测与短提前量不一致")
+        candidate = expert
+        valid &= np.isfinite(expert).all(axis=(1, 2)) & (expert >= 0).all(axis=(1, 2))
+    # 先屏蔽缺测整行，避免未启用的分支仍因 0*NaN 污染预测。
+    difference = np.where(valid[:, None, None], candidate - out[:, :k], 0.)
+    energy = out[:, :k] @ beta
+    times = pd.DatetimeIndex(origins).to_numpy()[:, None] + (
+        np.arange(1, k + 1)[None, :] * np.timedelta64(C.STEP_MINUTES, "m"))
+    tariff = prices if prices is not None else load_prices()
+    flat = pd.DatetimeIndex(times.ravel())
+    missing = sorted(set(flat.month) - set(tariff))
+    if missing:
+        raise ValueError(f"缺少资源高价段判断所需的官方电价月份: {missing}")
+    high = np.array([tariff[t.month][t.hour * 4 + t.minute // 15] >= tariff[t.month].mean()
+                     for t in flat]).reshape(len(positions), k)
+    enabled = valid[:, None] & high & ((difference @ beta) > threshold * np.maximum(energy, 1.))
+    out[:, :k] += weight * enabled[:, :, None] * np.maximum(difference, 0.)
     return out
 
 
@@ -315,7 +373,8 @@ def _resource_oof(prepared: PreparedData, folds: list[dict], quick: bool, num_ro
         positions, eval_positions, ref = _resource_positions(masked, fold, quick)
         truth = resource_series(masked).to_numpy()[eval_positions[:, None] + np.asarray(C.HORIZONS_L)]
         cached = {"fold": fold["name"], "prepared": masked,
-                  "origins": masked.index[eval_positions], "predictions": {}, "ref": ref}
+                  "origins": masked.index[eval_positions], "predictions": {}, "ref": ref,
+                  "truth": truth}
         baseline_models = None
         for objective in results:
             logging.getLogger("aic-half").info("资源开发折 %s: %s", fold["name"], objective)
@@ -366,11 +425,36 @@ def _resource_oof(prepared: PreparedData, folds: list[dict], quick: bool, num_ro
                                                    {"execution_gas_mode": "substitute_vent"})
         candidates["head_half_hour_substitute_vent"] = (C.OPT_CONFIG["rolling_replan_steps"],
                                                         {"execution_gas_mode": "substitute_vent"})
-    head_weights = {"head_hour_substitute_vent": 1., "head_half_hour_substitute_vent": .5}
+        candidates["head_half_peak_persist15_substitute_vent"] = (1,
+                                                        {"execution_gas_mode": "substitute_vent"})
+        candidates["head_half_peak_nn15_substitute_vent"] = (1,
+                                                        {"execution_gas_mode": "substitute_vent"})
+        candidates["head_half_peak_nn03_15_substitute_vent"] = (1,
+                                                        {"execution_gas_mode": "substitute_vent"})
+    head_weights = {"head_hour_substitute_vent": 1., "head_half_hour_substitute_vent": .5,
+                    "head_half_peak_persist15_substitute_vent": .5,
+                    "head_half_peak_nn15_substitute_vent": .5,
+                    "head_half_peak_nn03_15_substitute_vent": .5}
+    adjustments = {"head_half_peak_persist15_substitute_vent": {
+        "method": "positive_persistence_peak", "threshold_ratio": .03, "weight": .5},
+        "head_half_peak_nn15_substitute_vent": {
+        "method": "positive_nn_peak", "threshold_ratio": .05, "weight": 1.},
+        "head_half_peak_nn03_15_substitute_vent": {
+        "method": "positive_nn_peak", "threshold_ratio": .03, "weight": .5}}
+    adjustment_metrics = {name: [] for name in adjustments}
+    nn_training = []
     for item in caches:
         data, ref = item["prepared"], item["ref"]
         heat, caps = estimate_heat_rate(data, ref), _gas_caps(data, ref)
         frozen = ResourceBundle({}, {}, [], heat_rate=heat, gas_caps=caps)
+        if head_gases and heat.get("ok"):
+            import main_nn
+            base = _resource_base(data)
+            pack = main_nn.train_resource_nn(base, resource_series(data), ref, heat, load_prices(), quick)
+            item["nn_forecast"] = main_nn.predict_resource_nn(pack, base, resource_series(data),
+                                                               data.index.get_indexer(item["origins"]))
+            nn_training.append({"fold": item["fold"], **{k: pack[k] for k in
+                ("kind", "epochs", "inner_error", "train_end", "inner_train_end", "max_training_target", "seed")}})
         forecast = np.stack([item["predictions"][chosen[g]][:, :, gi]
                              for gi, g in enumerate(C.RESOURCE_NAMES)], axis=2)
         head_forecast = forecast.copy()
@@ -382,11 +466,28 @@ def _resource_oof(prepared: PreparedData, folds: list[dict], quick: bool, num_ro
         for name, (interval, options) in candidates.items():
             weight = head_weights.get(name, 0.)
             trial = (forecast * (1. - weight) + head_forecast * weight) if weight else forecast
+            if name in adjustments:
+                before = score_resources(trial, item["truth"])
+                trial = _adjust_available_resources(trial, data, item["origins"], heat, adjustments[name],
+                    expert=item.get("nn_forecast"))
+                after = score_resources(trial, item["truth"])
+                adjustment_metrics[name].append({"fold": item["fold"],
+                    "before_short_wape": {g: before[g]["groups"]["short"]["wape"] for g in C.RESOURCE_NAMES},
+                    "after_short_wape": {g: after[g]["groups"]["short"]["wape"] for g in C.RESOURCE_NAMES}})
             replay = optimize_rolling(trial,
                                       data, item["origins"], frozen,
                                       quick=True, replan_steps=interval, control_options=options)
             comparisons[name] = replay["summary"]
         controls.append({"fold": item["fold"], "comparison": comparisons})
+    adjustment_allowed = {}
+    for name, rows in adjustment_metrics.items():
+        before = [r["before_short_wape"][g] for r in rows for g in C.RESOURCE_NAMES]
+        after = [r["after_short_wape"][g] for r in rows for g in C.RESOURCE_NAMES]
+        valid = bool(rows) and all(v is not None for v in before + after)
+        adjustment_allowed[name] = bool(valid and np.mean(after) < np.mean(before)
+            and all(a <= b + .02 for a, b in zip(after, before)))
+    candidates = {name: spec for name, spec in candidates.items()
+                  if name not in adjustments or adjustment_allowed[name]}
     dispatch = _select_dispatch(controls, candidates)
     confirmation = {}
     if not quick and head_gases:
@@ -398,20 +499,26 @@ def _resource_oof(prepared: PreparedData, folds: list[dict], quick: bool, num_ro
         eligible = [name for name in head_weights if name in screened]
         full_controls = []
         base_name = base_dispatch["candidate"]
+        references = (["head_half_hour_substitute_vent"]
+                      if any(name in adjustments for name in eligible) else [])
         for item in caches if eligible else []:
             comparisons = {}
-            for name in dict.fromkeys(["daily", base_name, *eligible]):
+            for name in dict.fromkeys(["daily", base_name, *references, *eligible]):
                 interval, options = candidates[name]
                 weight = head_weights.get(name, 0.)
                 forecast = item["selected_forecast"]
                 trial = (forecast * (1. - weight) + item["head_forecast"] * weight) if weight else forecast
+                heat = estimate_heat_rate(item["prepared"], item["ref"])
+                if name in adjustments:
+                    trial = _adjust_available_resources(trial, item["prepared"], item["origins"],
+                                                        heat, adjustments[name], expert=item.get("nn_forecast"))
                 replay = optimize_rolling(trial, item["prepared"], item["origins"],
-                    ResourceBundle({}, {}, [], heat_rate=estimate_heat_rate(item["prepared"], item["ref"]),
+                    ResourceBundle({}, {}, [], heat_rate=heat,
                                    gas_caps=_gas_caps(item["prepared"], item["ref"])),
                     replan_steps=interval, control_options=options)
                 comparisons[name] = replay["summary"]
             full_controls.append({"fold": item["fold"], "comparison": comparisons})
-        full_candidates = {name: candidates[name] for name in dict.fromkeys(["daily", base_name, *eligible])}
+        full_candidates = {name: candidates[name] for name in dict.fromkeys(["daily", base_name, *references, *eligible])}
         checked = _select_dispatch(full_controls, full_candidates)
         accepted = []
         for row in checked["ranking"]:
@@ -424,6 +531,17 @@ def _resource_oof(prepared: PreparedData, folds: list[dict], quick: bool, num_ro
                 gains.append(trial["proxy_inventory_adjusted_revenue_cny"] /
                              baseline["proxy_inventory_adjusted_revenue_cny"] - 1.)
                 safe &= trial["proxy_curtailed_generation_mwh"] <= baseline["proxy_curtailed_generation_mwh"] + 1e-5
+            if name in adjustments:
+                # 新修正还必须胜过已经选定的八步50%小时控制，不能增加其降载。
+                previous_gains = []
+                for item in full_controls:
+                    previous = item["comparison"]["head_half_hour_substitute_vent"]
+                    trial = item["comparison"][name]
+                    previous_gains.append(trial["proxy_inventory_adjusted_revenue_cny"] /
+                                          previous["proxy_inventory_adjusted_revenue_cny"] - 1.)
+                    safe &= trial["proxy_curtailed_generation_mwh"] <= previous["proxy_curtailed_generation_mwh"] + 1e-5
+                safe &= np.mean(previous_gains) >= .002 and min(previous_gains) >= -.01
+                row["gain_vs_previous_head_control"] = previous_gains
             row["gain_vs_existing_control"] = gains
             row["head_gate_passed"] = bool(safe and np.mean(gains) >= .002 and min(gains) >= -.01)
             if row["head_gate_passed"]:
@@ -445,7 +563,10 @@ def _resource_oof(prepared: PreparedData, folds: list[dict], quick: bool, num_ro
                  "max_training_target": item["head_max_training_target"]} for item in caches]}
     return {"objectives": chosen, "oof": results, "selection_scope": "tuning_folds_only",
             "metric": "all_finite_wape_including_zero", "max_fold_wape_drop": .02,
-            "dispatch_selection": dispatch, "head_selection": head_selection}
+            "dispatch_selection": dispatch, "head_selection": head_selection,
+            "availability_adjustment": adjustments.get(dispatch["candidate"], {}),
+            "availability_adjustment_selection": {"allowed": adjustment_allowed, "oof": adjustment_metrics,
+                                                   "nn_training": nn_training}}
 
 
 def _resource_head_positions(ref_pos: int, quick: bool) -> np.ndarray:
@@ -489,7 +610,15 @@ def train_resources(prepared: PreparedData, folds: list[dict],
                             feature_names=names,
                             train_rows=int(len(positions) * len(C.HORIZONS_L)),
                             train_seconds=time.time() - started, selection=selection,
-                            dispatch_selection=selection["dispatch_selection"])
+                            dispatch_selection=selection["dispatch_selection"],
+                            heat_rate=estimate_heat_rate(prepared, ref_pos),
+                            final_heat_rate=estimate_heat_rate(prepared, len(prepared.index) - 1))
+    if selection.get("availability_adjustment", {}).get("method") == "positive_nn_peak":
+        import main_nn
+        bundle.resource_nn = main_nn.train_resource_nn(_resource_base(masked), resource_series(masked),
+            ref_pos, bundle.heat_rate, load_prices(), quick)
+        bundle.final_resource_nn = main_nn.train_resource_nn(_resource_base(prepared), resource_series(prepared),
+            len(prepared.index) - 1, bundle.final_heat_rate, load_prices(), quick)
     origins = prepared.index[eval_positions]
     forecast = forecast_resources(bundle, masked, origins)
     truth = resource_series(masked).to_numpy(dtype=float)[
@@ -536,8 +665,6 @@ def train_resources(prepared: PreparedData, folds: list[dict],
     bundle.final_quantile_models = final_quantile_models
     bundle.quantile_metrics = quantile_metrics
 
-    bundle.heat_rate = estimate_heat_rate(prepared, ref_pos)
-    bundle.final_heat_rate = estimate_heat_rate(prepared, len(prepared.index) - 1)
     bundle.gas_caps = _gas_caps(prepared, ref_pos)
     bundle.final_gas_caps = _gas_caps(prepared, len(prepared.index) - 1)
     bundle.train_end = str(prepared.index[ref_pos])

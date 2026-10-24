@@ -243,7 +243,7 @@ def _optimizer_contract_check() -> dict:
     from types import SimpleNamespace
     from main_opt import (_fallback_day, _solve_day, _gas_caps, _price_vector, validate_day,
                           _execute_proxy_step, score_resources, _dispatch_metrics,
-                          calibrate_resources_online)
+                          calibrate_resources_online, _adjust_available_resources)
     prepared = _synthetic_prepared(480)
     prepared.frame[C.GAS_HOLDER["column"]] = prepared.frame["d_holder_level"]
     heat = {"coefficients_mw_per_m3h": {"blast": 0.000346, "coke": 0.0019, "converter": 0.00059}}
@@ -318,12 +318,48 @@ def _optimizer_contract_check() -> dict:
     perturbed = calibrate_resources_online(paths, observations, np.arange(8))
     calibration_causal = (np.array_equal(calibrated[:4], perturbed[:4])
                           and calibrated[-1, 0, 0] > 100.)
+    gate_data = _synthetic_prepared(480)
+    gate_origins = gate_data.index[[128, 200]]
+    columns = ["d_use_blast", "d_use_coke", "d_use_converter"]
+    gate_data.frame.loc[gate_origins, columns] = 20000.
+    fixed = np.full((2, 96, 3), 10000.)
+    recipe = {"method": "positive_persistence_peak", "threshold_ratio": .03, "weight": .5}
+    tariffs = {1: np.r_[np.full(32, .2), np.ones(32), np.full(32, .2)]}
+    gate_heat = {"ok": True, **mapping}
+    gated = _adjust_available_resources(fixed, gate_data, gate_origins, gate_heat, recipe, tariffs)
+    aligned = np.concatenate([_adjust_available_resources(fixed[i:i+1], gate_data,
+        gate_origins[i:i+1], gate_heat, recipe, tariffs) for i in range(2)])
+    changed = copy.deepcopy(gate_data)
+    changed.frame.loc[changed.index > gate_origins[0], columns] *= 1000.
+    future_same = _adjust_available_resources(fixed[:1], changed, gate_origins[:1], gate_heat, recipe, tariffs)
+    gate_data.frame.loc[gate_origins[0], "d_use_coke"] = np.nan
+    missing = _adjust_available_resources(fixed, gate_data, gate_origins, gate_heat, recipe, tariffs)
+    gate_data.frame.loc[gate_origins[0], columns] = 0.
+    zero = _adjust_available_resources(fixed, gate_data, gate_origins, gate_heat, recipe, tariffs)
+    gate_data.frame.loc[gate_origins[0], columns] = 10200.
+    below = _adjust_available_resources(fixed, gate_data, gate_origins, gate_heat, recipe, tariffs)
+    gate_data.frame.loc[gate_origins[0], columns] = 20000.
+    nn_recipe = {"method": "positive_nn_peak", "threshold_ratio": .05, "weight": 1.}
+    expert = np.full((2, 8, 3), 20000.)
+    nn_gated = _adjust_available_resources(fixed, gate_data, gate_origins, gate_heat,
+                                          nn_recipe, tariffs, expert)
+    expert[0] = np.nan
+    nn_missing = _adjust_available_resources(fixed, gate_data, gate_origins, gate_heat,
+                                            nn_recipe, tariffs, expert)
+    resource_adjustment_ok = (np.all(gated[0, :8] == 15000.) and np.array_equal(gated[1], fixed[1])
+        and np.array_equal(gated[:, 8:], fixed[:, 8:]) and np.array_equal(gated, aligned)
+        and np.array_equal(future_same[0], gated[0]) and np.array_equal(missing, fixed)
+        and np.array_equal(zero, fixed) and np.array_equal(below, fixed)
+        and np.all(nn_gated[0, :8] == 20000.) and np.array_equal(nn_gated[:, 8:], fixed[:, 8:])
+        and np.array_equal(nn_missing, fixed)
+        and np.all(fixed == 10000.))
     return {"passed": bool(fallback["status"] == "FALLBACK_SAFE"
                             and np.all(fallback["power"] == 0) and detected and prefix
                             and np.all(curtailed["power"] == 0) and curtailed["holder"] == 30000.
                             and zero_counted
                             and stress_passed
                             and substitute_safe and recovered and overflow_recovered and metrics_ok and calibration_causal
+                            and resource_adjustment_ok
                             and price.tolist() == [1.0, 2.0]),
             "solver_status": result["status"], "tamper_detected": bool(detected),
             "continuous_resource_shock_steps": 1200,
@@ -331,6 +367,7 @@ def _optimizer_contract_check() -> dict:
             "overflow_substitution_preserves_power_and_holder": bool(overflow_recovered),
             "daily_price_metric_and_missing_values": bool(metrics_ok),
             "online_resource_calibration_causal": bool(calibration_causal),
+            "peak_resource_adjustment_causal_missing_safe": bool(resource_adjustment_ok),
             "zero_resource_curtailment": True, "resource_zeros_counted": bool(zero_counted)}
 
 

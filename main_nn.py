@@ -1,10 +1,10 @@
-"""神经网络支路：DLinear / N-HiTS / TCN，主攻长周期外推。
+"""负荷 DLinear / N-HiTS / TCN 与独立八步资源残差网络。
 
 设计要点：
-1. 与树模型共用 15min 宽表与折协议；输出同为 (n_origins, n_horizons, 2) 立方体。
+1. 负荷网络输出两目标；资源网络独立输出八步三气种，不共用标签或预测头。
 2. 归一化只用训练段统计量（RevIN 可选），避免评测窗信息泄漏。
-3. 损失为 MAPE 加权 L1，远端提前量加权，直接对齐 1-MAPE 口径。
-4. 一切实验写 tmp/nn/；只有调参折达标的模型才进正式归档。
+3. 负荷采用 MAPE 加权 L1；资源兼顾逐气种与联合能量误差，并按已知电价加权。
+4. 实验完整写入 tmp/tmp_outputs/；只有通过开发折晋级的实际模型进入运行归档。
 """
 from __future__ import annotations
 
@@ -35,6 +35,152 @@ except Exception:
     pass
 import os
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+
+class _ResourceResidualMLP(nn.Module):
+    """资源联合预测与负荷网络隔离，只输出八步三气种的非共享预测头。"""
+    def __init__(self, width: int):
+        super().__init__()
+        self.layers = nn.Sequential(nn.Linear(width, 128), nn.SiLU(), nn.Dropout(.10),
+                                    nn.Linear(128, 64), nn.SiLU(), nn.Linear(64, 24))
+        nn.init.zeros_(self.layers[-1].weight)
+        nn.init.zeros_(self.layers[-1].bias)
+
+    def forward(self, x, anchor):
+        return self.layers(x).reshape(-1, 8, 3) + anchor[:, None, :]
+
+
+def _resource_nn_features(values: np.ndarray, positions: np.ndarray,
+                          fit_end: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    history = values[:fit_end + 1]
+    center = np.nan_to_num(np.nanmedian(history, axis=0), nan=0.)
+    scale = np.nanpercentile(history, 75, axis=0) - np.nanpercentile(history, 25, axis=0)
+    scale = np.where(np.isfinite(scale) & (scale > 1e-5), scale, 1.)
+    selected = values[positions]
+    z = np.clip((selected - center) / scale, -10., 10.)
+    # 标准化后的中性值与缺失指示同时输入，不把过程缺测伪装成真实零供气。
+    X = np.concatenate([np.nan_to_num(z, nan=0.), np.isfinite(selected).astype(np.float32)], axis=1)
+    return X.astype(np.float32), center, scale
+
+
+def _fit_resource_nn(X, anchor, target, energy_weights, price_weights,
+                     epochs: int, validation=None, seed: int = 73):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    model = _ResourceResidualMLP(X.shape[1]).to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=6e-4, weight_decay=1e-4)
+    tensors = [torch.as_tensor(a, dtype=torch.float32, device=DEVICE)
+               for a in (X, anchor, target, price_weights)]
+    ew = torch.as_tensor(energy_weights, dtype=torch.float32, device=DEVICE)
+    best, best_epoch, stale = np.inf, 1, 0
+    for epoch in range(1, epochs + 1):
+        model.train()
+        order = torch.randperm(len(X), device=DEVICE)
+        for start in range(0, len(X), 256):
+            take = order[start:start + 256]
+            prediction = model(tensors[0][take], tensors[1][take])
+            y = tensors[2][take]
+            valid = torch.isfinite(y)
+            safe = torch.nan_to_num(y, nan=0.)
+            error = nn.functional.smooth_l1_loss(prediction, safe, reduction="none", beta=.2)
+            weight = valid * tensors[3][take, :, None] * ew
+            loss = (error * weight).sum() / weight.sum().clamp_min(1.)
+            joint_valid = valid.all(dim=-1)
+            joint_error = torch.abs(((prediction - safe) * ew).sum(dim=-1))
+            loss += .25 * (joint_error * joint_valid * tensors[3][take]).sum() / joint_valid.sum().clamp_min(1.)
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 2.)
+            optimizer.step()
+        if validation is not None:
+            model.eval()
+            with torch.no_grad():
+                vx, va, vy = validation
+                prediction = model(vx, va)
+                mask = torch.isfinite(vy)
+                error = torch.abs(prediction - torch.nan_to_num(vy, nan=0.)) * mask * ew
+                score = float(error.sum() / (mask * ew).sum())
+            if score < best - 1e-5:
+                best, best_epoch, stale = score, epoch, 0
+            else:
+                stale += 1
+            if stale >= 10:
+                break
+    return model, best_epoch, best
+
+
+def train_resource_nn(base: pd.DataFrame, resource: pd.DataFrame, end_pos: int,
+                       heat: dict, prices: dict, quick: bool = False, seed: int = 73) -> dict:
+    """仅在起报前前缀选轮数，再以该轮数重训；不访问外层验证标签。"""
+    torch.set_num_threads(min(4, os.cpu_count() or 1))
+    values = base.to_numpy(dtype=np.float32)
+    actual = resource[list(C.RESOURCE_NAMES)].to_numpy(dtype=np.float32)
+    positions = np.arange(C.PROFILE_DAYS * C.STEPS_PER_DAY, end_pos - 8 + 1)
+    if quick:
+        positions = positions[::C.QUICK_TRAIN_STRIDE][-2048:]
+    split = end_pos - 7 * C.STEPS_PER_DAY
+    train, valid = positions + 8 < split, positions >= split
+    if train.sum() < 128 or valid.sum() < 32:
+        raise ValueError("资源网络的前缀训练或内部早停样本不足")
+    gas_scale = np.maximum(np.nanmedian(actual[:end_pos + 1], axis=0), 1.)
+    beta = np.array([heat["coefficients_mw_per_m3h"][g] for g in C.RESOURCE_NAMES])
+    energy_weights = (gas_scale * beta) / (gas_scale @ beta)
+    target = actual[positions[:, None] + np.arange(1, 9)] / gas_scale
+    anchor = np.nan_to_num(actual[positions] / gas_scale, nan=0.)
+    times = base.index.to_numpy()[positions[:, None] + np.arange(1, 9)]
+    flat = pd.DatetimeIndex(times.ravel())
+    price_weight = np.array([prices[t.month][t.hour * 4 + t.minute // 15] / prices[t.month].mean()
+                             for t in flat]).reshape(len(positions), 8)
+    price_weight = price_weight / np.sqrt(np.arange(1, 9))
+    inner_scale = np.maximum(np.nanmedian(actual[:split], axis=0), 1.)
+    inner_anchor = np.nan_to_num(actual[positions] / inner_scale, nan=0.)
+    inner_target = actual[positions[:, None] + np.arange(1, 9)] / inner_scale
+    inner_X, _, _ = _resource_nn_features(values, positions, split - 1)
+    validation = tuple(torch.as_tensor(v, dtype=torch.float32, device=DEVICE)
+                       for v in (inner_X[valid], inner_anchor[valid], inner_target[valid]))
+    _, epochs, error = _fit_resource_nn(inner_X[train], inner_anchor[train], inner_target[train],
+        energy_weights, price_weight[train], 2 if quick else 100, validation, seed)
+    X, center, scale = _resource_nn_features(values, positions, end_pos)
+    model, _, _ = _fit_resource_nn(X, anchor, target, energy_weights, price_weight, epochs, seed=seed)
+    return {"kind": "resource_mlp", "state_dict": model.cpu().state_dict(), "width": X.shape[1],
+            "epochs": epochs, "inner_error": error, "feature_names": list(base.columns),
+            "center": center, "scale": scale, "gas_scale": gas_scale,
+            "train_end": str(base.index[end_pos]), "inner_train_end": str(base.index[split - 1]),
+            "max_training_target": str(base.index[positions[-1] + 8]), "seed": seed}
+
+
+def predict_resource_nn(pack: dict, base: pd.DataFrame, resource: pd.DataFrame,
+                         positions: np.ndarray) -> np.ndarray:
+    if list(base.columns) != pack["feature_names"]:
+        raise ValueError("资源网络特征顺序不一致")
+    model = pack.get("_runtime_model")
+    if model is None:
+        model = _ResourceResidualMLP(pack["width"]).to(DEVICE)
+        model.load_state_dict(pack["state_dict"])
+        model.eval()
+        pack["_runtime_model"] = model
+    values = base.to_numpy(dtype=np.float32)[positions]
+    z = np.clip((values - pack["center"]) / pack["scale"], -10., 10.)
+    X = np.concatenate([np.nan_to_num(z, nan=0.), np.isfinite(values).astype(np.float32)], axis=1).astype(np.float32)
+    actual = resource[list(C.RESOURCE_NAMES)].to_numpy(dtype=np.float32)[positions]
+    anchor = np.nan_to_num(actual / pack["gas_scale"], nan=0.)
+    with torch.no_grad():
+        output = model(torch.as_tensor(X, device=DEVICE),
+                       torch.as_tensor(anchor, device=DEVICE)).cpu().numpy()
+    return np.maximum(output * pack["gas_scale"], 0.)
+
+
+def save_resource_nn(pack: dict, path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({k: v for k, v in pack.items() if not k.startswith("_")}, path)
+    return path
+
+
+def load_resource_nn(path: Path) -> dict:
+    pack = torch.load(path, map_location="cpu", weights_only=False)
+    if pack.get("kind") != "resource_mlp":
+        raise ValueError("不是独立八步资源网络")
+    return pack
 
 
 # ---------------------------------------------------------------------------
