@@ -39,6 +39,13 @@ class PreparedData:
     source_hashes: dict = field(default_factory=dict)
     stage_ranges: dict = field(default_factory=dict)
 
+    def require_training_data(self) -> None:
+        """训练入口二次拦截，避免调用方误传本地评测对象或其前缀副本。"""
+        if (self.quality.get("data_scope") == "local_evaluation"
+                or any(s["role"] != "train" for s in self.scan.get("stages", {}).values())
+                or self.index[-1] > pd.Timestamp(C.TRAIN_END)):
+            raise ValueError("本地评测数据不得进入训练、选参或标定，请独立读取训练阶段")
+
     def masked_copy(self, start: pd.Timestamp | str, end: pd.Timestamp | str) -> "PreparedData":
         """复制并遮挡连续评测窗口的目标负荷，模拟正式推理的输入模式。"""
         start = pd.Timestamp(start)
@@ -87,19 +94,21 @@ def _read_csv(path: Path) -> pd.DataFrame:
     raise ValueError(f"无法解析 {path.name}: {last_error}")
 
 
-def _find_table_files(stage_dir: Path, table: str) -> list[Path]:
+def _find_table_files(stage_dir: Path, table: str, config=C) -> list[Path]:
     files = [p for p in stage_dir.glob("*.csv") if p.is_file()]
     hits: list[Path] = []
-    for suffix in C.TABLE_SUFFIXES[table]:
+    for suffix in config.TABLE_SUFFIXES[table]:
         hits.extend(p for p in files if p.name.lower().endswith(suffix.lower()))
     return sorted(set(hits))
 
 
-def scan_sources(config=C) -> dict:
-    """只读扫描四个真实数据目录；不根据目录名猜标签是否发布。"""
+def scan_sources(config=C, include_inference: bool = True) -> dict:
+    """按阶段角色只读扫描；训练扫描不打开官方测试文件。"""
     report = {"generated_at": pd.Timestamp.now().isoformat(timespec="seconds"),
               "stages": {}, "files": {}, "extras": {}, "problems": []}
     for stage in config.STAGES:
+        if not include_inference and stage["role"] != "train":
+            continue
         stage_dir = config.DATA_ROOT / stage["dir"]
         info = {"dir": str(stage_dir), "exists": stage_dir.is_dir(),
                 "role": stage["role"], "tables": {}}
@@ -109,7 +118,7 @@ def scan_sources(config=C) -> dict:
             report["stages"][stage["name"]] = info
             continue
         for table in config.TABLES:
-            files = _find_table_files(stage_dir, table)
+            files = _find_table_files(stage_dir, table, config)
             table_info = {"files": [], "rows": 0, "columns": [], "time_range": None,
                           "target_valid": {}, "duplicates": 0, "missing_ratio": {}}
             for path in files:
@@ -286,14 +295,16 @@ def _concat_stage_tables(frames: list[pd.DataFrame], name: str,
         conflict = repeated.groupby(level=0).nunique(dropna=False).gt(1).any(axis=1)
         if conflict.any():
             second_counts.append(int(conflict.sum()))
-        combined = combined.loc[~combined.index.duplicated(keep="first")]
+        # 新发布的 half_train 补齐旧 semi_test 的标签与缺测，以整条新记录为准。
+        combined = combined.loc[~combined.index.duplicated(keep="last")]
     return combined
 
 
 def prepare_data(config=C, mask_targets: tuple | None = None,
-                 cutoff: pd.Timestamp | str | None = None) -> PreparedData:
-    """扫描、拼接、清洗并生成统一 15 分钟宽表。"""
-    scan = scan_sources(config)
+                 cutoff: pd.Timestamp | str | None = None,
+                 include_inference: bool = False) -> PreparedData:
+    """默认只读取训练阶段；本地评测须显式打开推理阶段。"""
+    scan = scan_sources(config, include_inference=include_inference)
     source_hashes = {k: v["sha256"] for k, v in scan["files"].items()}
     conflicts: list[str] = []
     duplicate_conflicts: list[int] = []
@@ -301,15 +312,26 @@ def prepare_data(config=C, mask_targets: tuple | None = None,
     stage_ranges: dict[str, list[str]] = {}
 
     for stage in config.STAGES:
+        if stage["name"] not in scan["stages"]:
+            continue
         stage_dir = config.DATA_ROOT / stage["dir"]
         if not stage_dir.is_dir():
             continue
         loaded = {}
         for table in config.TABLES:
             pieces = []
-            for path in _find_table_files(stage_dir, table):
+            for path in _find_table_files(stage_dir, table, config):
                 raw = _read_csv(path)
-                pieces.append(_standardize_table(raw, f"{stage['name']}/{table}", conflicts))
+                part = _standardize_table(raw, f"{stage['name']}/{table}", conflicts)
+                start = pd.Timestamp(stage["period"][0])
+                stop = pd.Timestamp(stage["period"][1]) + pd.Timedelta(days=1)
+                part = part.loc[(part.index >= start) & (part.index < stop)]
+                if stage["labels"] in {"masked", "forbidden"}:
+                    targets = [t for t in config.TARGETS if t in part.columns]
+                    if stage["labels"] == "forbidden" and part[targets].notna().any().any():
+                        raise ValueError(f"{stage['name']}/{path.name}: 官方测试标签禁止进入预测数据")
+                    part.loc[:, targets] = np.nan
+                pieces.append(part)
             if pieces:
                 frame = pd.concat(pieces, axis=0).sort_index()
                 frame = frame.loc[~frame.index.duplicated(keep="first")]
@@ -338,6 +360,7 @@ def prepare_data(config=C, mask_targets: tuple | None = None,
     frame.index.name = "datetime"
 
     quality: dict = {"rows": int(len(frame)),
+                     "data_scope": "local_evaluation" if include_inference else "training_only",
                      "time_range": [index.min().isoformat(), index.max().isoformat()],
                      "duplicate_conflicts": int(sum(duplicate_conflicts)),
                      "problems": conflicts}

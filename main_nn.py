@@ -929,6 +929,7 @@ def train_nn(prepared: PreparedData, folds: list[dict], kind: str = "dlinear",
              horizons: tuple[int, ...] | None = None, quick: bool = False,
              n_seeds: int = 1, cfg: dict | None = None) -> NNBundle:
     """单个训练截止点拟合：前缀内早停选轮数，再按固定轮数重训合法前缀。"""
+    prepared.require_training_data()
     horizons = tuple(horizons or C.HORIZONS_L)
     cfg = _cfg(cfg)
     look_back = int(cfg["look_back"])

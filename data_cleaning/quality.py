@@ -22,6 +22,11 @@ def data_contract_check(prepared: PreparedData) -> dict:
         problems.append("时间索引存在重复")
     if not prepared.labels.index.equals(prepared.index):
         problems.append("标签索引与特征索引不一致")
+    if prepared.quality.get("data_scope") == "training_only":
+        if prepared.index[-1] > pd.Timestamp(C.TRAIN_END):
+            problems.append("训练数据超过允许截止点")
+        if any(s["role"] != "train" for s in prepared.scan.get("stages", {}).values()):
+            problems.append("训练数据包含非训练阶段")
     for target in C.TARGETS:
         if C.TARGET_COLUMN[target] not in prepared.frame.columns:
             problems.append(f"缺少目标列 {C.TARGET_COLUMN[target]}")
@@ -60,6 +65,78 @@ def _synthetic_prepared(n: int = 480) -> PreparedData:
     labels = pd.DataFrame({t: frame[C.TARGET_COLUMN[t]] for t in C.TARGETS}, index=index)
     return PreparedData(index=index, frame=frame, labels=labels,
                         quality={}, scan={}, source_hashes={}, stage_ranges={})
+
+
+def _stage_isolation_check() -> dict:
+    """用临时数据验证新阶段覆盖、特殊文件名及测试集隔离，不读取真实测试值。"""
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+    from types import SimpleNamespace
+
+    C.EXPERIMENT_OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix="stage_isolation_", dir=C.EXPERIMENT_OUTPUT_ROOT) as directory:
+        cfg = SimpleNamespace(**{k: getattr(C, k) for k in dir(C) if k.isupper()})
+        cfg.ROOT = Path(directory)
+        cfg.DATA_ROOT = cfg.ROOT / "data"
+        cfg.STAGES = tuple(s for s in C.STAGES if s["name"] in {"semi_test", "half_train", "half_test"})
+        for stage in cfg.STAGES:
+            folder = cfg.DATA_ROOT / stage["dir"]
+            folder.mkdir(parents=True)
+            times = (["2025-10-11 00:00:00", "2025-10-31 23:45:00"]
+                     if stage["name"] == "half_test" else ["2025-10-10 23:45:00", "2025-10-11 00:00:00"])
+            payloads = {
+                "load": {"generator_1": 100., "generator_all": 200.,
+                         "generator_use_blast_furnace_gas": 500000.,
+                         "generator_use_coke_gas": 30000., "generator_use_converter_gas": 50000.},
+                "gas": {"blast_furnace_1": 800000., "coke_oven_1": 50000., "converter_1": 2000.},
+                "gas_user": {"blast_furnace_user1": 10000.},
+                "gas_holder": {"blast_furnace_gas_holder_2": 100000.},
+            }
+            for table, values in payloads.items():
+                raw = pd.DataFrame({"datetime": times, **values})
+                if stage["name"] != "half_train" and table == "load":
+                    raw.loc[:, list(C.TARGETS)] = np.nan
+                name = "final_load_real.csv" if stage["name"] == "half_test" and table == "load" else f"final_{table}.csv"
+                raw.to_csv(folder / name, index=False)
+        training = prepare_data(cfg)
+        evaluated = prepare_data(cfg, include_inference=True)
+        training.require_training_data()
+        from main_s import train_short
+        from main_l import train_long
+        from main_opt import train_resources
+        from main_nn import train_nn
+        blocked = []
+        for trainer in (train_short, train_long, train_resources, train_nn):
+            try:
+                trainer(evaluated.prefix_copy(C.TRAIN_END), [])
+            except ValueError as exc:
+                blocked.append("本地评测数据不得进入训练" in str(exc))
+            else:
+                blocked.append(False)
+        overlap = pd.Timestamp("2025-10-10 23:45:00")
+        official = evaluated.index >= pd.Timestamp(C.OFFICIAL_EVAL_START)
+        priority = bool(evaluated.labels.loc[overlap, "generator_1"] == 100.)
+        boundary = bool(training.index[-1] == overlap and training.labels.notna().all().all())
+        alias = bool(evaluated.frame.loc[C.OFFICIAL_EVAL_START, "d_use_blast"] == 500000.)
+        targets_hidden = bool(evaluated.labels.loc[official].isna().all().all())
+        test_load = cfg.DATA_ROOT / "half_test" / "final_load_real.csv"
+        changed = pd.read_csv(test_load)
+        changed.loc[:, "generator_use_blast_furnace_gas"] = 0.
+        changed.loc[:, list(C.TARGETS)] = 999.
+        changed.to_csv(test_load, index=False)
+        second = prepare_data(cfg)
+        independent = bool(training.frame.equals(second.frame) and training.source_hashes == second.source_hashes
+                           and set(training.stage_ranges) == {"half_train"})
+        rejected = False
+        try:
+            prepare_data(cfg, include_inference=True)
+        except ValueError as exc:
+            rejected = "官方测试标签禁止" in str(exc)
+    return {"passed": all((priority, boundary, alias, targets_hidden, independent, rejected, all(blocked))),
+            "new_stage_priority": priority, "training_cutoff": boundary,
+            "load_real_recognized": alias, "test_targets_hidden": targets_hidden,
+            "test_changes_do_not_affect_training": independent, "test_labels_rejected": rejected,
+            "all_training_entries_reject_evaluation": all(blocked)}
 
 
 def _future_perturbation_check() -> dict:
@@ -449,6 +526,7 @@ def _rolling_causality_check() -> dict:
 
 def run_self_checks(config=C) -> dict:
     checks = {
+        "stage_isolation": _stage_isolation_check(),
         "future_perturbation": _future_perturbation_check(),
         "prefix_consistency": _prefix_consistency_check(),
         "zero_preservation": _zero_preservation_check(),

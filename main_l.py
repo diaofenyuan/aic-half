@@ -51,6 +51,7 @@ class LongBundle:
 
 
 def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -> LongBundle:
+    prepared.require_training_data()
     tuning = [f for f in folds if f["role"] == "tuning"]
     if quick:
         tuning = tuning[:1]

@@ -4,11 +4,10 @@
 
 ```powershell
 python main.py            # 完整链路（历史 21 天开发验证）——须由真人启动或明确授权
-python main.py infer      # 半决赛特征窗口干跑——须由真人启动
+python main.py infer --experiment # 冻结训练后对官方测试集本地评测——须由真人启动
 python main.py --quick    # 单折开发模式
 python main.py infer --quick
 python main.py run --experiment # 获准后的全量开发实验，写入 tmp/tmp_outputs
-python main.py infer --experiment
 python main.py doctor     # 只读扫描数据目录
 python main.py self-check # 因果清洗与特征自检
 python main.py verify     # 校验最近一次输出
@@ -32,17 +31,24 @@ python main.py run --experiment --nn-only --nn-span resource --folds A,B
 模型截止点必须早于推理窗口，冻结专项可按短期、长期重复传入。
 运行摘要明确记录模型来源和本轮未评估 D，不把既有诊断当作新确认。
 
-全量 `run` / `infer` 训练耗时较长，必须由真人发起或明确授权；当前轮已获得
-2026-10-23 全量训练授权。后续任务仍按 `AGENTS.md` §8 判断授权范围。
+全量 `run` / `infer` 训练耗时较长，必须由真人发起或明确授权；
+2026-10-23 的历史单轮授权不自动延续，后续任务按 `AGENTS.md` §8 判断授权范围。
 
 `--quick` 的完整运行产物写入 `tmp/tmp_outputs/<run_id>/`。开发实验也必须使用
 该目录；`outputs/` 只保留用户明确归档的选定最终运行。
 
 ## 数据
 
-`data/first_train`、`data/first_test`、`data/semi_train`、`data/semi_test` 只读。
-半决赛正式评测区间 2025-10-11～10-31 的输入尚未发布；`data/half_test/` 为预留目录。
-程序不会根据目录名假定标签存在，扫描结果决定可用标签。
+所有原始数据目录只读。`half_train` 已接入，新增 2025-10-01～10-10 的完整训练标签；
+与旧 `semi_test` 重叠时，以新发布的 `half_train` 记录为准。
+
+训练数据准备默认只读取 `role=train` 阶段，截止 2025-10-10 23:45。
+`half_test`（2025-10-11～10-31）只用于冻结模型后的本地预测/评分，
+不参与负荷/资源训练、选参、融合、早停或物理标定；训练扫描也不读取该目录。
+短期、长期、资源及 NN 训练入口会拒绝本地评测对象，即使传入其测试期之前的前缀。
+本地评测显式开启测试输入，支持 `final_load_real.csv`，保持完整 2016 个起报点。
+该文件的两个目标负荷当前全为空，无法计算官方测试集的本地 1-MAPE；
+已发布耗气仅到 10 月 12 日，后续保持缺测，不补零伪造资源。
 
 ## 方法
 
@@ -93,8 +99,10 @@ python main.py run --experiment --nn-only --nn-span resource --folds A,B
 最多 8 轮内部早停试验并按选定轮数重训，优化仅抽取前 2 天，不代表全量结果。
 历史多步错位修复前的分数不作新基线；D 窗口已参与历史开发，不声称独立盲测。
 
-`infer` 在 `data/half_test` 就绪时对准官方评测窗；否则用 `semi_test`
+`infer` 在 `data/half_test` 四表覆盖官方评测区间时用于本地评测；否则在测试输入
+尚未提供时用 `semi_test`
 （2025-10-01～10-10）做提交链路干跑，产物同样标记不可提交。
+已提供但不完整的官方四表会报错，不静默缩短评测窗口或退回旧窗口。
 
 `opt_result.csv` 的 `datetime` 采用调度目标时刻（t+15min…t+1440min）。官方
 模板尚未发布，正式提交前必须按官方行列语义重新适配。

@@ -161,16 +161,23 @@ def run_verify(directory: Path | None = None) -> int:
 
 
 def _inference_window(prepared) -> tuple[pd.DatetimeIndex, str]:
-    """选择官方推理起报点：优先 half_test，否则用 semi_test 做预开发干跑。"""
+    """本地评测保留完整起报网格；已提供但不完整的官方输入直接报错。"""
     index = prepared.index
     half = [s for s in C.STAGES if s["name"] == "half_test"]
-    if half and (C.DATA_ROOT / half[0]["dir"]).is_dir():
+    info = prepared.scan.get("stages", {}).get("half_test", {})
+    tables = info.get("tables", {})
+    if half and any(t.get("files") for t in tables.values()):
         start = pd.Timestamp(C.OFFICIAL_EVAL_START)
         end = pd.Timestamp(C.OFFICIAL_EVAL_END)
+        for table in C.TABLES:
+            detail = tables.get(table, {})
+            span = detail.get("time_range")
+            if (not span or pd.Timestamp(span[0]) > start or pd.Timestamp(span[1]) < end):
+                raise ValueError(f"half_test/{table} 缺失或未覆盖完整官方评测区间")
         origins = pd.date_range(start, end, freq=f"{C.STEP_MINUTES}min")
-        origins = origins[origins.isin(index)]
-        if len(origins):
-            return origins, "half_test"
+        if not origins.isin(index).all():
+            raise ValueError("官方评测网格不完整，不得截短输出窗口")
+        return origins, "half_test"
     stage = next(s for s in C.STAGES if s["name"] == "semi_test")
     start = pd.Timestamp(stage["period"][0] + " 00:00:00")
     end = pd.Timestamp(stage["period"][1] + " 23:45:00")
@@ -183,7 +190,7 @@ def _inference_window(prepared) -> tuple[pd.DatetimeIndex, str]:
 
 def run_infer(quick: bool = False, experimental: bool = False,
               reuse_run: Path | None = None, nn_studies: list[Path] | None = None) -> int:
-    """半决赛预开发：在官方特征窗口上滚动预测并生成提交格式文件。"""
+    """冻结训练后在官方特征窗口做本地评测，仍保留不可提交标记。"""
     started = time.time()
     ctx = output.begin_run(C, mode="infer", experimental=quick or experimental)
     _setup_logger(ctx.log_path)
@@ -193,7 +200,7 @@ def run_infer(quick: bool = False, experimental: bool = False,
                "quick": bool(quick), "validation_scope": "A/B开发验证" if quick else "历史开发验证，D已被多次查看", "errors": []}
     try:
         scan = scan_sources()
-        prepared = prepare_data(C)
+        prepared = prepare_data(C, include_inference=True)
         contract = data_contract_check(prepared)
         if not contract["passed"]:
             raise ValueError("数据契约检查失败: " + "; ".join(contract["problems"]))
@@ -201,7 +208,11 @@ def run_infer(quick: bool = False, experimental: bool = False,
             raise ValueError("源数据在读取后被修改")
 
         origins, window = _inference_window(prepared)
-        training = prepared.prefix_copy(origins[0] - pd.Timedelta(minutes=C.STEP_MINUTES))
+        # 训练重新读取独立白名单，测试期过程量也不能用于资源拟合或物理标定。
+        training = prepare_data(C).prefix_copy(min(
+            pd.Timestamp(C.TRAIN_END), origins[0] - pd.Timedelta(minutes=C.STEP_MINUTES)))
+        LOGGER.info("训练白名单: %s .. %s；官方测试仅作本地评测",
+                    training.index[0], training.index[-1])
         if reuse_run is None:
             folds = build_folds(training, quick=quick)
             short_bundle = main_s.train_short(training, folds, quick=quick)
@@ -284,6 +295,10 @@ def run_infer(quick: bool = False, experimental: bool = False,
         summary.update({
             "status": "SUCCESS_INFER" if official else "SUCCESS_DRYRUN",
             "window": window,
+            "data_usage": {"training_range": [str(training.index[0]), str(training.index[-1])],
+                           "training_stages": list(training.stage_ranges),
+                           "official_test_training_used": False,
+                           "test_usage": "frozen_model_local_evaluation_only"},
             "origins": int(len(origins)),
             "origin_range": [str(origins[0]), str(origins[-1])],
             "short": {"scores": short_bundle.scores, "selection": short_bundle.selection,
@@ -302,7 +317,8 @@ def run_infer(quick: bool = False, experimental: bool = False,
             "zip": zip_report,
             "submittable": bool(official),
             "reason": None if official else
-                      "缺少正式半决赛评测输入或官方 opt_result 模板，仅作预开发干跑",
+                      ("官方半决赛输入已接入，仅作本地评测；官方优化模板及物理口径尚未核对"
+                       if window == "half_test" else "缺少正式半决赛评测输入，仅作预开发干跑"),
             "duration_seconds": round(time.time() - started, 2),
         })
         report_path = output.write_report(ctx, summary)
@@ -334,7 +350,7 @@ def run_full(quick: bool = False, experimental: bool = False) -> int:
                "experimental": bool(quick or experimental), "output_root": str(ctx.root),
                "quick": bool(quick), "validation_scope": "A/B开发验证" if quick else "历史开发验证，D已被多次查看", "errors": []}
     try:
-        scan = scan_sources()
+        scan = scan_sources(include_inference=False)
         LOGGER.info("扫描完成: %d 个阶段目录, %d 个文件",
                     len(scan["stages"]), len(scan["files"]))
         prepared = prepare_data(C)
@@ -470,7 +486,7 @@ def run_full(quick: bool = False, experimental: bool = False) -> int:
                 "source": source_report,
                 "zip": zip_report,
                 "submittable": False,
-                "reason": "缺少正式半决赛评测输入与官方 opt_result 模板",
+                "reason": "历史开发验证模拟包；官方优化模板及物理口径尚未核对",
             },
             "duration_seconds": round(time.time() - started, 2),
         })

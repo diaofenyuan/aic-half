@@ -583,6 +583,7 @@ def _resource_head_positions(ref_pos: int, quick: bool) -> np.ndarray:
 
 def train_resources(prepared: PreparedData, folds: list[dict],
                     quick: bool = False) -> ResourceBundle:
+    prepared.require_training_data()
     started = time.time()
     confirm = next(f for f in folds if f["role"] == "confirm")
     masked = prepared.masked_copy(

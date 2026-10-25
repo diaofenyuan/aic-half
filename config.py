@@ -19,8 +19,8 @@ EXPERIMENT_OUTPUT_ROOT = TMP_ROOT / "tmp_outputs"
 
 # ---------------------------------------------------------------------------
 # 阶段与文件
-# 官方赛题：半决赛发布 2025-10-01~10-10 特征，评测区间 2025-10-11~10-31。
-# 当前磁盘上只有前者；因此日常运行走历史 21 天盲测，正式评测输入出现后再适配。
+# 半决赛训练标签覆盖 2025-10-01~10-10，评测区间为 2025-10-11~10-31。
+# 阶段按发布顺序排列；重叠时间戳以较新发布的数据为准。
 # ---------------------------------------------------------------------------
 STEPS_PER_DAY = 96
 STEP_MINUTES = 15
@@ -34,7 +34,10 @@ STAGES = (
      "labels": "present", "period": ("2025-05-03", "2025-09-30")},
     {"name": "semi_test", "dir": "semi_test", "role": "inference_features",
      "labels": "masked", "period": ("2025-10-01", "2025-10-10")},
-    # 正式半决赛输入目录：当前不存在。出现后仅作推理输入，标签必须为空。
+    {"name": "half_train", "dir": "half_train", "role": "train",
+     "labels": "present", "period": ("2025-10-01", "2025-10-10"),
+     "optional": True},
+    # 官方测试集只作冻结后的本地评测输入，不参与任何训练或标定。
     {"name": "half_test", "dir": "half_test", "role": "official_inference",
      "labels": "forbidden", "period": ("2025-10-11", "2025-10-31"),
      "optional": True},
@@ -45,7 +48,7 @@ TABLE_SUFFIXES = {
     "gas_holder": ("gas_holder.csv",),
     "gas_user": ("gas_user.csv",),
     "gas": ("gas.csv",),
-    "load": ("load.csv",),
+    "load": ("load.csv", "load_real.csv"),
 }
 TABLES = ("load", "gas", "gas_user", "gas_holder")
 
@@ -57,8 +60,8 @@ HORIZONS_L = tuple(range(1, 97))
 PROBE_HORIZONS = (1, 2, 4, 8, 16, 24, 32, 48, 64, 80, 96)
 
 TRAIN_START = "2025-01-01 00:00:00"
-TRAIN_END = "2025-09-30 23:45:00"
-# 当前没有正式评测特征；保留官方区间用于正式输入适配与输出校验。
+TRAIN_END = "2025-10-10 23:45:00"
+# 官方测试范围仅用于本地评测窗口与输出覆盖校验。
 OFFICIAL_EVAL_START = "2025-10-11 00:00:00"
 OFFICIAL_EVAL_END = "2025-10-31 23:45:00"
 

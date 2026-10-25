@@ -456,6 +456,7 @@ def _fold_positions(prepared: PreparedData, fold: dict,
 
 
 def train_short(prepared: PreparedData, folds: list[dict], quick: bool = False) -> ShortBundle:
+    prepared.require_training_data()
     tuning = [f for f in folds if f["role"] == "tuning"]
     if quick:
         tuning = tuning[:1]
