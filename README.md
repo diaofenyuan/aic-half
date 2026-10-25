@@ -58,6 +58,22 @@ E6 用训练前缀内完整折外误差路径校准库存裕度，不可行时�
 对通过完整门槛的 `observed` 专项，同一入口复用主模型，只独立重训缺少的新增特征分支。
 `pressure` 只诊断 10 月 1～9 日起报点，训练截止 9 月 30 日；该已查看分布的
 九天窗口不参加晋级，也不称为独立盲测。
+
+`generator1` 专项固定现有总负荷和优化策略，比较缺测专家融合、前缀折外门控、
+专项树及联合遮挡神经网络。短长期独立训练；完整 A/B/C 三种观测情景通过后，
+只将胜出的 `generator_1` 分支接入推理。平均增益门槛为 0.2 个百分点，
+单折退化不超过 0.2 个百分点且最差折不下降；这些是开发门槛，不是官方标准。
+
+```bash
+python main.py run --experiment --plan-study generator1 --study-reference tmp/tmp_outputs/<完整可用性专项>
+python main.py run --experiment --plan-study generator1 --study-reference tmp/tmp_outputs/<完整可用性专项> --study-resume tmp/tmp_outputs/<本轮专项> --g1-stages G5,G6,G7
+python main.py verify --run-dir tmp/tmp_outputs/<已完成专项>
+python main.py infer --experiment --reuse-run tmp/tmp_outputs/<当前最终模型> --generator1-study-run tmp/tmp_outputs/<已核验专项>
+```
+
+全量训练须由真人启动或明确授权。专项可续跑，已保存的模型保留在对应实验目录；
+测试输入不参与专项选择，D 不重评。专项最终模型及冻结参数随结果包保存，
+归档重载不依赖实验缓存；预测改善不能代替优化物理核验。
 资源专项中断后，可在同一命令追加 `--study-resume tmp/tmp_outputs/<中断目录>`；
 续跑核对原数据来源、训练截止、标签索引和模型重载预测，只补尚未完成的模型，
 原源码快照保留，续跑源码归档到 `源码/续跑/`。

@@ -684,6 +684,42 @@ def _observed_at_t_check() -> dict:
             "additional_features": len(base.columns), "window": "(t-window,t]"}
 
 
+def _generator1_contract_check() -> dict:
+    import copy
+    import main_s
+    import main_nn
+    prepared = _synthetic_prepared(40 * 96)
+    prepared.frame["at_t_synthetic"] = prepared.frame["d_gen_blast"]
+    origin = 35 * 96
+    changed = copy.deepcopy(prepared)
+    changed.frame.loc[changed.index > changed.index[origin], :] = np.nan
+    causal = all(np.allclose(main_s.generator1_base(prepared, days).iloc[:origin + 1],
+        main_s.generator1_base(changed, days).iloc[:origin + 1], equal_nan=True) for days in (0, 21))
+    positions = np.array([origin, origin + 1])
+    first = C.PROFILE_DAYS * 96
+    start = first + ((origin - first) // (21 * 96)) * 21 * 96
+    view = prepared.masked_copy(prepared.index[start], prepared.index[-1])
+    profiles_same = np.allclose(main_nn._blocked_profiles(prepared, positions, (1, 8, 96), 21),
+        main_nn._profile_cube(view, positions, (1, 8, 96), fuel=False), equal_nan=True)
+    reference = np.array([[[120., 300.], [80., 280.], [200., 440.]]])
+    result = main_s.generator1_project(np.array([[-20., 400., 40.]]), reference)
+    total_same = np.array_equal(reference[..., 1], result[..., 1])
+    bounds = np.all(result[..., 0] >= np.maximum(0., result[..., 1] - 240.)) and np.all(result[..., 0] <= np.minimum(200., result[..., 1]))
+    torch = main_nn.torch
+    sample = main_nn._Sample(torch.zeros((8, 2), device=main_nn.DEVICE), np.array([3, 4, 5]),
+        np.full((3, 4, 2), 100.), np.zeros((3, 4, 1), dtype=np.float32), None, 3, 4,
+        (1, 2, 3, 4), "direct", {"target_indices": [0]})
+    prediction = torch.full((3, 4, 2), 100., device=main_nn.DEVICE)
+    changed_prediction = prediction.clone()
+    changed_prediction[..., 1] = 999.
+    take = torch.arange(3, device=main_nn.DEVICE)
+    target_only = sample.loss(prediction, take).item() == sample.loss(changed_prediction, take).item()
+    checks = {"future_independent": causal, "blocked_profile_matches_service": profiles_same,
+              "total_preserved": total_same, "structure_bounds": bool(bounds),
+              "specialist_loss_ignores_total_output": target_only}
+    return {"passed": bool(all(checks.values())), **checks}
+
+
 def run_self_checks(config=C) -> dict:
     checks = {
         "stage_isolation": _stage_isolation_check(),
@@ -700,6 +736,7 @@ def run_self_checks(config=C) -> dict:
         "plan_research": _plan_research_check(),
         "power_gas_availability": _power_gas_availability_check(),
         "observed_at_t": _observed_at_t_check(),
+        "generator1_contract": _generator1_contract_check(),
     }
     checks["passed"] = all(v.get("passed", False) for v in checks.values())
     return checks

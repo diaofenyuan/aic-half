@@ -369,7 +369,12 @@ def build_feature_table(prepared: PreparedData, load_history: bool = False,
 
     base = build_base_features(prepared, include_targets=True)
     columns = list(_feature_columns(base, "gas"))
-    if feature_set == "compact":
+    if feature_set == "generator1":
+        from main_s import generator1_base
+        base = generator1_base(prepared)
+        # 目标历史由带整窗遮挡的条件向量提供，避免序列中混入训练期新鲜标签。
+        columns = [c for c in base if not c.startswith(("g1_generator_1_", "g1_generator_all_"))]
+    elif feature_set == "compact":
         columns = [c for c in columns if c.startswith(("cal_", "obs_")) or
                    (c.startswith("d_") and not any(s in c for s in ("_lag", "_ma", "_std"))
                     and not c.endswith(("_d1", "_d4")))]
@@ -435,6 +440,17 @@ def _future_columns(prepared: PreparedData, positions: np.ndarray,
         weekday = cal["tgt_weekday"]
         parts = [cal["tgt_slot_sin"], cal["tgt_slot_cos"], np.sin(2 * np.pi * weekday / 7.),
                  np.cos(2 * np.pi * weekday / 7.), cal["tgt_is_weekend"], frac]
+    if (cfg or {}).get("future_price"):
+        from main_opt import load_prices
+        if not hasattr(_future_columns, "_prices"):
+            _future_columns._prices = load_prices()
+        prices = _future_columns._prices
+        times = pd.DatetimeIndex(np.repeat(prepared.index.take(positions).to_numpy(), m) +
+            np.tile(np.asarray(horizons), n).astype("timedelta64[m]") * C.STEP_MINUTES)
+        if any(month not in prices for month in np.unique(times.month)):
+            raise ValueError("专项未来电价缺少官方月份，禁止补造")
+        price = np.array([prices[t.month][t.hour * 4 + t.minute // 15] for t in times]).reshape(n, m)
+        parts.append(price)
     return np.stack(parts, axis=-1).astype(np.float32)
 
 
@@ -793,6 +809,9 @@ class _Sample:
         self.aug_noise = float(cfg.get("aug_noise", 0.0) or 0.0)
         self.aug_channel_drop = float(cfg.get("aug_channel_drop", 0.0) or 0.0)
         self.prior = float(cfg.get("prior_lambda", 0.0) or 0.0)
+        self.target_indices = list(cfg.get("target_indices", (0, 1)))
+        if not self.target_indices or any(i not in (0, 1) for i in self.target_indices):
+            raise ValueError("NN专项目标索引必须来自两个合法目标")
         half_life = float(cfg.get("sample_decay_days", 0.) or 0.)
         age = np.maximum(int(cfg.get("cutoff_position", self.positions.max())) - self.positions, 0)
         self.sample_weight = torch.as_tensor(np.power(2., -age / (half_life * C.STEPS_PER_DAY))
@@ -821,9 +840,9 @@ class _Sample:
         weights = self.h_weight * self.sample_weight[take, None, None]
         # 每个目标独立归约；零负荷保持合法标签，以容量归一化的绝对误差另行约束。
         loss = ((relative * positive * weights).sum((0, 1)) /
-                (positive * weights).sum((0, 1)).clamp_min(1.)).mean()
+                (positive * weights).sum((0, 1)).clamp_min(1.))[self.target_indices].mean()
         loss = loss + .1 * ((error / self.capacity * zero).sum((0, 1)) /
-                           zero.sum((0, 1)).clamp_min(1.)).mean()
+                            zero.sum((0, 1)).clamp_min(1.))[self.target_indices].mean()
         if self.prior > 0.0 and self.mode == "ratio":
             # 向“完全信任画像”收缩：开发折显示柔性网络会把训练期工况当成规律，
             # 遇到换季后的新工况反而低于画像，用显式先验压住这类偏移。
@@ -878,7 +897,7 @@ class _Sample:
                 relative = (estimate - safe).abs() / safe
                 total += (relative * valid).sum((0, 1), dtype=torch.float64)
                 count += valid.sum((0, 1))
-        return float((total / count.clamp_min(1.)).mean())
+        return float((total / count.clamp_min(1.))[self.target_indices].mean())
 
 
 def _make_sample(prepared: PreparedData, table: torch.Tensor, positions: np.ndarray,
@@ -896,7 +915,7 @@ def _make_sample(prepared: PreparedData, table: torch.Tensor, positions: np.ndar
     positions, targets = positions[keep], targets[keep]
     future = _future_columns(prepared, positions, horizons, cfg)
     profile = None
-    if mode in ("ratio", "residual"):
+    if mode in ("ratio", "residual") or cfg.get("profile_conditions_scaled"):
         mask_days = int(cfg.get("training_mask_days", 0))
         profile = (_blocked_profiles(prepared, positions, horizons, mask_days)
                    if mask_days > 0 else _profile_cube(prepared, positions, horizons, fuel=_profile_is_fuel(cfg)))
@@ -1001,7 +1020,7 @@ def train_nn(prepared: PreparedData, folds: list[dict], kind: str = "dlinear",
         return (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
                 if cfg.get("scheduler") == "cosine" else None)
 
-    seeds = [20261021 + i for i in range(max(1, n_seeds))]
+    seeds = [int(cfg.get("seed_base", 20261021)) + i for i in range(max(1, n_seeds))]
     selected_epochs, val_losses = [], []
     curves = {"train": [], "val": []}
     for seed in C.progress(seeds, desc=f"NN {kind} 内部早停种子", unit="种子"):
@@ -1128,7 +1147,7 @@ def predict_nn(bundle: NNBundle, prepared: PreparedData,
     cfg["head_mode"] = bundle.head_mode
     future = _future_columns(prepared, sub, bundle.horizons, cfg)
     profile = None
-    if bundle.head_mode in ("ratio", "residual"):
+    if bundle.head_mode in ("ratio", "residual") or cfg.get("profile_conditions_scaled"):
         profile = _profile_cube(prepared, sub, bundle.horizons, fuel=_profile_is_fuel(cfg))
         if cfg.get("profile_conditions"):
             future = _profile_conditions(prepared, sub, future, profile)

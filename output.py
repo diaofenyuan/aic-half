@@ -253,6 +253,9 @@ def load_final_models(directory: Path):
                     key = (tag.rsplit("__", 1)[0], int(tag.rsplit("__", 1)[1])) if "__" in tag else tag
                     retained["models"][key] = lgb.Booster(model_str=(directory / "retained" / filename).read_text(encoding="utf-8"))
             bundles[-1].final_availability = state
+        if item.get("generator1"):
+            from main_s import load_generator1
+            bundles[-1].final_generator1 = load_generator1(model_root / item["generator1"]["path"])
     item, artifacts = meta["resource"], meta["artifacts"]["resource"]
     from main_opt import load_resource_model
     models = {tag: load_resource_model((model_root / "resource" / "final" / filename).read_text(encoding="utf-8"))
@@ -322,6 +325,15 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
                 info["retained"] = retained_info
                 summary["reload_ok"] &= retained_info["reload_ok"]
         nn = getattr(bundle, "final_nn_bundle" if use_final else "nn_bundle", None)
+        specialist = getattr(bundle, "final_generator1", None) if use_final else None
+        if specialist:
+            from main_s import save_generator1, load_generator1
+            directory = ctx.model_dir / name / "final_generator1"
+            save_generator1(specialist, directory)
+            loaded = load_generator1(directory)
+            same = (loaded["recipe"] == specialist["recipe"] and loaded["train_end"] == specialist["train_end"])
+            summary[name]["generator1"] = {"path": str(directory.relative_to(ctx.model_dir)), "reload_ok": same}
+            summary["reload_ok"] &= same
         if nn is not None:
             path = main_nn.save_nn(nn, ctx.model_dir / name / role)
             loaded = main_nn.load_nn(Path(path))
@@ -367,6 +379,7 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
             state["retained_state"] = {k: v for k, v in state["retained_state"].items() if k != "models"}
         return {"kind": bundle.kind, "features": bundle.features,
                 "availability": state,
+                "generator1": summary["short" if len(bundle.horizons) == 8 else "long"].get("generator1"),
                 "blend": bundle.blend, "feature_names": bundle.feature_names,
                 "lgb_kind": bundle.lgb_kind, "lgb_features": bundle.lgb_features,
                 "nn_weights": bundle.nn_weights,

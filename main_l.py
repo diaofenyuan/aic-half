@@ -50,6 +50,7 @@ class LongBundle:
     train_end: str | None = None
     final_train_end: str | None = None
     final_availability: dict | None = None
+    final_generator1: dict | None = None
 
 
 def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -> LongBundle:
@@ -314,4 +315,6 @@ def predict_long(bundle: LongBundle, prepared: PreparedData,
     pred = enforce_physics(pred, fallback=baselines["profile"])
     result = blend_cube(pred, baselines["profile"], bundle.blend,
                         C.HORIZONS_L, C.LONG_GROUPS)
-    return apply_availability_fallback(bundle, prepared, positions, result, use_final)
+    from main_s import apply_generator1_specialist
+    result = apply_availability_fallback(bundle, prepared, positions, result, use_final)
+    return apply_generator1_specialist(bundle, prepared, positions, result, use_final)
