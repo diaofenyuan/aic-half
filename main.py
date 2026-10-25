@@ -1,8 +1,8 @@
 """半决赛唯一日常入口：python main.py
 
-默认执行当时能合法完成的完整链路：扫描→清洗→21 天时序折→短期/长期训练与
-确认→资源预测→MILP→三份 CSV→模型/源码归档→模拟 ZIP。缺少正式评测输入或
-优化模板时明确标记不可提交，不伪造正式成绩。
+默认 run 执行历史 21 天时序验证、模型训练、资源预测、调度与归档；infer 在
+历史验证和冻结训练后，对已接入的半决赛测试窗口生成预测。当前测试负荷标签
+为空，不计算测试集本地分数；优化模板及物理口径尚待核对，结果包不可提交。
 """
 from __future__ import annotations
 
@@ -28,11 +28,19 @@ from data_cleaning import data_contract_check, prepare_data, run_self_checks, sc
 LOGGER = logging.getLogger("aic-half")
 
 
+class _ProgressLogHandler(logging.StreamHandler):
+    def emit(self, record) -> None:
+        try:
+            C.tqdm.write(self.format(record), file=self.stream)
+        except Exception:
+            self.handleError(record)
+
+
 def _setup_logger(log_path: Path | None = None) -> None:
     LOGGER.handlers.clear()
     LOGGER.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-    console = logging.StreamHandler(sys.stdout)
+    console = _ProgressLogHandler(sys.stdout)
     console.setFormatter(fmt)
     LOGGER.addHandler(console)
     if log_path is not None:
@@ -73,7 +81,7 @@ def build_folds(prepared, config=C, quick: bool = False) -> list[dict]:
 
 
 def _sources_unchanged(scan: dict) -> bool:
-    for relative, info in scan.get("files", {}).items():
+    for relative, info in C.progress(scan.get("files", {}).items(), desc="核验源文件", unit="文件"):
         path = C.ROOT / relative
         if not path.is_file():
             return False
@@ -142,7 +150,7 @@ def run_verify(directory: Path | None = None) -> int:
     if not zip_paths:
         zip_paths = list(directory.glob("*评分包*.zip"))
     if not zip_paths:
-        problems.append("缺少模拟评分包")
+        problems.append("缺少运行结果压缩包")
     else:
         try:
             with ZipFile(zip_paths[0]) as packed:
@@ -161,7 +169,7 @@ def run_verify(directory: Path | None = None) -> int:
 
 
 def _inference_window(prepared) -> tuple[pd.DatetimeIndex, str]:
-    """本地评测保留完整起报网格；已提供但不完整的官方输入直接报错。"""
+    """测试推理保留完整起报网格；已提供但不完整的官方输入直接报错。"""
     index = prepared.index
     half = [s for s in C.STAGES if s["name"] == "half_test"]
     info = prepared.scan.get("stages", {}).get("half_test", {})
@@ -190,7 +198,7 @@ def _inference_window(prepared) -> tuple[pd.DatetimeIndex, str]:
 
 def run_infer(quick: bool = False, experimental: bool = False,
               reuse_run: Path | None = None, nn_studies: list[Path] | None = None) -> int:
-    """冻结训练后在官方特征窗口做本地评测，仍保留不可提交标记。"""
+    """冻结模型后对半决赛测试窗口推理，结果仍按本地验证包标记。"""
     started = time.time()
     ctx = output.begin_run(C, mode="infer", experimental=quick or experimental)
     _setup_logger(ctx.log_path)
@@ -198,6 +206,7 @@ def run_infer(quick: bool = False, experimental: bool = False,
     summary = {"run_id": ctx.run_id, "status": "FAILED", "mode": "INFER",
                "experimental": bool(quick or experimental), "output_root": str(ctx.root),
                "quick": bool(quick), "validation_scope": "A/B开发验证" if quick else "历史开发验证，D已被多次查看", "errors": []}
+    stages = C.progress(total=8, desc="推理 · 数据准备", unit="阶段", leave=True)
     try:
         scan = scan_sources()
         prepared = prepare_data(C, include_inference=True)
@@ -211,14 +220,22 @@ def run_infer(quick: bool = False, experimental: bool = False,
         # 训练重新读取独立白名单，测试期过程量也不能用于资源拟合或物理标定。
         training = prepare_data(C).prefix_copy(min(
             pd.Timestamp(C.TRAIN_END), origins[0] - pd.Timedelta(minutes=C.STEP_MINUTES)))
-        LOGGER.info("训练白名单: %s .. %s；官方测试仅作本地评测",
+        LOGGER.info("训练白名单: %s .. %s；半决赛测试输入仅用于冻结模型推理",
                     training.index[0], training.index[-1])
+        stages.update(1)
         if reuse_run is None:
             folds = build_folds(training, quick=quick)
+            stages.set_description("推理 · 短期训练")
             short_bundle = main_s.train_short(training, folds, quick=quick)
+            stages.update(1)
+            stages.set_description("推理 · 长期训练")
             long_bundle = main_l.train_long(training, folds, quick=quick)
+            stages.update(1)
+            stages.set_description("推理 · 资源训练")
             resource_bundle = main_opt.train_resources(training, folds, quick=quick)
+            stages.update(1)
         else:
+            stages.set_description("推理 · 复用模型与冻结 NN")
             import main_nn
             short_bundle, long_bundle, resource_bundle = output.load_final_models(reuse_run)
             for bundle in (short_bundle, long_bundle, resource_bundle):
@@ -256,11 +273,13 @@ def run_infer(quick: bool = False, experimental: bool = False,
                     "candidates": result["selection"], "frozen_study": str(study)}
                 bundle.train_seconds = neural.train_seconds
                 summary["nn_promotion"].append({"study": str(study), "promoted": True, "kind": bundle.kind})
+            stages.update(3)
         LOGGER.info("训练完成: short=%s/%s long=%s/%s heat_rate_ok=%s",
                     short_bundle.kind, short_bundle.features,
                     long_bundle.kind, long_bundle.features,
                     resource_bundle.heat_rate.get("ok"))
 
+        stages.set_description("推理 · 批量预测")
         LOGGER.info("推理窗口: %s, 起报点=%d (%s .. %s)",
                     window, len(origins), origins[0], origins[-1])
         # 官方推理没有标签可见；评测窗口目标必须整体遮挡。
@@ -278,10 +297,14 @@ def run_infer(quick: bool = False, experimental: bool = False,
 
         resource_forecast = main_opt.forecast_resources(
             resource_bundle, masked, origins, use_final=True)
+        stages.update(1)
+        stages.set_description("推理 · 调度优化")
         optimization = main_opt.optimize(resource_forecast, masked, origins,
                                          long_pred, resource_bundle, quick=quick,
                                          use_final=True)
         optimization_report = output.write_optimization(ctx, optimization.get("schedule"))
+        stages.update(1)
+        stages.set_description("推理 · 模型与结果归档")
 
         model_report = output.save_models(ctx, short_bundle, long_bundle,
                                           resource_bundle, optimization.get("summary", {}),
@@ -289,8 +312,10 @@ def run_infer(quick: bool = False, experimental: bool = False,
         calibration_report = output.write_calibration(
             ctx, short_bundle, long_bundle, resource_bundle, use_final=True)
         source_report = output.write_source_snapshot(ctx, C)
-        official = False  # 当前用户仅授权预开发，不因目录或模板开关自动进入正式交付。
+        official = False  # 数据已接入；优化模板及物理口径尚待核对，本地验证不自动转为正式交付。
         zip_report = output.build_zip(ctx, submittable=bool(official), config=C)
+        stages.update(1)
+        stages.set_description("推理 · 保存摘要")
 
         summary.update({
             "status": "SUCCESS_INFER" if official else "SUCCESS_DRYRUN",
@@ -317,17 +342,19 @@ def run_infer(quick: bool = False, experimental: bool = False,
             "zip": zip_report,
             "submittable": bool(official),
             "reason": None if official else
-                      ("官方半决赛输入已接入，仅作本地评测；官方优化模板及物理口径尚未核对"
-                       if window == "half_test" else "缺少正式半决赛评测输入，仅作预开发干跑"),
+                      ("半决赛测试输入已接入，负荷标签为空，不计算测试集本地分数；优化模板及物理口径尚待核对"
+                       if window == "half_test" else "本次使用 semi_test 兼容窗口干跑，未使用 half_test 正式评测窗口"),
             "duration_seconds": round(time.time() - started, 2),
         })
         report_path = output.write_report(ctx, summary)
+        stages.update(1)
+        stages.set_description("推理完成")
         LOGGER.info("报告: %s", report_path)
         print("\n推理摘要")
         print(f"  窗口: {window} | 起报点 {len(origins)}")
         print(f"  优化状态: {optimization.get('status')}")
         print(f"  输出目录: {ctx.root}")
-        print(f"  评分包: {zip_report['name']}")
+        print(f"  本地验证包: {zip_report['name']}（不可提交）")
         return 0
     except Exception as exc:  # noqa: BLE001
         LOGGER.error("推理失败: %s", exc)
@@ -339,6 +366,8 @@ def run_infer(quick: bool = False, experimental: bool = False,
         except Exception:
             pass
         return 1
+    finally:
+        stages.close()
 
 
 def run_full(quick: bool = False, experimental: bool = False) -> int:
@@ -349,6 +378,7 @@ def run_full(quick: bool = False, experimental: bool = False) -> int:
     summary = {"run_id": ctx.run_id, "status": "FAILED", "mode": "BACKTEST",
                "experimental": bool(quick or experimental), "output_root": str(ctx.root),
                "quick": bool(quick), "validation_scope": "A/B开发验证" if quick else "历史开发验证，D已被多次查看", "errors": []}
+    stages = C.progress(total=8, desc="回测 · 数据准备", unit="阶段", leave=True)
     try:
         scan = scan_sources(include_inference=False)
         LOGGER.info("扫描完成: %d 个阶段目录, %d 个文件",
@@ -366,12 +396,18 @@ def run_full(quick: bool = False, experimental: bool = False) -> int:
         folds = build_folds(prepared, quick=quick)
         LOGGER.info("时序折: %s", [(f["name"], f["role"], round(f["label_coverage"], 3))
                                   for f in folds])
+        stages.update(1)
+        stages.set_description("回测 · 短期训练")
         short_bundle = main_s.train_short(prepared, folds, quick=quick)
+        stages.update(1)
+        stages.set_description("回测 · 长期训练")
         LOGGER.info("短期选模=%s/%s, 调参=%.3f, 确认=%.3f",
                     short_bundle.kind, short_bundle.features,
                     short_bundle.scores["tuning_mean"],
                     short_bundle.scores["confirm"]["accuracy"])
         long_bundle = main_l.train_long(prepared, folds, quick=quick)
+        stages.update(1)
+        stages.set_description("回测 · 批量预测")
         LOGGER.info("长期选模=%s/%s, 调参=%.3f, 确认=%.3f",
                     long_bundle.kind, long_bundle.features,
                     long_bundle.scores["tuning_mean"],
@@ -397,6 +433,8 @@ def run_full(quick: bool = False, experimental: bool = False) -> int:
             long_bundle.scores["confirm"] = rescored
         prediction_report = output.write_predictions(ctx, origins, short_pred, long_pred)
         LOGGER.info("预测输出: %d 个起报点, 短期/长期校验通过", len(origins))
+        stages.update(1)
+        stages.set_description("回测 · 资源训练与预测")
 
         resource_bundle = main_opt.train_resources(prepared, folds, quick=quick)
         LOGGER.info("资源模型 WAPE: %s, heat_rate_ok=%s",
@@ -408,6 +446,8 @@ def run_full(quick: bool = False, experimental: bool = False) -> int:
         if resource_bundle.quantile_models:
             quantile_low = main_opt.forecast_resources_quantile(
                 resource_bundle, masked, origins, "p10")
+        stages.update(1)
+        stages.set_description("回测 · 调度优化")
         optimization = main_opt.optimize(resource_forecast, masked, origins,
                                          long_pred, resource_bundle, quick=quick,
                                          availability_mode="point")
@@ -416,6 +456,8 @@ def run_full(quick: bool = False, experimental: bool = False) -> int:
                                        availability_mode="robust_low",
                                        quantile_low=quantile_low)
         optimization_report = output.write_optimization(ctx, optimization.get("schedule"))
+        stages.update(1)
+        stages.set_description("回测 · 模型与结果归档")
         LOGGER.info("优化状态: %s, 原因=%s", optimization.get("status"),
                     optimization.get("summary", {}).get("reason"))
         opt_summary = optimization.get("summary", {})
@@ -435,6 +477,8 @@ def run_full(quick: bool = False, experimental: bool = False) -> int:
             ctx, short_bundle, long_bundle, resource_bundle)
         source_report = output.write_source_snapshot(ctx, C)
         zip_report = output.build_zip(ctx, submittable=False, config=C)
+        stages.update(1)
+        stages.set_description("回测 · 保存摘要")
 
         summary.update({
             "status": "SUCCESS_MOCK",
@@ -486,11 +530,13 @@ def run_full(quick: bool = False, experimental: bool = False) -> int:
                 "source": source_report,
                 "zip": zip_report,
                 "submittable": False,
-                "reason": "历史开发验证模拟包；官方优化模板及物理口径尚未核对",
+                "reason": "历史时序回测，分数不代表半决赛测试集成绩；优化模板及物理口径尚待核对",
             },
             "duration_seconds": round(time.time() - started, 2),
         })
         report_path = output.write_report(ctx, summary)
+        stages.update(1)
+        stages.set_description("回测完成")
         LOGGER.info("报告: %s", report_path)
         LOGGER.info("完成: %.1fs, ZIP=%s", summary["duration_seconds"], zip_report["name"])
         print("\n运行摘要")
@@ -501,7 +547,7 @@ def run_full(quick: bool = False, experimental: bool = False) -> int:
         print(f"  优化状态: {optimization.get('status')} | "
               f"计划可行={optimization.get('summary', {}).get('plan_feasible')}（收益口径见 JSON）")
         print(f"  输出目录: {ctx.root}")
-        print(f"  评分包: {zip_report['name']}（不可提交）")
+        print(f"  本地验证包: {zip_report['name']}（不可提交）")
         return 0
     except Exception as exc:  # noqa: BLE001
         LOGGER.error("运行失败: %s", exc)
@@ -513,6 +559,8 @@ def run_full(quick: bool = False, experimental: bool = False) -> int:
         except Exception:
             pass
         return 1
+    finally:
+        stages.close()
 
 
 def run_resource_nn_study(args) -> int:
@@ -536,12 +584,12 @@ def run_resource_nn_study(args) -> int:
             pd.Timedelta(days=f["days"] + 1) for f in specs))
         base, resource = main_opt._resource_base(prepared), resource_series(prepared)
         prices = main_opt.load_prices()
-        for spec in specs:
+        for spec in C.progress(specs, desc="资源 NN 专项验证", unit="折"):
             _, evaluation, ref = main_s._fold_positions(prepared, spec, 8)
             heat = main_opt.estimate_heat_rate(prepared, ref)
             truth = resource.to_numpy()[evaluation[:, None] + np.arange(1, 9)]
             item = {"fold": spec["name"], "models": {}}
-            for kind in ("mlp", "tcn"):
+            for kind in C.progress(("mlp", "tcn"), desc="资源 NN 网络比较", unit="候选"):
                 main_nn.torch.cuda.reset_peak_memory_stats() if main_nn.DEVICE.type == "cuda" else None
                 tick = time.perf_counter()
                 pack = main_nn.train_resource_nn(base, resource, ref, heat, prices, args.quick,
@@ -663,7 +711,7 @@ def run_nn_study(args) -> int:
         prepared = prepared.prefix_copy(stop)
         horizons = C.HORIZONS_S if args.nn_span == "short" else C.HORIZONS_L
         preds, profiles, truths, references = [], [], [], []
-        for spec in specs:
+        for spec in C.progress(specs, desc="负荷 NN 专项验证", unit="折"):
             LOGGER.info("NN 专项 %s/%s/%s，目录=%s", args.nn_span, args.nn_kind, spec["name"], ctx.root)
             positions, evaluation, ref = main_s._fold_positions(prepared, spec, max(horizons))
             masked = prepared.masked_copy(spec["start"],
@@ -749,6 +797,12 @@ def main(argv: list[str] | None = None) -> int:
                         choices=("run", "infer", "doctor", "self-check", "verify"))
     parser.add_argument("--run-dir", type=Path, help="verify 指定选定运行或实验结果目录")
     parser.add_argument("--quick", action="store_true", help="单折、低迭代的开发模式")
+    progress_args = parser.add_mutually_exclusive_group()
+    progress_args.add_argument("--progress", dest="progress", action="store_true",
+                               help="强制显示进度条（适用于 IDE 控制台）")
+    progress_args.add_argument("--no-progress", dest="progress", action="store_false",
+                               help="关闭进度条，仅保留日志")
+    parser.set_defaults(progress=None)
     parser.add_argument("--experiment", action="store_true", help="全量开发实验写入 tmp/tmp_outputs")
     parser.add_argument("--fresh", action="store_true", help="保留参数，当前无训练缓存")
     parser.add_argument("--nn-only", action="store_true", help="只运行神经网络开发实验，不访问D或调度器")
@@ -763,6 +817,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reuse-run", type=Path, help="infer复用本项目已归档的final模型")
     parser.add_argument("--nn-study-run", type=Path, action="append", help="infer读取已通过ABC门槛的冻结NN专项")
     args = parser.parse_args(argv)
+    C.PROGRESS_ENABLED = args.progress
     if args.reuse_run and args.command != "infer":
         parser.error("--reuse-run 只用于 infer")
     if args.nn_only:

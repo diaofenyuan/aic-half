@@ -8,7 +8,23 @@
    ``inferred``，由 ``main_opt.py`` 返回阻断原因，而不是编造可提交结果。
 """
 import os
+import sys
 from pathlib import Path
+
+from tqdm import tqdm
+
+
+PROGRESS_ENABLED: bool | None = None
+
+
+def progress(iterable=None, *, desc: str, **kwargs):
+    """统一控制终端进度；非交互输出默认静默，避免污染重定向日志。"""
+    options = {"dynamic_ncols": True, "mininterval": .5, "leave": False, "file": sys.stdout,
+               "disable": None if PROGRESS_ENABLED is None else not PROGRESS_ENABLED,
+               "unit": "项"}
+    options.update(kwargs)
+    return tqdm(iterable, desc=desc, **options)
+
 
 ROOT = Path(__file__).resolve().parent
 DATA_ROOT = ROOT / "data"
@@ -37,7 +53,7 @@ STAGES = (
     {"name": "half_train", "dir": "half_train", "role": "train",
      "labels": "present", "period": ("2025-10-01", "2025-10-10"),
      "optional": True},
-    # 官方测试集只作冻结后的本地评测输入，不参与任何训练或标定。
+    # 半决赛测试输入已接入，仅用于冻结模型推理，不参与训练、选参或标定。
     {"name": "half_test", "dir": "half_test", "role": "official_inference",
      "labels": "forbidden", "period": ("2025-10-11", "2025-10-31"),
      "optional": True},
@@ -61,7 +77,7 @@ PROBE_HORIZONS = (1, 2, 4, 8, 16, 24, 32, 48, 64, 80, 96)
 
 TRAIN_START = "2025-01-01 00:00:00"
 TRAIN_END = "2025-10-10 23:45:00"
-# 官方测试范围仅用于本地评测窗口与输出覆盖校验。
+# 官方测试范围仅用于推理起报网格与输出覆盖校验，不提供本地评分标签。
 OFFICIAL_EVAL_START = "2025-10-11 00:00:00"
 OFFICIAL_EVAL_END = "2025-10-31 23:45:00"
 
@@ -181,7 +197,7 @@ LGBM_BASE = {
     "bagging_freq": 1,
     "lambda_l2": 2.0,
     "verbosity": -1,
-    "num_threads": min(8, os.cpu_count() or 1),
+    "num_threads": min(16, os.cpu_count() or 1),
     "seed": 20261021,
 }
 LGBM_TREES_SHORT = 450
@@ -293,7 +309,7 @@ OPT_CONFIG = {
     # P4：启停切换惩罚，压机组频繁开关（元/次·台）。
     "unit_switch_penalty_cny": 150.0,
     "max_daily_milp": 31,
-    # 模板缺失时只能生成模拟调度表，不得标记可提交。
+    # 优化模板及物理口径尚待核对；数据接入不等于已满足正式提交条件。
     "template_confirmed": False,
     "price_file": "first_train/price.xlsx",
     "price_unit": "CNY_per_kWh",

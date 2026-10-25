@@ -4,7 +4,7 @@
 
 ```powershell
 python main.py            # 完整链路（历史 21 天开发验证）——须由真人启动或明确授权
-python main.py infer --experiment # 冻结训练后对官方测试集本地评测——须由真人启动
+python main.py infer --experiment # 历史验证及冻结训练后，对半决赛测试集推理——须由真人启动
 python main.py --quick    # 单折开发模式
 python main.py infer --quick
 python main.py run --experiment # 获准后的全量开发实验，写入 tmp/tmp_outputs
@@ -43,10 +43,10 @@ python main.py run --experiment --nn-only --nn-span resource --folds A,B
 与旧 `semi_test` 重叠时，以新发布的 `half_train` 记录为准。
 
 训练数据准备默认只读取 `role=train` 阶段，截止 2025-10-10 23:45。
-`half_test`（2025-10-11～10-31）只用于冻结模型后的本地预测/评分，
+`half_test`（2025-10-11～10-31）已接入，只用于冻结模型后的测试推理，
 不参与负荷/资源训练、选参、融合、早停或物理标定；训练扫描也不读取该目录。
 短期、长期、资源及 NN 训练入口会拒绝本地评测对象，即使传入其测试期之前的前缀。
-本地评测显式开启测试输入，支持 `final_load_real.csv`，保持完整 2016 个起报点。
+测试推理显式开启测试输入，支持 `final_load_real.csv`，保持完整 2016 个起报点。
 该文件的两个目标负荷当前全为空，无法计算官方测试集的本地 1-MAPE；
 已发布耗气仅到 10 月 12 日，后续保持缺测，不补零伪造资源。
 
@@ -85,8 +85,8 @@ python main.py run --experiment --nn-only --nn-span resource --folds A,B
 - 优化摘要分别保存计划、代理执行和历史发电的收入/电量/按日平均电价计算的
   加权负荷比；代理高炉气释放按多个假设罚金做敏感性评价。无柜气种的未用包络
   不作为实际放散，缺真实净余气、历史放散及官方罚金时不计算官方净效益提升率。
-- 压缩包统一命名为 `咕咕嘎嘎-半决赛.zip`。当前缺少官方 `opt_result.csv` 模板，
-  产物仍是模拟包，运行摘要标记 `submittable=false`。
+- 压缩包统一命名为 `咕咕嘎嘎-半决赛.zip`。半决赛数据已接入，官方优化模板及
+  物理口径尚待核对；当前产物仍按本地验证/模拟包标记，`submittable=false`。
 
 ## 输出
 
@@ -99,13 +99,13 @@ python main.py run --experiment --nn-only --nn-span resource --folds A,B
 最多 8 轮内部早停试验并按选定轮数重训，优化仅抽取前 2 天，不代表全量结果。
 历史多步错位修复前的分数不作新基线；D 窗口已参与历史开发，不声称独立盲测。
 
-`infer` 在 `data/half_test` 四表覆盖官方评测区间时用于本地评测；否则在测试输入
-尚未提供时用 `semi_test`
-（2025-10-01～10-10）做提交链路干跑，产物同样标记不可提交。
+当前 `infer` 使用已接入的 `data/half_test` 四表，对完整官方评测区间进行推理。
+若在其他环境中未放置该输入，兼容分支仍可使用 `semi_test`
+（2025-10-01～10-10）做链路干跑；这不代表当前项目缺少半决赛数据。
 已提供但不完整的官方四表会报错，不静默缩短评测窗口或退回旧窗口。
 
 `opt_result.csv` 的 `datetime` 采用调度目标时刻（t+15min…t+1440min）。官方
-模板尚未发布，正式提交前必须按官方行列语义重新适配。
+优化模板尚待核对，正式提交前必须核验行列、单位和时间语义并完成适配。
 
 datetime 格式与原始 CSV 一致（`YYYY-MM-DD HH:MM:SS`，带空格）。赛题 PDF
 文本写作 `YYYY-MM-DDHH:MM:SS`，疑似排版丢失空格；若官方校验器要求无空格，
@@ -114,3 +114,8 @@ datetime 格式与原始 CSV 一致（`YYYY-MM-DD HH:MM:SS`，带空格）。赛
 ## 环境
 
 Python 3.10，依赖见 `requirements.txt`；全部计算可离线运行。
+
+终端默认显示分阶段及嵌套 `tqdm` 进度，覆盖数据读取、候选/时序折、LightGBM 迭代、
+NN 训练轮次与批次、批量预测、调度重规划、模型归档及打包；进度中的剩余时间为估计值。
+重定向输出时自动关闭进度条，运行日志保持纯文本。IDE 控制台可加 `--progress`
+强制显示；加 `--no-progress` 只保留日志，例如 `python main.py infer --experiment --progress`。

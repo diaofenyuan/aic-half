@@ -4,7 +4,7 @@
 - 高炉气柜只有 2 号柜数据可用，焦炉/转炉没有独立柜位，不虚构库存。
 - 热值/效率没有官方数值，只由历史 ``generator_all`` 与三气种耗气做正系数回归，
   标记为 inferred；正式提交前必须按官方数据字典复核。
-- 当前没有官方 ``opt_result.csv`` 模板，因此只生成明确标记的模拟调度表。
+- 半决赛数据已接入；官方优化模板及完整物理口径尚待核对，调度保留模拟标记。
 """
 from __future__ import annotations
 
@@ -108,7 +108,7 @@ def _fit_resource_models(prepared: PreparedData, positions: np.ndarray,
         params = {**params, "objective": "quantile", "alpha": float(alpha),
                   "metric": "quantile"}
     models = {}
-    for gas in gases:
+    for gas in C.progress(gases, desc="资源模型拟合", unit="气种"):
         X, y, weights = _stack(prepared, base_values, cal, names, positions,
                                horizons, series[gas].to_numpy(dtype=float), decay)
         gas_params = {**params}
@@ -144,7 +144,8 @@ def forecast_resources(bundle: ResourceBundle, prepared: PreparedData,
         X[lo:lo + n] = np.hstack(parts)
     out = np.empty((n, len(C.HORIZONS_L), len(C.RESOURCE_NAMES)))
     models = bundle.final_models if use_final else bundle.models
-    for gi, gas in enumerate(C.RESOURCE_NAMES):
+    for gi, gas in C.progress(enumerate(C.RESOURCE_NAMES), total=len(C.RESOURCE_NAMES),
+                              desc="资源批量预测", unit="气种"):
         pred = models[gas].predict(X).reshape(len(C.HORIZONS_L), n).T
         out[:, :, gi] = np.maximum(pred, 0.0)
         head = models.get(gas + "__head")
@@ -240,7 +241,8 @@ def forecast_resources_quantile(bundle: ResourceBundle, prepared: PreparedData,
         X[lo:lo + n] = np.hstack(parts)
     out = np.empty((n, len(C.HORIZONS_L), len(C.RESOURCE_NAMES)))
     calib = (bundle.quantile_metrics or {}).get(label, {}).get("scale", {})
-    for gi, gas in enumerate(C.RESOURCE_NAMES):
+    for gi, gas in C.progress(enumerate(C.RESOURCE_NAMES), total=len(C.RESOURCE_NAMES),
+                              desc=f"资源 {label} 分位数预测", unit="气种"):
         pred = pool[label][gas].predict(X).reshape(len(C.HORIZONS_L), n).T
         scale = float(calib.get(gas, 1.0))
         out[:, :, gi] = np.maximum(pred * scale, 0.0)
@@ -372,7 +374,8 @@ def _resource_oof(prepared: PreparedData, folds: list[dict], quick: bool, num_ro
     """只在 A/B/C 前缀样本外选择逐气种损失函数，确认窗口不参加选择。"""
     results = {"regression_l1": [], "regression_l2": []}
     caches = []
-    for fold in (f for f in folds if f["role"] == "tuning"):
+    for fold in C.progress([f for f in folds if f["role"] == "tuning"],
+                            desc="资源开发验证", unit="折"):
         masked = prepared.masked_copy(fold["start"], pd.Timestamp(fold["start"]) + pd.Timedelta(days=fold["days"]))
         positions, eval_positions, ref = _resource_positions(masked, fold, quick)
         truth = resource_series(masked).to_numpy()[eval_positions[:, None] + np.asarray(C.HORIZONS_L)]
@@ -380,7 +383,7 @@ def _resource_oof(prepared: PreparedData, folds: list[dict], quick: bool, num_ro
                   "origins": masked.index[eval_positions], "predictions": {}, "ref": ref,
                   "truth": truth}
         baseline_models = None
-        for objective in results:
+        for objective in C.progress(results, desc=f"资源折 {fold['name']} 损失函数", unit="候选"):
             logging.getLogger("aic-half").info("资源开发折 %s: %s", fold["name"], objective)
             models, names = _fit_resource_models(masked, positions, num_round, ref,
                                                 objectives={g: objective for g in C.RESOURCE_NAMES})
@@ -448,7 +451,7 @@ def _resource_oof(prepared: PreparedData, folds: list[dict], quick: bool, num_ro
     adjustment_metrics = {name: [] for name in adjustments}
     nn_training = []
     resource_history = bool(C.OPT_CONFIG.get("resource_nn_history", False))
-    for item in caches:
+    for item in C.progress(caches, desc="调度策略初筛", unit="折"):
         data, ref = item["prepared"], item["ref"]
         heat, caps = estimate_heat_rate(data, ref), _gas_caps(data, ref)
         frozen = ResourceBundle({}, {}, [], heat_rate=heat, gas_caps=caps)
@@ -469,7 +472,8 @@ def _resource_oof(prepared: PreparedData, folds: list[dict], quick: bool, num_ro
                 head_forecast[:, :len(C.HORIZONS_S), gi] = item["head_prediction"][:, :, gi]
         item["selected_forecast"], item["head_forecast"] = forecast, head_forecast
         comparisons = {}
-        for name, (interval, options) in candidates.items():
+        for name, (interval, options) in C.progress(candidates.items(),
+                                                   desc=f"调度折 {item['fold']} 候选", unit="策略"):
             weight = head_weights.get(name, 0.)
             trial = (forecast * (1. - weight) + head_forecast * weight) if weight else forecast
             if name in adjustments:
@@ -507,9 +511,10 @@ def _resource_oof(prepared: PreparedData, folds: list[dict], quick: bool, num_ro
         base_name = base_dispatch["candidate"]
         references = (["head_half_hour_substitute_vent"]
                       if any(name in adjustments for name in eligible) else [])
-        for item in caches if eligible else []:
+        for item in C.progress(caches if eligible else [], desc="调度全窗口核验", unit="折"):
             comparisons = {}
-            for name in dict.fromkeys(["daily", base_name, *references, *eligible]):
+            for name in C.progress(dict.fromkeys(["daily", base_name, *references, *eligible]),
+                                    desc=f"调度折 {item['fold']} 全窗口候选", unit="策略"):
                 interval, options = candidates[name]
                 weight = head_weights.get(name, 0.)
                 forecast = item["selected_forecast"]
@@ -637,7 +642,8 @@ def train_resources(prepared: PreparedData, folds: list[dict],
     # P2：在同一特征栈上拟合分位数模型；覆盖率应接近目标分位 alpha。
     q_round = max(20 if quick else 80, num_round // 2)
     quantile_models, final_quantile_models, quantile_metrics = {}, {}, {}
-    for alpha in (C.OPT_CONFIG.get("resource_quantiles") or (0.10,)):
+    for alpha in C.progress(C.OPT_CONFIG.get("resource_quantiles") or (0.10,),
+                             desc="资源分位数模型", unit="分位数"):
         label = f"p{int(round(float(alpha) * 100)):02d}"
         q_models, _ = _fit_resource_models(
             masked, positions, q_round, ref_pos, alpha=float(alpha))
@@ -1286,7 +1292,9 @@ def optimize_rolling(resource_forecast: np.ndarray, prepared: PreparedData,
     revenue, shortfall, vent_volume, realized_steps = 0., 0., 0., 0
     holder_min, holder_max = holder, holder
     started = time.time()
-    for row in range(0, limit, steps):
+    for row in C.progress(range(0, limit, steps),
+                          desc=f"滚动调度 · 每 {steps * C.STEP_MINUTES} 分钟重规划",
+                          unit="次"):
         origin = origins[row]
         avail = np.maximum(resource_forecast[row], 0)
         price = _price_vector(prices, origin + pd.Timedelta(minutes=C.STEP_MINUTES), len(C.HORIZONS_L))
@@ -1434,7 +1442,7 @@ def optimize(resource_forecast: np.ndarray, prepared: PreparedData,
     plans = {}
     records = []
     statuses = []
-    for day in days:
+    for day in C.progress(days, desc=f"逐日调度 · {availability_mode or '默认'}", unit="天"):
         day_origin = pd.Timestamp(day)
         if day_origin not in position_to_row:
             continue
@@ -1619,7 +1627,7 @@ def optimize(resource_forecast: np.ndarray, prepared: PreparedData,
         "template_confirmed": bool(C.OPT_CONFIG["template_confirmed"]),
         "availability_mode": availability_mode or C.OPT_CONFIG.get("availability_mode"),
         "time_semantics": "target_time t+15min ... t+1440min",
-        "note": "无官方 opt_result 模板与完整物理参数，结果为历史模拟原型；"
+        "note": "官方优化模板及完整物理口径尚待核对，调度为代理资源包络下的模拟计划；"
                 "计划收益与包络回放仅作代理诊断，非真实可执行净收益；未计放散罚金官方系数。",
         "daily": records,
     }

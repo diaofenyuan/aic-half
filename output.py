@@ -261,7 +261,7 @@ def _save_boosters(directory: Path, prefix: str, models: dict,
     index = {}
     reload_ok = True
     probe = np.zeros((3, len(feature_names)), dtype=np.float32)
-    for key, booster in models.items():
+    for key, booster in C.progress(models.items(), desc=f"保存 {prefix} 模型", unit="模型"):
         tag = _model_tag(key)
         file_name = f"{prefix}_{tag}.txt"
         temp_path = temp_dir / file_name
@@ -421,7 +421,7 @@ def write_source_snapshot(ctx: RunContext, config=C) -> dict:
     # 仓库保留 Git 忽略规则；提交源码快照不携带，并清理旧快照的遗留文件。
     (ctx.source_dir / ".gitignore").unlink(missing_ok=True)
     copied = []
-    for name in files:
+    for name in C.progress(files, desc="归档源码", unit="文件"):
         source = config.ROOT / name
         if source.is_file():
             target = ctx.source_dir / name
@@ -444,14 +444,13 @@ def build_zip(ctx: RunContext, submittable: bool, config=C) -> dict:
     members = ["s_result.csv", "l_result.csv"]
     if (ctx.root / "opt_result.csv").is_file():
         members.append("opt_result.csv")
+    paths = [ctx.root / member for member in members]
+    for folder in (config.SOURCE_DIR, config.MODEL_DIR):
+        paths.extend(path for path in sorted((ctx.root / folder).rglob("*"))
+                     if path.is_file() and path.name != ".gitignore")
     with ZipFile(temp_path, "w", ZIP_DEFLATED) as packed:
-        for member in members:
-            packed.write(ctx.root / member, member)
-        for folder in (config.SOURCE_DIR, config.MODEL_DIR):
-            base = ctx.root / folder
-            for path in sorted(base.rglob("*")):
-                if path.is_file() and path.name != ".gitignore":
-                    packed.write(path, path.relative_to(ctx.root).as_posix())
+        for path in C.progress(paths, desc="生成压缩包", unit="文件"):
+            packed.write(path, path.relative_to(ctx.root).as_posix())
     with ZipFile(temp_path) as packed:
         bad = packed.testzip()
         if bad is not None:

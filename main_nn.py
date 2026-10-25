@@ -163,10 +163,12 @@ def _fit_resource_nn(X, anchor, target, energy_weights, price_weights,
     ew = torch.as_tensor(energy_weights, dtype=torch.float32, device=DEVICE)
     sequence = None if sequence is None else torch.as_tensor(sequence, device=DEVICE)
     best, best_epoch, stale = np.inf, 1, 0
-    for epoch in range(1, epochs + 1):
+    for epoch in C.progress(range(1, epochs + 1),
+                            desc="资源 NN 内部早停" if validation is not None else "资源 NN 重训",
+                            unit="轮"):
         model.train()
         order = torch.randperm(len(X), device=DEVICE)
-        for start in range(0, len(X), batch):
+        for start in C.progress(range(0, len(X), batch), desc="资源 NN 训练批次", unit="批"):
             take = order[start:start + batch]
             with torch.autocast("cuda", dtype=torch.bfloat16,
                                 enabled=sequence is not None and DEVICE.type == "cuda"):
@@ -288,7 +290,7 @@ def predict_resource_nn(pack: dict, base: pd.DataFrame, resource: pd.DataFrame,
                 if pack["kind"] == "resource_tcn" else None)
     with torch.no_grad():
         estimates = []
-        for start in range(0, len(X), 512):
+        for start in C.progress(range(0, len(X), 512), desc="资源 NN 预测批次", unit="批"):
             take = slice(start, start + 512)
             args = (torch.as_tensor(X[take], device=DEVICE), torch.as_tensor(anchor[take], device=DEVICE))
             if sequence is not None:
@@ -832,7 +834,7 @@ class _Sample:
         model.train()
         order = torch.randperm(self.count, device=DEVICE)
         total = torch.zeros((), device=DEVICE)
-        for start in range(0, self.count, self.batch):
+        for start in C.progress(range(0, self.count, self.batch), desc="NN 训练批次", unit="批"):
             take = order[start:start + self.batch]
             x = _windows(self.table, self.pos[take], self.look_back)
             if self.aug_noise > 0 or self.aug_channel_drop > 0:
@@ -862,7 +864,7 @@ class _Sample:
         total = torch.zeros(2, dtype=torch.float64, device=DEVICE)
         count = torch.zeros(2, dtype=torch.float64, device=DEVICE)
         with torch.inference_mode():
-            for start in range(0, self.count, self.batch):
+            for start in C.progress(range(0, self.count, self.batch), desc="NN 验证批次", unit="批"):
                 take = torch.arange(start, min(start + self.batch, self.count), device=DEVICE)
                 x = _windows(self.table, self.pos[take], self.look_back)
                 prediction = model(x, self.future[take])
@@ -1002,28 +1004,31 @@ def train_nn(prepared: PreparedData, folds: list[dict], kind: str = "dlinear",
     seeds = [20261021 + i for i in range(max(1, n_seeds))]
     selected_epochs, val_losses = [], []
     curves = {"train": [], "val": []}
-    for seed in seeds:
+    for seed in C.progress(seeds, desc=f"NN {kind} 内部早停种子", unit="种子"):
         model = make_model(seed)
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
         schedule = make_schedule(optimizer)
         # 未训练画像也是合法候选，不能强迫选中一个比初始基线更差的更新步。
         best = val_sample.evaluate(model) if mode in ("ratio", "residual") else math.inf
         best_epoch, bad = 0, 0
-        for epoch in range(1, epochs + 1):
-            train_value = fit_sample.epoch(model, optimizer, amp)
-            value = val_sample.evaluate(model)
-            if schedule is not None:
-                schedule.step()
-            curves["train"].append(round(float(train_value), 6))
-            curves["val"].append(round(float(value), 6))
-            if not math.isfinite(value):
-                raise ValueError("NN 内部早停损失出现非有限值")
-            if value < best - 1e-5:
-                best, best_epoch, bad = value, epoch, 0
-            else:
-                bad += 1
-                if bad >= patience:
-                    break
+        with C.progress(range(1, epochs + 1),
+                        desc=f"NN {kind} 早停 seed={seed}", unit="轮") as epoch_bar:
+            for epoch in epoch_bar:
+                train_value = fit_sample.epoch(model, optimizer, amp)
+                value = val_sample.evaluate(model)
+                if schedule is not None:
+                    schedule.step()
+                curves["train"].append(round(float(train_value), 6))
+                curves["val"].append(round(float(value), 6))
+                epoch_bar.set_postfix(train=f"{train_value:.5f}", val=f"{value:.5f}", refresh=False)
+                if not math.isfinite(value):
+                    raise ValueError("NN 内部早停损失出现非有限值")
+                if value < best - 1e-5:
+                    best, best_epoch, bad = value, epoch, 0
+                else:
+                    bad += 1
+                    if bad >= patience:
+                        break
         selected_epochs.append(best_epoch)
         val_losses.append(best)
         logger.info("NN %s 内部早停完成: seed=%d, 选定%d轮, loss=%.5f", kind, seed, best_epoch, best)
@@ -1037,11 +1042,12 @@ def train_nn(prepared: PreparedData, folds: list[dict], kind: str = "dlinear",
     gpu = _gpu_table(table, mean, std)
     full_sample = _make_sample(prepared, gpu, full_pos, horizons, cfg, mode, batch, look_back)
     states = []
-    for seed, rounds in zip(seeds, selected_epochs):
+    for seed, rounds in C.progress(zip(seeds, selected_epochs), total=len(seeds),
+                                   desc=f"NN {kind} 重训种子", unit="种子"):
         model = make_model(seed)
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
         schedule = make_schedule(optimizer)
-        for _ in range(rounds):
+        for _ in C.progress(range(rounds), desc=f"NN {kind} 重训 seed={seed}", unit="轮"):
             full_sample.epoch(model, optimizer, amp)
             if schedule is not None:
                 schedule.step()
@@ -1090,10 +1096,11 @@ def _predict_cube(model_states: list[dict], table: torch.Tensor, positions: np.n
             model = build_model(kind, look_back, horizon, table.shape[1], n_fut, cfg)
             model.load_state_dict(state)
             runtime_models.append(model)
-    for model in runtime_models:
+    for model in C.progress(runtime_models, desc=f"NN {kind} 集成预测", unit="模型"):
         model.eval()
         with torch.inference_mode():
-            for start in range(0, len(positions), max(1, batch)):
+            for start in C.progress(range(0, len(positions), max(1, batch)),
+                                    desc=f"NN {kind} 预测批次", unit="批"):
                 take = slice(start, start + max(1, batch))
                 x = _windows(table, pos[take], look_back)
                 total[take] += model(x, fut[take]).float()
@@ -1197,8 +1204,8 @@ def benchmark_engine(directory: Path, kind: str, cfg: dict) -> list[dict]:
     cfg = {**_cfg(cfg), "head_mode": "scaled", "aug_noise": 0., "aug_channel_drop": 0.}
     length, horizon, features = int(cfg["look_back"]), 8, 192
     results = []
-    for precision in ("fp32", "bf16"):
-        for batch in (128, 512, 1024, 2048, 4096):
+    for precision in C.progress(("fp32", "bf16"), desc="GPU 基准精度", unit="种"):
+        for batch in C.progress((128, 512, 1024, 2048, 4096), desc=f"GPU {precision} batch", unit="配置"):
             if batch == 4096 and precision == "fp32":
                 continue
             torch.manual_seed(73)

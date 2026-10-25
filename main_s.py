@@ -39,7 +39,12 @@ def fit_booster(X: np.ndarray, y: np.ndarray, feature_names: list[str],
     weights = _mape_weights(y, weights)
     dataset = lgb.Dataset(X, label=y, weight=weights, feature_name=feature_names,
                           free_raw_data=True)
-    return lgb.train(params, dataset, num_boost_round=int(num_round))
+    with C.progress(total=int(num_round), desc="LightGBM 迭代", unit="轮") as bar:
+        def report_iteration(env):
+            bar.update(1)
+
+        return lgb.train(params, dataset, num_boost_round=int(num_round),
+                         callbacks=[report_iteration])
 
 
 def training_weights(prepared: PreparedData, positions: np.ndarray,
@@ -286,7 +291,7 @@ def select_candidate(candidates: list[dict], reference_kind: str) -> dict:
 def evaluate_blended_candidates(candidates: list[dict], profiles: list[np.ndarray],
                                 horizons: tuple[int, ...], groups) -> None:
     """以实际部署的融合结果排名，避免先淘汰互补候选再给赢家单独融合。"""
-    for candidate in candidates:
+    for candidate in C.progress(candidates, desc="候选画像融合评价", unit="候选"):
         candidate["raw_mean"] = candidate["mean"]
         blend = select_blend(candidate["preds"], profiles, candidate["truths"], horizons, groups)
         predictions = [blend_cube(p, prof, blend, horizons, groups)
@@ -345,21 +350,22 @@ def _train_models(prepared: PreparedData, base_all: pd.DataFrame,
     models: dict = {}
     params = {**C.LGBM_BASE, "num_threads": C.LGBM_BASE["num_threads"]}
     if kind == "direct":
-        for target in C.TARGETS:
-            for j, h in enumerate(horizons):
+        for target in C.progress(C.TARGETS, desc="Direct-H 训练目标", unit="目标"):
+            for j, h in C.progress(enumerate(horizons), total=len(horizons),
+                                   desc=f"{target} 提前量", unit="模型"):
                 X, y, w = build_training_block(
                     prepared, base, base_values, extras, extra_names,
                     positions, horizons, j, target, weights)
                 models[(target, int(h))] = fit_booster(X, y, names, params, num_round, w)
     elif kind in ("global", "grouped"):
         groups = _groups_for(horizons)
-        for target in C.TARGETS:
+        for target in C.progress(C.TARGETS, desc=f"{kind} 训练目标", unit="目标"):
             if kind == "global":
                 X, y, w = stack_training(prepared, base_values, extras, extra_names,
                                          positions, horizons, target, weights)
                 models[target] = fit_booster(X, y, names, params, num_round, w)
             else:
-                for gname, lo, hi in groups:
+                for gname, lo, hi in C.progress(groups, desc=f"{target} 提前量分组", unit="模型"):
                     subset = tuple(h for h in horizons if lo <= h <= hi)
                     jidx = [horizons.index(h) for h in subset]
                     sub_extras = {k: v[:, jidx] for k, v in extras.items()}
@@ -384,12 +390,15 @@ def _predict_models(prepared: PreparedData, base_all: pd.DataFrame,
         raise ValueError("预测特征顺序与训练不一致")
     out = np.empty((len(positions), len(horizons), 2), dtype=float)
     if kind == "direct":
-        for ti, target in enumerate(C.TARGETS):
-            for j, h in enumerate(horizons):
+        for ti, target in C.progress(enumerate(C.TARGETS), total=len(C.TARGETS),
+                                     desc="Direct-H 预测目标", unit="目标"):
+            for j, h in C.progress(enumerate(horizons), total=len(horizons),
+                                   desc=f"{target} 预测提前量", unit="模型"):
                 X = _block(base_values, positions, extras, extra_names, int(h), j)
                 out[:, j, ti] = models[(target, int(h))].predict(X)
     elif kind == "global":
-        for ti, target in enumerate(C.TARGETS):
+        for ti, target in C.progress(enumerate(C.TARGETS), total=len(C.TARGETS),
+                                     desc="Global-H 批量预测", unit="目标"):
             X = np.empty((len(positions) * len(horizons), len(names)), dtype=np.float32)
             for j, h in enumerate(horizons):
                 lo = j * len(positions)
@@ -397,8 +406,10 @@ def _predict_models(prepared: PreparedData, base_all: pd.DataFrame,
                     base_values, positions, extras, extra_names, int(h), j)
             out[:, :, ti] = models[target].predict(X).reshape(len(horizons), len(positions)).T
     elif kind == "grouped":
-        for ti, target in enumerate(C.TARGETS):
-            for gname, lo_h, hi_h in _groups_for(horizons):
+        for ti, target in C.progress(enumerate(C.TARGETS), total=len(C.TARGETS),
+                                     desc="Grouped-H 预测目标", unit="目标"):
+            for gname, lo_h, hi_h in C.progress(_groups_for(horizons),
+                                               desc=f"{target} 预测分组", unit="模型"):
                 subset = [j for j, h in enumerate(horizons) if lo_h <= h <= hi_h]
                 X = np.empty((len(positions) * len(subset), len(names)), dtype=np.float32)
                 for k, j in enumerate(subset):
@@ -464,7 +475,7 @@ def train_short(prepared: PreparedData, folds: list[dict], quick: bool = False) 
     num_round = C.LGBM_TREES_QUICK if quick else C.LGBM_TREES_SHORT
     started = time.time()
     fold_cache = []
-    for fold in tuning:
+    for fold in C.progress(tuning, desc="短期验证数据准备", unit="折"):
         masked = prepared.masked_copy(
             fold["start"],
             pd.Timestamp(fold["start"]) + pd.Timedelta(days=int(fold["days"])))
@@ -482,7 +493,7 @@ def train_short(prepared: PreparedData, folds: list[dict], quick: bool = False) 
     # 不与长期网络共享权重或选参。
     nn_started = time.time()
     nn_preds, nn_truths, nn_bundles = [], [], []
-    for item in fold_cache:
+    for item in C.progress(fold_cache, desc="短期 NN 验证", unit="折"):
         fold = item["fold"]
         solo = [{**fold, "role": "tuning"},
                 {**fold, "role": "confirm", "name": fold["name"] + "_val"}]
@@ -503,12 +514,12 @@ def train_short(prepared: PreparedData, folds: list[dict], quick: bool = False) 
                        "worst": float(min(s["accuracy"] for s in nn_scores)),
                        "seconds": time.time() - nn_started,
                        "nn_bundle": nn_bundles[0]})
-    for cand in SHORT_CANDIDATES:
+    for cand in C.progress(SHORT_CANDIDATES, desc="短期树模型选模", unit="候选"):
         started_cand = time.time()
         preds, truths = [], []
         models_store = None
         names_store = None
-        for item in fold_cache:
+        for item in C.progress(fold_cache, desc=f"短期 {cand['kind']} 验证", unit="折"):
             masked = item["prepared"]
             logging.getLogger("aic-half").info("短期候选 %s/%s，折=%s", cand["kind"],
                                               cand["features"], item["fold"]["name"])

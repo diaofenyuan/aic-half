@@ -47,7 +47,7 @@ class PreparedData:
             raise ValueError("本地评测数据不得进入训练、选参或标定，请独立读取训练阶段")
 
     def masked_copy(self, start: pd.Timestamp | str, end: pd.Timestamp | str) -> "PreparedData":
-        """复制并遮挡连续评测窗口的目标负荷，模拟正式推理的输入模式。"""
+        """整体遮挡评测窗口的目标负荷，统一历史回测与测试推理的数据可见性。"""
         start = pd.Timestamp(start)
         end = pd.Timestamp(end)
         frame = self.frame.copy()
@@ -106,7 +106,7 @@ def scan_sources(config=C, include_inference: bool = True) -> dict:
     """按阶段角色只读扫描；训练扫描不打开官方测试文件。"""
     report = {"generated_at": pd.Timestamp.now().isoformat(timespec="seconds"),
               "stages": {}, "files": {}, "extras": {}, "problems": []}
-    for stage in config.STAGES:
+    for stage in C.progress(config.STAGES, desc="扫描数据阶段", unit="阶段"):
         if not include_inference and stage["role"] != "train":
             continue
         stage_dir = config.DATA_ROOT / stage["dir"]
@@ -117,7 +117,7 @@ def scan_sources(config=C, include_inference: bool = True) -> dict:
                 report["problems"].append(f"缺少目录 {stage_dir}")
             report["stages"][stage["name"]] = info
             continue
-        for table in config.TABLES:
+        for table in C.progress(config.TABLES, desc=f"扫描 {stage['name']}", unit="表"):
             files = _find_table_files(stage_dir, table, config)
             table_info = {"files": [], "rows": 0, "columns": [], "time_range": None,
                           "target_valid": {}, "duplicates": 0, "missing_ratio": {}}
@@ -311,14 +311,14 @@ def prepare_data(config=C, mask_targets: tuple | None = None,
     per_table: dict[str, list[pd.DataFrame]] = {t: [] for t in config.TABLES}
     stage_ranges: dict[str, list[str]] = {}
 
-    for stage in config.STAGES:
+    for stage in C.progress(config.STAGES, desc="读取与对齐数据", unit="阶段"):
         if stage["name"] not in scan["stages"]:
             continue
         stage_dir = config.DATA_ROOT / stage["dir"]
         if not stage_dir.is_dir():
             continue
         loaded = {}
-        for table in config.TABLES:
+        for table in C.progress(config.TABLES, desc=f"读取 {stage['name']}", unit="表"):
             pieces = []
             for path in _find_table_files(stage_dir, table, config):
                 raw = _read_csv(path)

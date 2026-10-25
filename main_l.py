@@ -62,7 +62,7 @@ def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -
         num_round = C.LGBM_TREES_LONG
     started = time.time()
     fold_cache = []
-    for fold in tuning:
+    for fold in C.progress(tuning, desc="长期验证数据准备", unit="折"):
         masked = prepared.masked_copy(
             fold["start"],
             pd.Timestamp(fold["start"]) + pd.Timedelta(days=int(fold["days"])))
@@ -79,7 +79,7 @@ def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -
     # 浅层 DLinear：数据量有限时比 N-HiTS 稳，作为长周期主力候选之一。
     nn_started = time.time()
     nn_preds, nn_truths = [], []
-    for item in fold_cache:
+    for item in C.progress(fold_cache, desc="长期 NN 验证", unit="折"):
         fold = item["fold"]
         # 只用该折 train_end 之前的数据，避免串折泄漏
         solo = [{**fold, "role": "tuning"},
@@ -102,10 +102,10 @@ def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -
                        "seconds": time.time() - nn_started,
                        "nn_bundle": nb})
 
-    for cand in LONG_CANDIDATES:
+    for cand in C.progress(LONG_CANDIDATES, desc="长期树模型选模", unit="候选"):
         started_cand = time.time()
         preds, truths = [], []
-        for item in fold_cache:
+        for item in C.progress(fold_cache, desc=f"长期 {cand['kind']} 验证", unit="折"):
             masked = item["prepared"]
             logging.getLogger("aic-half").info("长期候选 %s/%s，折=%s", cand["kind"],
                                               cand["features"], item["fold"]["name"])
