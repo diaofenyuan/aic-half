@@ -731,10 +731,14 @@ def _generator1_contract_check() -> dict:
             {"ensemble_aggregation": aggregation, "ensemble_weights": weights}, 16,
             runtime_models=[ConstantHead(1.), ConstantHead(4.), ConstantHead(7.)])
         aggregation_ok &= np.allclose(actual, expected)
+    transition_names = [f"g1_d_use_{gas}_log_age" for gas in ("blast", "coke", "converter")] + ["g1_generator_1_log_age", "h"]
+    transition_input = np.array([[0., 0., 0., 0., 1.], [1., 1., 1., 1., 1.],
+                                 [0., 0., 0., 2., 8.], [3., 3., 3., 3.2, 8.]], dtype=np.float32)
+    transition_ok = np.array_equal(main_s.generator1_transition_bins(transition_input, transition_names, True), [0, 2, 7, 11])
     checks = {"future_independent": causal, "blocked_profile_matches_service": profiles_same,
               "total_preserved": total_same, "structure_bounds": bool(bounds),
               "specialist_loss_ignores_total_output": target_only,
-              "seed_aggregation_values": bool(aggregation_ok)}
+              "seed_aggregation_values": bool(aggregation_ok), "transition_state_and_lead_bins": bool(transition_ok)}
     return {"passed": bool(all(checks.values())), **checks}
 
 

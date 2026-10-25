@@ -1012,6 +1012,34 @@ def generator1_gate_matrix(prepared, positions, horizons, before, after):
     return np.concatenate(parts).astype(np.float32), cols + ["before", "after", "difference", "h"]
 
 
+def generator1_transition_bins(X, names, stateful=False):
+    columns = [names.index(f"g1_d_use_{gas}_log_age") for gas in ("blast", "coke", "converter")]
+    age = np.nanmax(X[:, columns], axis=1)
+    day = np.searchsorted(np.log1p([1., 7.]), age, side="right")
+    lead = (X[:, names.index("h")] > 4).astype(int)
+    result = day * 2 + lead
+    if stateful:
+        target_age = np.expm1(X[:, names.index("g1_generator_1_log_age")])
+        result += 6 * (target_age - np.expm1(age) >= 1.).astype(int)
+    return result
+
+
+def generator1_transition_weights(calibration, prepared, positions, horizons, before, after):
+    X, names = generator1_gate_matrix(prepared, positions, horizons, before, after)
+    if names != calibration["feature_names"]:
+        raise ValueError("缺测阶段校准特征与归档顺序不一致")
+    stateful = calibration["family"] == "duration_state"
+    if calibration["family"] not in ("duration", "duration_state"):
+        raise ValueError("不支持的缺测阶段校准")
+    table = np.asarray(calibration["table"], dtype=float)
+    shrink = float(calibration["shrink"])
+    if (len(table) != (12 if stateful else 6) or not np.isfinite(table).all()
+            or np.any((table < 0.) | (table > .5)) or not 0. <= shrink <= 1.):
+        raise ValueError("缺测阶段权重不合法")
+    raw = table[generator1_transition_bins(X, names, stateful)]
+    return np.clip(.25 + shrink * (raw.reshape(len(horizons), -1).T - .25), 0., .5)
+
+
 def generator1_gate_fit(X, before, after, truth, names):
     before, after, truth = (x.T.ravel() for x in (before, after, truth))
     delta = after - before
@@ -1033,6 +1061,11 @@ def apply_generator1_specialist(bundle, prepared, positions, prediction, use_fin
     recipe, horizons = state["recipe"], bundle.horizons
     if recipe["kind"] == "refined_nn":
         import copy
+        if recipe.get("calibration"):
+            calibration = state.get("calibration")
+            if (not calibration or calibration.get("train_end") != state["train_end"]
+                    or any(calibration.get(k) != recipe["calibration"][k] for k in ("family", "shrink", "mode"))):
+                raise ValueError("冻结配方缺少同截止点、同参数的阶段校准")
         if state["base_state"]["recipe"]["kind"] == "refined_nn":
             raise ValueError("精修分支只保留一层，禁止不断堆叠历史模型")
         base_bundle = copy.copy(bundle)
@@ -1044,7 +1077,9 @@ def apply_generator1_specialist(bundle, prepared, positions, prediction, use_fin
         if not active.any():
             return before
         estimate = main_nn.predict_nn(state["nn"], prepared, prepared.index[positions])[..., 0]
-        result = generator1_project(before[..., 0] + update["weight"] * active[:, None] * (estimate - before[..., 0]), before)
+        weight = (generator1_transition_weights(state["calibration"], prepared, positions, horizons,
+                  before[..., 0], estimate) if state.get("calibration") else update["weight"])
+        result = generator1_project(before[..., 0] + weight * active[:, None] * (estimate - before[..., 0]), before)
         result[~active] = before[~active]
         return result
     active = np.ones(len(positions), dtype=bool)
