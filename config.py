@@ -187,9 +187,26 @@ LGBM_TREES_QUICK = 180
 TRAIN_STRIDE_SHORT = 1
 TRAIN_STRIDE_LONG = 2
 QUICK_TRAIN_STRIDE = 8
-NN_CONFIG = {"look_back": 96, "epochs": 80, "quick_epochs": 8,
+NN_CONFIG = {"look_back": 192, "epochs": 80, "quick_epochs": 8,
              "patience": 12, "quick_patience": 3, "early_stop_days": 7,
-             "batch_size": 64, "quick_batch_size": 256}
+             "batch_size": 512, "quick_batch_size": 256,
+             # 16GB GPU 引擎：按批 gather 滑窗、bf16 训练、fp32 推理。
+             "precision": "bf16", "predict_batch": 1024, "train_stride": 1,
+             "d_model": 64, "n_blocks": 5, "dropout": 0.15,
+             "lr": 1e-3, "weight_decay": 1e-4, "scheduler": "none",
+             # A/B/C 开发验证后保留容量归一化因果 TCN；是否部署仍由逐目标融合门槛决定。
+             "kind_long": "tcn_causal", "kind_short": "tcn_causal",
+             "head_mode": "scaled", "load_history": False,
+             "feature_set": "engineered", "training_mask_days": 0, "far_weight": 1.0,
+             "profile_conditions": True, "residual_limit": 0.15,
+             "temporal_norm": "layer", "future_calendar": "cyclic",
+             "max_gpu_memory_gib": 15.0,
+             # 画像残差作为研究对照；部署以三 seed 均值降低训练随机性。
+             "profile_base": "plain", "mape_floor_ratio": 0.02, "n_seeds": 3,
+             # 向画像收缩的先验；开发折未带来改善，默认关闭，保留研究开关。
+             "prior_lambda": 0.0,
+             # 增广未通过本轮受控比较，默认关闭。
+             "aug_noise": 0.0, "aug_channel_drop": 0.0}
 # 默认独立输出；重叠带覆盖只作为在开发折验证过的可选策略，不推断官方要求。
 LONG_HEAD_FROM_SHORT = False
 LONG_GROUPS = (("short", 1, 8), ("medium", 9, 32), ("long", 33, 96))
@@ -197,8 +214,8 @@ SHORT_GROUPS = (("head", 1, 4), ("tail", 5, 8))
 
 # 选模门槛（百分点）。仅作为预防单折噪声的工程阈值，不冒充官方标准。
 SELECTION = {
-    "min_mean_gain_pp": 0.0,
-    "max_worst_fold_drop_pp": 1.0,
+    "min_mean_gain_pp": 0.20,
+    "max_worst_fold_drop_pp": 0.20,
     "confirm_drop_tolerance_pp": 1.5,
     "blend_grid": (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0),
 }
@@ -232,6 +249,9 @@ OPT_CONFIG = {
     "robust_headroom": 0.98,
     # P2：资源分位数预测。p10 供 robust_low 作下行边界，p50 作中位数校验。
     "resource_quantiles": (0.10, 0.50),
+    # 资源八步网络是否附带 8/32 步气量路径池化；开发折上 coke/converter 的
+    # short WAPE 无一致改善（blast 反而略升），默认关闭，保留为可切换研究开关。
+    "resource_nn_history": False,
     # 计划柜位相对安全区间再留 5% 裕度；回测仍按官方 15%~90% 检查。
     "holder_margin_ratio": 0.05,
     # 日末回到初始柜位，避免计划靠净放空/净充满气柜获得虚假收益。

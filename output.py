@@ -207,6 +207,53 @@ def _model_tag(key) -> str:
     return str(key)
 
 
+def load_final_models(directory: Path):
+    """重载本项目已归档的最终模型，避免神经网络专项重复拟合未改变的树与资源模型。"""
+    import main_nn
+    from main_s import ShortBundle
+    from main_l import LongBundle
+    from main_opt import ResourceBundle
+
+    directory = directory.resolve()
+    if not directory.is_relative_to(C.ROOT.resolve()):
+        raise ValueError("只允许复用本项目的本地运行模型")
+    model_root = directory / C.MODEL_DIR
+    meta = json.loads((model_root / "model_meta.json").read_text(encoding="utf-8"))
+    report = json.loads((directory / C.REPORT_DIR / C.REPORT_JSON).read_text(encoding="utf-8"))
+    if meta["role"] != "final":
+        raise ValueError("推理只能复用 final 角色，禁止把确认模型冒充最终模型")
+    bundles = []
+    for name, cls, horizons in (("short", ShortBundle, C.HORIZONS_S), ("long", LongBundle, C.HORIZONS_L)):
+        item, artifacts = meta[name], meta["artifacts"][name]
+        models = {}
+        for tag, filename in artifacts.get("final", {}).get("files", {}).items():
+            key = tag
+            if "__" in tag:
+                target, part = tag.rsplit("__", 1)
+                key = (target, int(part) if part.isdigit() else part)
+            models[key] = lgb.Booster(model_str=(model_root / name / "final" / filename).read_text(encoding="utf-8"))
+        neural = main_nn.load_nn(model_root / artifacts["nn"]["path"]) if "nn" in artifacts else None
+        bundles.append(cls(kind=item["kind"], features=item["features"], horizons=horizons,
+            blend=item["blend"], models={}, final_models=models, feature_names=item["feature_names"],
+            nn_bundle=None, final_nn_bundle=neural, lgb_kind=item.get("lgb_kind"),
+            nn_weights=item.get("nn_weights", {}),
+            lgb_features=item.get("lgb_features"), selection=report[name]["selection"], scores=item["scores"],
+            train_end=item["train_end"], final_train_end=item["train_end"]))
+    item, artifacts = meta["resource"], meta["artifacts"]["resource"]
+    models = {tag: lgb.Booster(model_str=(model_root / "resource" / "final" / filename).read_text(encoding="utf-8"))
+              for tag, filename in artifacts["final"]["files"].items()}
+    neural = main_nn.load_resource_nn(model_root / artifacts["nn"]["path"]) if "nn" in artifacts else None
+    resource = ResourceBundle(models={}, final_models=models,
+        feature_names=next(iter(models.values())).feature_name(),
+        metrics=item["metrics"], heat_rate=item["heat_rate"], final_heat_rate=item["heat_rate"],
+        gas_caps=item["gas_caps"], final_gas_caps=item["gas_caps"],
+        train_end=item["train_end"], final_train_end=item["train_end"],
+        selection=report["resource_selection"], dispatch_selection=item["dispatch_selection"],
+        resource_nn=None, final_resource_nn=neural, blocker=item.get("blocker"))
+    bundles.append(resource)
+    return bundles
+
+
 def _save_boosters(directory: Path, prefix: str, models: dict,
                    feature_names: list[str], temp_dir: Path) -> dict:
     directory.mkdir(parents=True, exist_ok=True)
@@ -289,6 +336,7 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
         return {"kind": bundle.kind, "features": bundle.features,
                 "blend": bundle.blend, "feature_names": bundle.feature_names,
                 "lgb_kind": bundle.lgb_kind, "lgb_features": bundle.lgb_features,
+                "nn_weights": bundle.nn_weights,
                 "scores": bundle.scores,
                 "train_end": nn.train_end if nn is not None else
                              (bundle.final_train_end if use_final else bundle.train_end)}

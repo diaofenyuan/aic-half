@@ -214,7 +214,45 @@ def _nn_contract_check() -> dict:
     origins = prepared.index[[300, 479]]
     bulk = main_nn.predict_nn(first, prepared, origins)
     singles = np.concatenate([main_nn.predict_nn(first, prepared, origins[[i]]) for i in range(2)])
-    return {"passed": bool(same and np.isfinite(bulk).all() and np.allclose(bulk, singles, atol=1e-5)),
+    # 两个更新步后时间主干必须收到梯度；仅检查预测有限会漏掉连续零初始化闭锁。
+    torch = main_nn.torch
+    torch.manual_seed(19)
+    network = main_nn.DLinear(8, 2, 3, cfg={"head_mode": "residual"})
+    x, target = torch.randn(12, 8, 3), torch.randn(12, 2, 2)
+    optimizer = torch.optim.SGD(network.parameters(), lr=.05)
+    for _ in range(2):
+        optimizer.zero_grad(set_to_none=True)
+        (network(x) - target).square().mean().backward()
+        optimizer.step()
+    gradient = bool(network.linear_trend.weight.grad.abs().sum() > 0)
+    sensitive = not torch.allclose(network(x), network(x + 2.))
+    with patch.object(C, "PROFILE_DAYS", 2):
+        positions = np.array([200, 215, 270])
+        blocked = main_nn._blocked_profiles(prepared, positions, (1, 2), 2)
+        view = prepared.masked_copy(prepared.index[192], prepared.index[383])
+        expected = main_nn._profile_cube(view, positions, (1, 2), fuel=False)
+        mask_equivalent = np.allclose(blocked, expected, atol=1e-5)
+    from main_s import enforce_physics, score_cube
+    values = torch.arange(10, dtype=torch.float32, device=main_nn.DEVICE).reshape(-1, 1) / 10
+    y = np.array([[[50, 160], [0, 180]], [[90, np.nan], [80, 360]], [[110, 400], [100, 0]]], dtype=np.float32)
+    positions = np.array([2, 4, 6])
+    future = np.zeros((3, 2, 6), dtype=np.float32)
+    sample = main_nn._Sample(values, positions, y, future, None, 2, 2, (1, 2), "scaled", {})
+    class Probe(torch.nn.Module):
+        def forward(self, x, future):
+            level = x[:, -1, 0]
+            return torch.stack((level, 2 * level), dim=-1)[:, None, :].expand(-1, 2, -1)
+    network = Probe().to(main_nn.DEVICE)
+    prediction = network(main_nn._windows(values, sample.pos, 2), sample.future)
+    prediction = sample.decode(prediction, torch.arange(3, device=main_nn.DEVICE)).cpu().numpy()
+    expected_mape = 1. - score_cube(enforce_physics(prediction), y, (1, 2))["accuracy"] / 100.
+    metric_equal = abs(sample.evaluate(network) - expected_mape) < 1e-6
+    return {"passed": bool(same and gradient and sensitive and mask_equivalent and metric_equal and np.isfinite(bulk).all()
+                           and np.allclose(bulk, singles, atol=1e-5)),
+            "gradient_reaches_backbone": gradient, "input_sensitive": sensitive,
+            "training_block_matches_masked_profile": bool(mask_equivalent),
+            "early_stop_matches_forecast_metric": bool(metric_equal),
+            "inner_target_history_masked": first.scores["early_stop"]["target_history_masked"],
             "prefix_model_unchanged": bool(same), "tail_shape": list(bulk.shape)}
 
 
@@ -229,7 +267,7 @@ def _model_role_check() -> dict:
     checks = []
     for cls, forecast, horizons, groups in ((ShortBundle, predict_short, C.HORIZONS_S, C.SHORT_GROUPS),
                                             (LongBundle, predict_long, C.HORIZONS_L, C.LONG_GROUPS)):
-        bundle = cls(kind="dlinear", features="nn", horizons=horizons,
+        bundle = cls(kind="nn", features="nn", horizons=horizons,
                      blend={t: {g[0]: 1.0 for g in groups} for t in C.TARGETS},
                      models={}, final_models={}, feature_names=[],
                      nn_bundle=SimpleNamespace(value=100), final_nn_bundle=SimpleNamespace(value=120))

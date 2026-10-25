@@ -13,7 +13,24 @@ python main.py doctor     # 只读扫描数据目录
 python main.py self-check # 因果清洗与特征自检
 python main.py verify     # 校验最近一次输出
 python main.py verify --run-dir tmp/tmp_outputs/<run_id> # 校验指定实验目录
+python main.py run --experiment --nn-only --nn-span short --nn-kind tcn_causal --folds A,B
+python main.py run --experiment --nn-only --nn-span resource --folds A,B
 ```
+
+`--nn-only` 是隔离的神经网络开发入口，只允许 A/B/C，不运行 D 或调度器。
+可通过 `--nn-seeds 3` 复验随机性、`--nn-reference` 同折训练树模型，
+`--nn-config` 接收 JSON 对象覆盖本次实验参数。资源专项比较 MLP 与历史序列 TCN；
+通过误差初筛后仍须完成 A/B/C 控制回放，不能自动替换部署模型。
+
+`--nn-benchmark` 在固定更新步数下比较 FP32/BF16 与 batch，使用合成输入，
+不产生预测分数。`--nn-reblend <专项目录>` 只重用已保存的 A/B/C 开发预测，
+选择全折共用的分目标/提前量融合系数；门槛固定为均分提升至少 0.20 个百分点，
+任一折任一目标下降不超过 0.20 个百分点。
+
+`infer --experiment --reuse-run <本项目final运行> --nn-study-run <冻结专项>`
+可复用未改变的最终树/资源模型，仅重训已通过完整 A/B/C 门槛的 NN；
+模型截止点必须早于推理窗口，冻结专项可按短期、长期重复传入。
+运行摘要明确记录模型来源和本轮未评估 D，不把既有诊断当作新确认。
 
 全量 `run` / `infer` 训练耗时较长，必须由真人发起或明确授权；当前轮已获得
 2026-10-23 全量训练授权。后续任务仍按 `AGENTS.md` §8 判断授权范围。

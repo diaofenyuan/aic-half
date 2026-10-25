@@ -290,10 +290,12 @@ def _gas_caps(prepared: PreparedData, end_pos: int) -> dict:
 
 
 def score_resources(forecast: np.ndarray, truth: np.ndarray) -> dict:
-    """零气量计入绝对误差；累计量按同一起报的 24 小时路径统计。"""
+    """零气量计入绝对误差；累计量按实际预测跨度统计，兼容独立八步头。"""
     if forecast.shape != truth.shape or not np.isfinite(forecast).all():
         raise ValueError("资源预测维度错误或含非有限数")
     metrics = {}
+    horizons = tuple(range(1, forecast.shape[1] + 1))
+    hours = len(horizons) * C.STEP_MINUTES / 60.
     for gi, gas in enumerate(C.RESOURCE_NAMES):
         actual, estimate = truth[:, :, gi], forecast[:, :, gi]
         valid = np.isfinite(actual)
@@ -311,13 +313,15 @@ def score_resources(forecast: np.ndarray, truth: np.ndarray) -> dict:
             "mae_m3h": float(np.abs(error[valid]).mean()) if valid.any() else None,
             "zero_fraction": float(zero.sum() / max(valid.sum(), 1)),
             "zero_false_supply_mae_m3h": float(estimate[zero].mean()) if zero.any() else None,
-            "cumulative_24h_error_p10_m3": float(np.quantile(cumulative, .1)) if len(cumulative) else None,
-            "cumulative_24h_error_p90_m3": float(np.quantile(cumulative, .9)) if len(cumulative) else None,
+            f"cumulative_{hours:g}h_error_p10_m3": float(np.quantile(cumulative, .1)) if len(cumulative) else None,
+            f"cumulative_{hours:g}h_error_p90_m3": float(np.quantile(cumulative, .9)) if len(cumulative) else None,
             "valid_cells": int(valid.sum()), "complete_paths": int(complete.sum()),
             "groups": {},
         }
         for name, lo, hi in C.LONG_GROUPS:
-            idx = [j for j, h in enumerate(C.HORIZONS_L) if lo <= h <= hi]
+            idx = [j for j, h in enumerate(horizons) if lo <= h <= hi]
+            if not idx:
+                continue
             a, e = actual[:, idx], error[:, idx]
             ok = np.isfinite(a)
             denom = float(a[ok].sum())
@@ -443,6 +447,7 @@ def _resource_oof(prepared: PreparedData, folds: list[dict], quick: bool, num_ro
         "method": "positive_nn_peak", "threshold_ratio": .03, "weight": .5}}
     adjustment_metrics = {name: [] for name in adjustments}
     nn_training = []
+    resource_history = bool(C.OPT_CONFIG.get("resource_nn_history", False))
     for item in caches:
         data, ref = item["prepared"], item["ref"]
         heat, caps = estimate_heat_rate(data, ref), _gas_caps(data, ref)
@@ -450,7 +455,8 @@ def _resource_oof(prepared: PreparedData, folds: list[dict], quick: bool, num_ro
         if head_gases and heat.get("ok"):
             import main_nn
             base = _resource_base(data)
-            pack = main_nn.train_resource_nn(base, resource_series(data), ref, heat, load_prices(), quick)
+            pack = main_nn.train_resource_nn(base, resource_series(data), ref, heat, load_prices(),
+                                         quick, use_history=resource_history)
             item["nn_forecast"] = main_nn.predict_resource_nn(pack, base, resource_series(data),
                                                                data.index.get_indexer(item["origins"]))
             nn_training.append({"fold": item["fold"], **{k: pack[k] for k in
@@ -615,10 +621,12 @@ def train_resources(prepared: PreparedData, folds: list[dict],
                             final_heat_rate=estimate_heat_rate(prepared, len(prepared.index) - 1))
     if selection.get("availability_adjustment", {}).get("method") == "positive_nn_peak":
         import main_nn
+        use_history = bool(C.OPT_CONFIG.get("resource_nn_history", False))
         bundle.resource_nn = main_nn.train_resource_nn(_resource_base(masked), resource_series(masked),
-            ref_pos, bundle.heat_rate, load_prices(), quick)
+            ref_pos, bundle.heat_rate, load_prices(), quick, use_history=use_history)
         bundle.final_resource_nn = main_nn.train_resource_nn(_resource_base(prepared), resource_series(prepared),
-            len(prepared.index) - 1, bundle.final_heat_rate, load_prices(), quick)
+            len(prepared.index) - 1, bundle.final_heat_rate, load_prices(), quick,
+            use_history=use_history)
     origins = prepared.index[eval_positions]
     forecast = forecast_resources(bundle, masked, origins)
     truth = resource_series(masked).to_numpy(dtype=float)[

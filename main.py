@@ -181,7 +181,8 @@ def _inference_window(prepared) -> tuple[pd.DatetimeIndex, str]:
     return origins, "semi_test_dryrun"
 
 
-def run_infer(quick: bool = False, experimental: bool = False) -> int:
+def run_infer(quick: bool = False, experimental: bool = False,
+              reuse_run: Path | None = None, nn_studies: list[Path] | None = None) -> int:
     """半决赛预开发：在官方特征窗口上滚动预测并生成提交格式文件。"""
     started = time.time()
     ctx = output.begin_run(C, mode="infer", experimental=quick or experimental)
@@ -201,10 +202,49 @@ def run_infer(quick: bool = False, experimental: bool = False) -> int:
 
         origins, window = _inference_window(prepared)
         training = prepared.prefix_copy(origins[0] - pd.Timedelta(minutes=C.STEP_MINUTES))
-        folds = build_folds(training, quick=quick)
-        short_bundle = main_s.train_short(training, folds, quick=quick)
-        long_bundle = main_l.train_long(training, folds, quick=quick)
-        resource_bundle = main_opt.train_resources(training, folds, quick=quick)
+        if reuse_run is None:
+            folds = build_folds(training, quick=quick)
+            short_bundle = main_s.train_short(training, folds, quick=quick)
+            long_bundle = main_l.train_long(training, folds, quick=quick)
+            resource_bundle = main_opt.train_resources(training, folds, quick=quick)
+        else:
+            import main_nn
+            short_bundle, long_bundle, resource_bundle = output.load_final_models(reuse_run)
+            for bundle in (short_bundle, long_bundle, resource_bundle):
+                if pd.Timestamp(bundle.final_train_end) >= origins[0]:
+                    raise ValueError("复用模型的训练截止点不得进入推理窗口")
+            summary["reused_models_from"] = str(reuse_run.resolve())
+            summary["validation_scope"] = "复用已有最终模型；神经网络按A/B/C冻结晋级，未评估D"
+            summary["nn_promotion"] = []
+            for study in nn_studies or []:
+                result = json.loads((study / C.REPORT_DIR / C.REPORT_JSON).read_text(encoding="utf-8"))
+                if result.get("status") != "SUCCESS_NN_STUDY" or set(result["folds"]) != {"A", "B", "C"}:
+                    raise ValueError("冻结晋级需要完整A/B/C成功专项结果")
+                eligible = [s for s in result["selection"] if s.get("passed_promotion")]
+                if not eligible:
+                    summary["nn_promotion"].append({"study": str(study), "promoted": False})
+                    continue
+                chosen = max(eligible, key=lambda s: s["mean"])
+                bundle = short_bundle if result["span"] == "short" else long_bundle
+                horizon = C.HORIZONS_S if result["span"] == "short" else C.HORIZONS_L
+                neural = main_nn.train_nn(training, [{"role": "tuning", "train_end": str(training.index[-1])}],
+                    result["kind"], horizon, n_seeds=int(result.get("n_seeds",
+                        len(result["results"][0]["training"]["early_stop"]["epochs"]))),
+                    cfg=result["config_overrides"])
+                old_kind, old_features = bundle.kind, bundle.features
+                bundle.kind = "nn_lgb_ens" if chosen["kind"] == "ensemble" else "nn"
+                bundle.features, bundle.blend = ("hybrid" if chosen["kind"] == "ensemble" else "nn"), chosen["blend"]
+                bundle.nn_weights = chosen.get("nn_weights", {})
+                bundle.final_nn_bundle = neural
+                bundle.lgb_kind, bundle.lgb_features = old_kind, old_features
+                if bundle.kind == "nn":
+                    bundle.models, bundle.final_models, bundle.feature_names = {}, {}, []
+                bundle.scores = {"tuning_mean": chosen["mean"], "confirm": {"accuracy": None,
+                    "reason": "本轮未评估D"}, "development": chosen["scores"]}
+                bundle.selection = {"chosen": {"kind": bundle.kind, "features": bundle.features},
+                    "candidates": result["selection"], "frozen_study": str(study)}
+                bundle.train_seconds = neural.train_seconds
+                summary["nn_promotion"].append({"study": str(study), "promoted": True, "kind": bundle.kind})
         LOGGER.info("训练完成: short=%s/%s long=%s/%s heat_rate_ok=%s",
                     short_bundle.kind, short_bundle.features,
                     long_bundle.kind, long_bundle.features,
@@ -459,6 +499,234 @@ def run_full(quick: bool = False, experimental: bool = False) -> int:
         return 1
 
 
+def run_resource_nn_study(args) -> int:
+    """资源时序候选与现有 MLP 同折比较；未过 WAPE 门槛不进入调度晋级。"""
+    import main_nn
+    from data_cleaning import resource_series
+
+    names = [s.strip() for s in args.folds.split(",")]
+    specs = [dict(f) for f in C.FOLDS if f["name"] in names and f["role"] == "tuning"]
+    if {f["name"] for f in specs} != set(names):
+        raise ValueError("资源专项只允许 A/B/C 开发折")
+    cfg = json.loads(args.nn_config)
+    ctx = output.begin_run(C, mode="nn_resource", experimental=True)
+    _setup_logger(ctx.log_path)
+    started = time.time()
+    summary = {"status": "RUNNING", "submittable": False, "folds": names,
+               "validation_scope": "仅开发折，D未评估", "results": [], "errors": []}
+    try:
+        output.write_source_snapshot(ctx, C)
+        prepared = prepare_data(C).prefix_copy(max(pd.Timestamp(f["start"]) +
+            pd.Timedelta(days=f["days"] + 1) for f in specs))
+        base, resource = main_opt._resource_base(prepared), resource_series(prepared)
+        prices = main_opt.load_prices()
+        for spec in specs:
+            _, evaluation, ref = main_s._fold_positions(prepared, spec, 8)
+            heat = main_opt.estimate_heat_rate(prepared, ref)
+            truth = resource.to_numpy()[evaluation[:, None] + np.arange(1, 9)]
+            item = {"fold": spec["name"], "models": {}}
+            for kind in ("mlp", "tcn"):
+                main_nn.torch.cuda.reset_peak_memory_stats() if main_nn.DEVICE.type == "cuda" else None
+                tick = time.perf_counter()
+                pack = main_nn.train_resource_nn(base, resource, ref, heat, prices, args.quick,
+                    use_history=False, network_kind=kind, max_epochs=int(cfg.get("epochs", 60)),
+                    batch=int(cfg.get("batch_size", 512)))
+                seconds = time.perf_counter() - tick
+                directory = ctx.model_dir / spec["name"] / kind
+                path = main_nn.save_resource_nn(pack, directory / "resource_nn.pt")
+                prediction = main_nn.predict_resource_nn(pack, base, resource, evaluation)
+                reloaded = main_nn.predict_resource_nn(main_nn.load_resource_nn(path), base, resource, evaluation)
+                if not np.allclose(prediction, reloaded, rtol=1e-6, atol=1e-5):
+                    raise ValueError("资源网络保存重载不一致")
+                item["models"][kind] = {"metrics": main_opt.score_resources(prediction, truth),
+                    "seconds": seconds, "epochs": pack["epochs"], "peak_memory_mb": main_nn.peak_memory_mb()}
+                np.savez_compressed(directory / "development_predictions.npz", prediction=prediction,
+                                    truth=truth, positions=evaluation)
+                LOGGER.info("资源 %s/%s: WAPE=%s，训练=%.1fs，显存=%.0fMiB", spec["name"], kind,
+                    {g: round(v["wape"], 4) for g, v in item["models"][kind]["metrics"].items()},
+                    seconds, main_nn.peak_memory_mb())
+            item["passed_wape_screen"] = all(item["models"]["tcn"]["metrics"][g]["wape"] <=
+                item["models"]["mlp"]["metrics"][g]["wape"] for g in C.RESOURCE_NAMES)
+            summary["results"].append(item)
+            output.write_report(ctx, summary)
+        summary["passed_wape_screen"] = all(r["passed_wape_screen"] for r in summary["results"])
+        summary["dispatch_promotion"] = "pending_full_ABC_control_gate" if summary["passed_wape_screen"] else "not_eligible"
+        summary["status"] = "SUCCESS_NN_STUDY"
+        return 0
+    except Exception as exc:
+        summary["status"] = "FAILED"
+        summary["errors"].append(f"{type(exc).__name__}: {exc}")
+        LOGGER.exception("资源专项失败")
+        return 1
+    finally:
+        summary["duration_seconds"] = time.time() - started
+        output.write_report(ctx, summary)
+        LOGGER.info("资源专项结果: %s", ctx.root)
+
+
+def run_nn_reblend(directory: Path) -> int:
+    """只重用已保存的开发预测选择统一融合系数，不重新训练也不接触新标签。"""
+    import shutil
+    started = time.time()
+    original = json.loads((directory / C.REPORT_DIR / C.REPORT_JSON).read_text(encoding="utf-8"))
+    if original.get("status") != "SUCCESS_NN_STUDY" or set(original["folds"]) != {"A", "B", "C"}:
+        raise ValueError("重选融合权重要求完整A/B/C成功专项结果")
+    span = original["span"]
+    horizons, groups = (C.HORIZONS_S, C.SHORT_GROUPS) if span == "short" else (C.HORIZONS_L, C.LONG_GROUPS)
+    ctx = output.begin_run(C, mode=f"nn_fusion_{span}", experimental=True)
+    _setup_logger(ctx.log_path)
+    output.write_source_snapshot(ctx, C)
+    neural, references, profiles, truths = [], [], [], []
+    for fold in original["folds"]:
+        folder = directory / C.MODEL_DIR / span / fold
+        with np.load(folder / "development_predictions.npz") as data:
+            neural.append(data["prediction"].copy())
+            references.append(data["reference"].copy())
+            profiles.append(data["profile"].copy())
+            truths.append(data["truth"].copy())
+        shutil.copytree(folder, ctx.model_dir / span / fold)
+    weights = main_s.select_nn_tree_weights(neural, references, truths, horizons, groups)
+    candidates = [
+        {"kind": "nn", "preds": neural, "truths": truths, "mean": 0.},
+        {"kind": "reference", "preds": references, "truths": truths, "mean": 0.},
+        {"kind": "ensemble", "preds": [main_s.blend_cube(a, b, weights, horizons, groups)
+            for a, b in zip(neural, references)], "truths": truths, "mean": 0., "nn_weights": weights}]
+    main_s.evaluate_blended_candidates(candidates, profiles, horizons, groups)
+    reference = candidates[1]
+    selection = []
+    for candidate in candidates:
+        item = {k: candidate[k] for k in ("kind", "mean", "worst", "blend", "scores")}
+        item["nn_weights"] = candidate.get("nn_weights", {})
+        item["passed_promotion"] = (candidate["kind"] != "reference" and
+            item["mean"] >= reference["mean"] + C.SELECTION["min_mean_gain_pp"] and
+            all(a["targets"][t]["accuracy"] >= b["targets"][t]["accuracy"] - C.SELECTION["max_worst_fold_drop_pp"]
+                for a, b in zip(item["scores"], reference["scores"]) for t in C.TARGETS))
+        selection.append(item)
+    original.update(selection=selection, training_source=str(directory.resolve()),
+                    fusion_grid=[0., .25, .5, .75, 1.], submittable=False,
+                    n_seeds=original.get("n_seeds", len(original["results"][0]["training"]["early_stop"]["epochs"])),
+                    training_duration_seconds=original.get("duration_seconds"),
+                    duration_seconds=time.time() - started, run_id=ctx.run_id)
+    output.write_report(ctx, original)
+    LOGGER.info("冻结融合: %s，结果=%s", weights, ctx.root)
+    return 0
+
+
+def run_nn_study(args) -> int:
+    """独立神经网络开发入口：只访问指定开发折，不触发 D 或整条调度回放。"""
+    import main_nn
+
+    if args.nn_reblend:
+        return run_nn_reblend(args.nn_reblend)
+
+    if args.nn_span == "resource":
+        return run_resource_nn_study(args)
+
+    names = [s.strip() for s in args.folds.split(",")]
+    specs = [dict(f) for f in C.FOLDS if f["name"] in names and f["role"] == "tuning"]
+    if not names or {f["name"] for f in specs} != set(names):
+        raise ValueError("NN 专项只允许 A/B/C 开发折，禁止把 D 用于调参")
+    cfg = json.loads(args.nn_config)
+    if not isinstance(cfg, dict):
+        raise ValueError("--nn-config 必须是 JSON 对象")
+    ctx = output.begin_run(C, mode=f"nn_{args.nn_span}_{args.nn_kind}", experimental=True)
+    _setup_logger(ctx.log_path)
+    started = time.time()
+    summary = {"status": "RUNNING", "submittable": False, "folds": names,
+               "kind": args.nn_kind, "span": args.nn_span, "config_overrides": cfg,
+               "n_seeds": args.nn_seeds,
+               "validation_scope": "历史开发折，D未评估", "results": [], "errors": []}
+    try:
+        output.write_source_snapshot(ctx, C)
+        if args.nn_benchmark:
+            summary["benchmark"] = main_nn.benchmark_engine(ctx.model_dir, args.nn_kind, cfg)
+            summary["status"] = "SUCCESS_NN_BENCHMARK"
+            return 0
+        prepared = prepare_data(C)
+        stop = max(pd.Timestamp(f["start"]) + pd.Timedelta(days=f["days"] + 1) for f in specs)
+        prepared = prepared.prefix_copy(stop)
+        horizons = C.HORIZONS_S if args.nn_span == "short" else C.HORIZONS_L
+        preds, profiles, truths, references = [], [], [], []
+        for spec in specs:
+            LOGGER.info("NN 专项 %s/%s/%s，目录=%s", args.nn_span, args.nn_kind, spec["name"], ctx.root)
+            positions, evaluation, ref = main_s._fold_positions(prepared, spec, max(horizons))
+            masked = prepared.masked_copy(spec["start"],
+                pd.Timestamp(spec["start"]) + pd.Timedelta(days=spec["days"]))
+            profile = main_s.baseline_cubes(masked, evaluation, horizons)["profile"]
+            truth = main_s.truth_cube(prepared, evaluation, horizons)
+            bundle = main_nn.train_nn(prepared, [spec], args.nn_kind, horizons,
+                                      quick=args.quick, n_seeds=args.nn_seeds, cfg=cfg)
+            directory = ctx.model_dir / args.nn_span / spec["name"]
+            path = main_nn.save_nn(bundle, directory)
+            origins = prepared.index[evaluation]
+            tick = time.perf_counter()
+            prediction = main_nn.predict_nn(bundle, masked, origins)
+            infer_seconds = time.perf_counter() - tick
+            reloaded = main_nn.predict_nn(main_nn.load_nn(Path(path)), masked, origins)
+            difference = float(np.max(np.abs(prediction - reloaded)))
+            if not np.isfinite(prediction).all() or difference > 1e-5:
+                raise ValueError("专项模型保存重载预测不一致")
+            item = {"fold": spec["name"], "score": main_s.score_cube(prediction, truth, horizons),
+                    "profile_score": main_s.score_cube(profile, truth, horizons),
+                    "training": bundle.scores, "infer_seconds": infer_seconds,
+                    "reload_max_abs_diff": difference, "feature_count": len(bundle.feature_names)}
+            if args.nn_reference:
+                kind = "direct" if args.nn_span == "short" else "global"
+                base = main_s.build_base_features(masked, include_targets=True)
+                stride = C.TRAIN_STRIDE_SHORT if args.nn_span == "short" else C.TRAIN_STRIDE_LONG
+                models, feature_names = main_s._train_models(masked, base, positions[::stride],
+                    horizons, kind, "gas", C.LGBM_TREES_SHORT if args.nn_span == "short" else C.LGBM_TREES_LONG, ref)
+                reference = main_s.enforce_physics(main_s._predict_models(masked, base, evaluation,
+                    horizons, kind, "gas", models, feature_names), fallback=profile)
+                for key, model in models.items():
+                    # Windows 原生 LightGBM 写中文路径不稳定，交由 Python 保存同一模型文本。
+                    (directory / f"reference_{output._model_tag(key)}.txt").write_text(
+                        model.model_to_string(), encoding="utf-8")
+                references.append(reference)
+                item["reference_score"] = main_s.score_cube(reference, truth, horizons)
+            arrays = {"prediction": prediction, "profile": profile, "truth": truth, "positions": evaluation}
+            if args.nn_reference:
+                arrays["reference"] = references[-1]
+            np.savez_compressed(directory / "development_predictions.npz", **arrays)
+            preds.append(prediction)
+            profiles.append(profile)
+            truths.append(truth)
+            summary["results"].append(item)
+            output.write_report(ctx, summary)
+            LOGGER.info("折 %s: NN=%.3f，画像=%.3f，训练=%.1fs，显存=%.0fMiB", spec["name"],
+                        item["score"]["accuracy"], item["profile_score"]["accuracy"],
+                        bundle.train_seconds, bundle.scores["peak_memory_mb"])
+        groups = main_s._groups_for(horizons)
+        candidates = [{"kind": "nn", "preds": preds, "truths": truths,
+                       "mean": float(np.mean([r["score"]["accuracy"] for r in summary["results"]]))}]
+        if references:
+            candidates.append({"kind": "reference", "preds": references, "truths": truths,
+                               "mean": float(np.mean([r["reference_score"]["accuracy"] for r in summary["results"]]))})
+            candidates.append({"kind": "ensemble", "preds": [(a + b) / 2 for a, b in zip(preds, references)],
+                               "truths": truths, "mean": 0.})
+        main_s.evaluate_blended_candidates(candidates, profiles, horizons, groups)
+        summary["selection"] = [{k: c[k] for k in ("kind", "mean", "worst", "blend", "scores")} for c in candidates]
+        if references:
+            baseline = candidates[1]
+            for item in summary["selection"]:
+                item["passed_promotion"] = (item["kind"] != "reference" and
+                    item["mean"] >= baseline["mean"] + C.SELECTION["min_mean_gain_pp"] and
+                    all(a["targets"][t]["accuracy"] >= b["targets"][t]["accuracy"] -
+                        C.SELECTION["max_worst_fold_drop_pp"]
+                        for a, b in zip(item["scores"], baseline["scores"]) for t in C.TARGETS))
+        summary["status"] = "SUCCESS_NN_STUDY"
+        return 0
+    except Exception as exc:
+        LOGGER.exception("神经网络专项失败")
+        summary["status"] = "FAILED"
+        summary["errors"].append(f"{type(exc).__name__}: {exc}")
+        return 1
+    finally:
+        summary["duration_seconds"] = time.time() - started
+        output.write_report(ctx, summary)
+        LOGGER.info("NN 专项结果: %s", ctx.root)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="AIC 半决赛煤气发电预测与优化")
     parser.add_argument("command", nargs="?", default="run",
@@ -467,11 +735,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--quick", action="store_true", help="单折、低迭代的开发模式")
     parser.add_argument("--experiment", action="store_true", help="全量开发实验写入 tmp/tmp_outputs")
     parser.add_argument("--fresh", action="store_true", help="保留参数，当前无训练缓存")
+    parser.add_argument("--nn-only", action="store_true", help="只运行神经网络开发实验，不访问D或调度器")
+    parser.add_argument("--folds", default="A,B", help="NN专项开发折，允许A/B/C")
+    parser.add_argument("--nn-span", choices=("short", "long", "resource"), default="long")
+    parser.add_argument("--nn-kind", choices=("dlinear", "tsmixer", "tcn_causal"), default="dlinear")
+    parser.add_argument("--nn-seeds", type=int, default=1)
+    parser.add_argument("--nn-config", default="{}", help="NN实验参数覆盖，JSON对象")
+    parser.add_argument("--nn-reference", action="store_true", help="同折训练树模型用于受控比较")
+    parser.add_argument("--nn-benchmark", action="store_true", help="固定更新步的合成GPU吞吐基准，不评价精度")
+    parser.add_argument("--nn-reblend", type=Path, help="重用ABC开发预测选择NN与树的统一融合权重")
+    parser.add_argument("--reuse-run", type=Path, help="infer复用本项目已归档的final模型")
+    parser.add_argument("--nn-study-run", type=Path, action="append", help="infer读取已通过ABC门槛的冻结NN专项")
     args = parser.parse_args(argv)
+    if args.reuse_run and args.command != "infer":
+        parser.error("--reuse-run 只用于 infer")
+    if args.nn_only:
+        if args.command != "run" or not args.experiment:
+            parser.error("--nn-only 必须搭配 run --experiment")
+        return run_nn_study(args)
     if args.command == "doctor":
         return run_doctor()
     if args.command == "infer":
-        return run_infer(quick=args.quick, experimental=args.experiment)
+        if args.nn_study_run and not args.reuse_run:
+            parser.error("--nn-study-run 必须同时指定 --reuse-run")
+        return run_infer(quick=args.quick, experimental=args.experiment,
+                         reuse_run=args.reuse_run, nn_studies=args.nn_study_run)
     if args.command == "self-check":
         return run_self_check()
     if args.command == "verify":
