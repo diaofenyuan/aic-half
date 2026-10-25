@@ -239,6 +239,9 @@ def _train_frozen_availability_models(training, study: Path, quick=False):
             or result.get("stages") != ["availability"]
             or not result.get("production_path_checks", {}).get("passed")):
         raise ValueError("最终冻结要求已完成的全量可用性专项")
+    if result.get("observed_at_t") and not any(
+            item.get("accepted") for item in result.get("retained_comparison", {}).values()):
+        raise ValueError("当前时刻特征尚未通过相对已保留策略的完整 A/B/C 门槛")
     training.require_training_data()
     recipes = json.loads((study / C.MODEL_DIR / "model_meta.json").read_text(encoding="utf-8"))
     ref, end = len(training.index) - 1, str(training.index[-1])
@@ -281,9 +284,11 @@ def _train_frozen_availability_models(training, study: Path, quick=False):
             stage, item = selected
             model_stage = item.get("model_stage", stage)
             state_recipe = {"kind": "direct" if span == "short" else "global",
-                "features": "gas_no_power" if model_stage == "R2" else "gas", "blend": item["blend"],
+                "features": item.get("features", "gas_no_power" if model_stage == "R2" else "gas"), "blend": item["blend"],
                 "fallback_weight": item.get("fallback_weight", 1.),
                 "fallback_weights": item.get("fallback_weights"),
+                "retained_recipe": item.get("retained_recipe"),
+                "retained_mix_weight": item.get("retained_mix_weight"),
                 "source_study": str(study), "stage": stage,
                 "development_gain_pp": item["tests"]["all_missing"]["mean_gain_pp"]}
             if promotion and (state_recipe["fallback_weight"] < 1. or state_recipe["fallback_weights"]):
@@ -329,8 +334,8 @@ def _train_frozen_availability_models(training, study: Path, quick=False):
     return bundles[0], bundles[1], resource
 
 
-def _refresh_availability_recipe(short_bundle, long_bundle, study):
-    """模型保持冻结，仅更新已通过联合验证的后处理配方。"""
+def _refresh_availability_recipe(short_bundle, long_bundle, study, training=None, quick=False):
+    """复用主模型；新增特征分支只按已通过开发门槛的配方独立重训。"""
     root = study.resolve()
     if not root.is_relative_to(C.EXPERIMENT_OUTPUT_ROOT.resolve()):
         raise ValueError("联合配方必须来自本项目实验目录")
@@ -338,6 +343,9 @@ def _refresh_availability_recipe(short_bundle, long_bundle, study):
     if (result.get("status") != "SUCCESS_PLAN_STUDY" or result.get("quick")
             or not result.get("production_path_checks", {}).get("passed")):
         raise ValueError("联合配方尚未通过完整实际入口验证")
+    if result.get("observed_at_t") and not any(
+            item.get("accepted") for item in result.get("retained_comparison", {}).values()):
+        raise ValueError("当前时刻特征尚未通过相对已保留策略的完整 A/B/C 门槛")
     originals = json.loads((root / C.MODEL_DIR / "model_meta.json").read_text(encoding="utf-8"))
     for span, bundle in (("short", short_bundle), ("long", long_bundle)):
         expected = dict(originals[span])
@@ -354,9 +362,23 @@ def _refresh_availability_recipe(short_bundle, long_bundle, study):
             continue
         stage, item = selected
         state = bundle.final_availability
-        expected_features = "gas_no_power" if item.get("model_stage", stage) == "R2" else "gas"
+        retained_state = state
+        expected_features = item.get("features", "gas_no_power" if item.get("model_stage", stage) == "R2" else "gas")
         if not state or state["features"] != expected_features:
-            raise ValueError("复用运行缺少对应缺测模型，需要按冻结配方重新训练")
+            if not result.get("observed_at_t") or training is None:
+                raise ValueError("复用运行缺少对应缺测模型，需要按冻结配方重新训练")
+            state = main_s.train_availability_fallback(training, bundle.horizons,
+                {"kind": "direct" if span == "short" else "global", "features": expected_features,
+                 "blend": item["blend"]}, quick)
+            bundle.final_availability = state
+            LOGGER.info("已按冻结配方重训 %s/%s 最终缺测分支", span, expected_features)
+        if item.get("retained_recipe"):
+            recipe = item["retained_recipe"]
+            if retained_state is None or any(retained_state.get(k) != recipe.get(k) for k in
+                    ("features", "blend", "fallback_weight", "fallback_weights")):
+                retained_state = main_s.train_availability_fallback(training, bundle.horizons, recipe, quick)
+            state.update(retained_state=retained_state, retained_recipe=recipe,
+                         retained_mix_weight=item["retained_mix_weight"])
         state.update(blend=item["blend"], fallback_weight=item.get("fallback_weight", 1.),
             fallback_weights=item.get("fallback_weights"), stage=stage, source_study=str(root),
             development_gain_pp=item["tests"]["all_missing"]["mean_gain_pp"])
@@ -404,10 +426,11 @@ def run_infer(quick: bool = False, experimental: bool = False,
                 if any(pd.Timestamp(b.final_train_end) != training.index[-1]
                        for b in (short_bundle, long_bundle, resource_bundle)):
                     raise ValueError("复用模型没有覆盖当前合法训练截止点，必须重训")
-                _refresh_availability_recipe(short_bundle, long_bundle, availability_study)
+                _refresh_availability_recipe(short_bundle, long_bundle, availability_study, training, quick)
                 summary["reused_models_from"] = str(reuse_run.resolve())
             summary["availability_study"] = str(availability_study.resolve())
-            summary["validation_scope"] = "冻结A/B/C联合开发配方；D未重评；复用运行不重复训练" if reuse_run else "冻结A/B/C开发配方；仅重训最终模型；D未重评"
+            summary["validation_scope"] = ("冻结A/B/C联合开发配方；D未重评；复用主模型，仅新增特征分支按需重训"
+                                           if reuse_run else "冻结A/B/C开发配方；仅重训最终模型；D未重评")
             stages.update(3)
         elif reuse_run is None:
             folds = build_folds(training, quick=quick)
@@ -1124,6 +1147,11 @@ def _verify_availability_production(directory, summary, prepared):
             state.update(models=_study_load_models(candidate, state["files"]), blend=item["blend"],
                          fallback_weight=item.get("fallback_weight", 1.),
                          fallback_weights=item.get("fallback_weights"), role="final")
+            if item.get("retained_recipe"):
+                retained_dir = root / "retained_model" / spec["name"]
+                retained = json.loads((retained_dir / "meta.json").read_text(encoding="utf-8"))
+                retained.update(item["retained_recipe"], models=_study_load_models(retained_dir, retained["files"]))
+                state.update(retained_state=retained, retained_mix_weight=item["retained_mix_weight"])
             if span == "long" and promoted_long and (state["fallback_weight"] < 1. or state["fallback_weights"]):
                 state["reference_recipe"] = {k: recipes[span][k] for k in ("kind", "features", "blend")}
             bundle = cls(kind=normal["kind"], features=normal["features"], horizons=horizons,
@@ -1147,6 +1175,9 @@ def _verify_availability_production(directory, summary, prepared):
                 difference = float(np.max(np.abs(actual - expected)))
                 with np.load(root / "R1" / scenario / spec["name"] / "predictions.npz") as arrays:
                     truth, baseline = arrays["truth"].copy(), arrays["prediction"].copy()
+                if summary.get("observed_at_t"):
+                    with np.load(root / "retained" / scenario / spec["name"] / "predictions.npz") as arrays:
+                        baseline = arrays["prediction"].copy()
                 after, before = main_s.score_cube(actual, truth, horizons), main_s.score_cube(baseline, truth, horizons)
                 deltas = {t: after["targets"][t]["accuracy"] - before["targets"][t]["accuracy"] for t in C.TARGETS}
                 results.append({"span": span, "fold": spec["name"], "scenario": scenario,
@@ -1775,8 +1806,110 @@ def _availability_joint_mix(ctx, summary):
             (target / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
             np.savez_compressed(target / "predictions.npz", prediction=pred, truth=row[2], positions=row[4])
     summary["promotion"][span]["R2_target_mix"] = {"accepted": True, "model_stage": "R2",
-        "blend": r2["blend"], "fallback_weights": weights, "tests": tests, "composition_includes_R0": True}
+        "blend": r2["blend"], "fallback_weights": weights, "tests": tests, "composition_includes_R0": True,
+        "features": r2.get("features", "gas_no_power")}
     LOGGER.info("联合策略通过：缺测提升 %.4fpp，分目标权重=%s", gain, weights)
+
+
+def _observed_retained_comparison(ctx, summary, reference, prior, specs):
+    """额外对照已保留缺测策略，避免只相对早期失配基线报告改善。"""
+    import shutil
+    results = {}
+    for span, horizons in (("short", C.HORIZONS_S), ("long", C.HORIZONS_L)):
+        selected = max(((s, v) for s, v in summary["promotion"][span].items()
+                        if not v.get("retained_without_new_promotion") and s != "R2_retained_mix"),
+            key=lambda pair: pair[1]["tests"]["all_missing"]["mean_gain_pp"])
+        old = max(((s, v) for s, v in prior["promotion"][span].items() if v["accepted"]),
+            key=lambda pair: pair[1]["tests"]["all_missing"]["mean_gain_pp"])
+        tests, cases = {}, {}
+        for scenario in summary["contract"]["scenarios"]:
+            after, before, truths = [], [], []
+            for spec in specs:
+                key = spec["name"]
+                with np.load(reference / C.MODEL_DIR / span / "R1" / scenario / key / "predictions.npz") as data:
+                    missing, truth, positions = (data[k].copy() for k in ("missing", "truth", "positions"))
+                arrays = []
+                for directory, stage, policy in ((ctx.root, selected[0], summary), (reference, old[0], prior)):
+                    normal_path = (Path("R0_long") / key if span == "long" and
+                        any(r.get("accepted") for r in policy.get("R0", [])) else Path(span) / "baseline" / key)
+                    with np.load(directory / C.MODEL_DIR / normal_path / "predictions.npz") as data:
+                        normal = data["prediction"].copy()
+                    with np.load(directory / C.MODEL_DIR / span / stage / scenario / key / "predictions.npz") as data:
+                        if (not np.array_equal(data["truth"], truth, equal_nan=True)
+                                or not np.array_equal(data["positions"], positions)):
+                            raise ValueError("当前时刻特征对照标签或起报点不一致")
+                        arrays.append(np.where(missing[:, None, None], data["prediction"], normal))
+                after.append(arrays[0])
+                before.append(arrays[1])
+                truths.append(truth)
+            tests[scenario] = main_s.load_promotion(after, before, truths, horizons)
+            cases[scenario] = (after, before, truths)
+            for values, truth, spec in zip(before, truths, specs):
+                target = ctx.model_dir / span / "retained" / scenario / spec["name"]
+                target.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(reference / C.MODEL_DIR / span / old[0] / scenario / spec["name"] / "meta.json",
+                                target / "meta.json")
+                with np.load(reference / C.MODEL_DIR / span / "R1" / scenario / spec["name"] / "predictions.npz") as data:
+                    np.savez_compressed(target / "predictions.npz", prediction=values, truth=truth, positions=data["positions"])
+        candidates, chosen = [], None
+        # 权重跨折、目标和提前量共用；只复用已有折外预测，不新增训练或查看确认折。
+        for weight in (1., .5, .25, .1, .05):
+            trial, predictions = {}, {}
+            for scenario, (after, before, truths) in cases.items():
+                predictions[scenario] = [main_s.enforce_physics(weight * a + (1. - weight) * b)
+                                         for a, b in zip(after, before)]
+                trial[scenario] = main_s.load_promotion(predictions[scenario], before, truths, horizons)
+            protected = all(v >= -C.SELECTION["max_worst_fold_drop_pp"] for t in trial.values()
+                            for delta in t["fold_target_deltas_pp"] for v in delta.values())
+            gain = trial["all_missing"]["mean_gain_pp"]
+            passed = protected and gain >= C.SELECTION["min_mean_gain_pp"]
+            candidates.append({"weight": weight, "mean_gain_pp": gain, "passed": bool(passed)})
+            if passed and (chosen is None or gain > chosen[0]):
+                chosen = (gain, weight, trial, predictions)
+        accepted = not summary["quick"] and chosen is not None
+        if chosen:
+            _, weight, tests, predictions = chosen
+        else:
+            weight = 1.
+        results[span] = {"accepted": bool(accepted), "stage": selected[0], "tests": tests,
+                         "reference_stage": old[0], "mix_weight": weight, "search": candidates}
+        if not summary["quick"]:
+            for stage, item in summary["promotion"][span].items():
+                item["accepted"] = False
+            model_stage = old[1].get("model_stage", old[0])
+            source = reference / C.MODEL_DIR / span
+            target = ctx.model_dir / span
+            shutil.copytree(source / model_stage, target / "retained_model", dirs_exist_ok=True)
+            meta = json.loads((source / model_stage / specs[0]["name"] / "meta.json").read_text(encoding="utf-8"))
+            if accepted:
+                originals = json.loads((reference / C.MODEL_DIR / "model_meta.json").read_text(encoding="utf-8"))
+                recipe = {"kind": meta["kind"], "features": meta["features"], "blend": old[1]["blend"],
+                          "fallback_weight": old[1].get("fallback_weight", 1.),
+                          "fallback_weights": old[1].get("fallback_weights")}
+                if recipe["fallback_weight"] < 1. or recipe["fallback_weights"]:
+                    recipe["reference_recipe"] = {k: originals[span][k] for k in ("kind", "features", "blend")}
+                stage = "R2_retained_mix"
+                summary["promotion"][span][stage] = {**selected[1], "accepted": True,
+                    "model_stage": selected[1].get("model_stage", selected[0]), "retained_recipe": recipe,
+                    "retained_mix_weight": weight, "tests": tests}
+                for scenario, estimates in predictions.items():
+                    for pred, truth, spec in zip(estimates, cases[scenario][2], specs):
+                        directory = target / stage / scenario / spec["name"]
+                        directory.mkdir(parents=True, exist_ok=True)
+                        with np.load(target / selected[0] / scenario / spec["name"] / "predictions.npz") as data:
+                            np.savez_compressed(directory / "predictions.npz", prediction=pred, truth=truth, positions=data["positions"])
+                        metadata = json.loads((target / selected[0] / scenario / spec["name"] / "meta.json").read_text(encoding="utf-8"))
+                        metadata.update(retained_mix_weight=weight, retained_recipe=recipe)
+                        (directory / "meta.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+                results[span]["stage"] = stage
+            if not accepted:
+                # 未过门槛的跨度完整保留旧分支，避免另一个跨度晋级时一起退回失配主模型。
+                summary["promotion"][span]["retained"] = {**old[1], "accepted": True,
+                    "model_stage": "retained_model", "features": meta["features"], "retained_without_new_promotion": True}
+            results[span]["action"] = "promoted" if accepted else "retained"
+        LOGGER.info("当前时刻特征相对保留策略 %s：缺测提升 %.4fpp，晋级=%s", span,
+                    tests["all_missing"]["mean_gain_pp"], accepted)
+    summary["retained_comparison"] = results
 
 
 def run_availability_study(args) -> int:
@@ -1789,6 +1922,13 @@ def run_availability_study(args) -> int:
     prior = json.loads((reference / C.REPORT_DIR / C.REPORT_JSON).read_text(encoding="utf-8"))
     if prior.get("status") != "SUCCESS_PLAN_STUDY" or prior.get("quick"):
         raise ValueError("可用性专项要求完整的冻结开发基线")
+    observed = args.plan_study == "observed"
+    if observed:
+        if (prior.get("stages") != ["availability"] or prior.get("observed_at_t")
+                or not prior.get("production_path_checks", {}).get("passed")):
+            raise ValueError("当前时刻特征专项必须对照已通过实际入口验证的可用性策略")
+        if not args.nn_study_run:
+            args.nn_study_run = [Path(p) for p in prior.get("nn_studies", [])]
     studies = [str(p.resolve()) for p in args.nn_study_run or []]
     if args.study_resume:
         root = args.study_resume.resolve()
@@ -1796,16 +1936,19 @@ def run_availability_study(args) -> int:
             raise ValueError("续跑只能使用本项目实验目录")
         summary = json.loads((root / C.REPORT_DIR / C.REPORT_JSON).read_text(encoding="utf-8"))
         if (summary.get("reference") != str(reference) or summary.get("quick") != args.quick
-                or summary.get("nn_studies") != studies or summary.get("stages") != ["availability"]):
+                or summary.get("nn_studies") != studies or summary.get("stages") != ["availability"]
+                or summary.get("observed_at_t", False) != observed):
             raise ValueError("可用性专项续跑参数不一致")
         ctx = output.RunContext(root.name, root, root / C.SOURCE_DIR, root / C.MODEL_DIR,
             root / C.REPORT_DIR, root / C.REPORT_DIR / C.REPORT_LOG, "plan_availability")
         summary.update(status="RUNNING", errors=[])
     else:
-        ctx = output.begin_run(C, mode="plan_availability", experimental=True)
+        ctx = output.begin_run(C, mode="plan_observed" if observed else "plan_availability", experimental=True)
         summary = {"status": "RUNNING", "submittable": False, "quick": args.quick,
             "reference": str(reference), "nn_studies": studies, "stages": ["availability"],
-            "validation_scope": "ABC_21_days_only; reused_development; no_D; no_test_inputs",
+            "observed_at_t": observed,
+            "validation_scope": ("AB_21_days_screen_only" if args.quick else "ABC_21_days_only")
+                                + "; reused_development; no_D; no_test_inputs",
             "results": [], "errors": [], "promotion": {},
             "contract": {"scenarios": ["normal", "all_missing", "outage_day7"],
                 "missing_gain_pp": .5, "fold_target_drop_pp": .2,
@@ -1902,12 +2045,14 @@ def run_availability_study(args) -> int:
                         for k in ("stage", "span", "scenario", "fold"))] + [item]
                 cached.append({"spec": spec, "evaluation": evaluation, "truth": truth, "scenarios": scenarios})
                 output.write_report(ctx, summary)
-            for stage in ("R2", "R3"):
+            for stage in (("R2",) if observed else ("R2", "R3")):
                 if stage == "R3" and summary["promotion"][span]["R2"]["accepted"]:
                     break
                 raws, profiles, truths = [], [], []
                 scenario_raws = {s: [] for s in summary["contract"]["scenarios"]}
                 feature_set = "gas_no_power" if stage == "R2" else "gas"
+                if observed:
+                    feature_set += "_at_t"
                 for cache in cached:
                     spec, evaluation = cache["spec"], cache["evaluation"]
                     target = ctx.model_dir / span / stage / spec["name"]
@@ -1989,7 +2134,8 @@ def run_availability_study(args) -> int:
                 protected = all(v >= -.2 for t in tests.values() for d in t["fold_target_deltas_pp"] for v in d.values())
                 accepted = len(specs) == 3 and protected and tests["all_missing"]["mean_gain_pp"] >= .5
                 summary["promotion"].setdefault(span, {})[stage] = {"accepted": bool(accepted),
-                    "blend": blend, "tests": tests, "normal_path": "original_unless_current_power_gas_missing"}
+                    "blend": blend, "tests": tests, "features": feature_set,
+                    "normal_path": "original_unless_current_power_gas_missing"}
                 LOGGER.info("完成 %s/%s：缺耗气提升 %.4fpp，晋级=%s", stage, span,
                     tests["all_missing"]["mean_gain_pp"], accepted)
                 output.write_report(ctx, summary)
@@ -2028,10 +2174,13 @@ def run_availability_study(args) -> int:
                             np.savez_compressed(target / "predictions.npz", prediction=pred, truth=cache["truth"], positions=cache["evaluation"])
                     summary["promotion"][span]["R2_mix"] = {"accepted": len(specs) == 3,
                         "model_stage": "R2", "fallback_weight": weight, "blend": r2["blend"], "tests": tests,
+                        "features": r2.get("features", "gas_no_power"),
                         "search_scope": "one_common_weight_from_existing_grid; frozen_ABC; no_D"}
                     LOGGER.info("完成 R2_mix/%s：共用权重 %.2f，提升 %.4fpp", span, weight, gain)
                     output.write_report(ctx, summary)
         _availability_joint_mix(ctx, summary)
+        if observed:
+            _observed_retained_comparison(ctx, summary, reference, prior, specs)
         summary["status"] = "SUCCESS_PLAN_STUDY"
         summary["R4_R5"] = {"status": "RESEARCH_ONLY_PREREQUISITES_UNRESOLVED",
             "reason": "historical_consumption_envelope; holder_mapping_and_real_net_gas_unverified; feedback_availability_requires_separate_validation"}
@@ -2049,7 +2198,7 @@ def run_availability_study(args) -> int:
 
 def run_plan_study(args) -> int:
     """方案专项只访问开发折，不触发正式推理、D 重选或交付打包。"""
-    if args.plan_study == "availability":
+    if args.plan_study in ("availability", "observed"):
         return run_availability_study(args)
     stages = set(args.plan_study.split(","))
     allowed = {"baseline", "pressure", "E1", "E2", "E3", "E4", "E5", "E6"}
@@ -2165,7 +2314,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reuse-run", type=Path, help="infer复用本项目已归档的final模型")
     parser.add_argument("--nn-study-run", type=Path, action="append", help="infer读取已通过ABC门槛的冻结NN专项")
     parser.add_argument("--availability-study-run", type=Path, help="infer按完整可用性专项冻结配方重训final，不重评D")
-    parser.add_argument("--plan-study", help="方案开发专项：baseline、pressure、availability 或 E1～E6")
+    parser.add_argument("--plan-study", help="方案开发专项：baseline、pressure、availability、observed 或 E1～E6")
     parser.add_argument("--study-reference", type=Path, help="原始运行或已生成的方案开发基线")
     parser.add_argument("--study-resume", type=Path, help="续跑已中断的资源方案专项，核验后复用已完成数组")
     args = parser.parse_args(argv)

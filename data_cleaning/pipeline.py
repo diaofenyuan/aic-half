@@ -316,6 +316,39 @@ def _concat_stage_tables(frames: list[pd.DataFrame], name: str,
     return combined
 
 
+def _observed_at_t_features(tables: dict[str, pd.DataFrame], index: pd.DatetimeIndex,
+                            config=C) -> pd.DataFrame:
+    """原值仍按同时间戳对齐；附加统计只读取 (t-window, t] 内真实观测。"""
+    cleaned = {}
+    for table in ("gas", "gas_user", "gas_holder"):
+        raw = tables.get(table, pd.DataFrame(index=pd.DatetimeIndex([])))
+        part = raw.loc[:index[-1]].add_prefix(f"{table}_").copy()
+        part.replace([np.inf, -np.inf], np.nan, inplace=True)
+        _apply_sentinel_rules(part, {})
+        cleaned[table] = part
+    out = {}
+    for col in config.AT_T_DEVICE_COLUMNS:
+        table = "gas_user" if col.startswith("gas_user_") else "gas"
+        series = cleaned[table].get(col, pd.Series(dtype=float))
+        current = series.reindex(index)
+        out[f"at_t_{col}"] = current
+        out[f"at_t_{col}_missing"] = current.isna().astype(float)
+    for name, columns in config.AT_T_MINUTE_GROUPS.items():
+        table = "gas_holder" if name == "holder" else "gas_user" if name.endswith("user") else "gas"
+        raw = cleaned[table].reindex(columns=list(columns))
+        # 多设备统计要求组成项齐备，避免部分缺测被误当作真实减产。
+        values = raw.sum(axis=1, min_count=len(columns))
+        window = values.rolling("15min", closed="right", min_periods=5)
+        mean = window.mean()
+        features = {"mean15m": mean, "std15m": window.std(),
+                    "coverage15m": values.rolling("15min", closed="right").count().div(15.).clip(0., 1.),
+                    "mean60m": values.rolling("60min", closed="right", min_periods=15).mean(),
+                    "recent_change": values.rolling("5min", closed="right", min_periods=2).mean() - mean}
+        for suffix, series in features.items():
+            out[f"at_t_{name}_{suffix}"] = series.reindex(index)
+    return pd.DataFrame(out, index=index, dtype=float)
+
+
 def prepare_data(config=C, mask_targets: tuple | None = None,
                  cutoff: pd.Timestamp | str | None = None,
                  include_inference: bool = False) -> PreparedData:
@@ -383,6 +416,7 @@ def prepare_data(config=C, mask_targets: tuple | None = None,
     _apply_sentinel_rules(frame, quality)
     _causal_fill(frame, quality)
     _build_derived(frame)
+    frame = pd.concat([frame, _observed_at_t_features(merged_tables, index, config)], axis=1)
 
     targets = pd.DataFrame({t: frame.get(config.TARGET_COLUMN[t], np.nan)
                             for t in config.TARGETS}, index=index)

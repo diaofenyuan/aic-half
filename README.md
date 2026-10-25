@@ -29,6 +29,7 @@ python main.py run --experiment --plan-study E1,E2,E3 --study-reference tmp/tmp_
 python main.py run --experiment --plan-study E4,E5,E6 --study-reference tmp/tmp_outputs/<方案基线>
 python main.py run --experiment --plan-study pressure --study-reference tmp/tmp_outputs/<方案基线>
 python main.py run --experiment --plan-study availability --study-reference tmp/tmp_outputs/<方案基线> --nn-study-run tmp/tmp_outputs/<长期融合专项>
+python main.py run --quick --experiment --plan-study observed --study-reference tmp/tmp_outputs/<已验证的可用性专项>
 python main.py infer --experiment --availability-study-run tmp/tmp_outputs/<全量可用性专项>
 ```
 
@@ -45,10 +46,16 @@ E6 用训练前缀内完整折外误差路径校准库存裕度，不可行时�
 的画像/分支权重，保持逐折逐目标保护；可通过 `--study-resume` 复用已保存模型。
 `--availability-study-run` 只接收已完成的全量专项，按冻结配方重训最终模型，
 不重新评估 D；实际使用的缺测分支及必要参考配方一并归档，可离线重载。
+`observed` 为独立缺测候选补充起报点设备明细，以及 `(t-15min,t]`、
+`(t-60min,t]` 的真实分钟统计和有效比例；原始 15 分钟取值不变，不补造缺测量。
+旧模型不读取这些新增列。专项同时比较已保留策略，quick 只做 A/B 筛选，不能晋级。
+新增分支可与已保留分支按全折共用的小比例融合，仍须逐折逐目标通过保护门槛；
+两组实际模型及融合参数共同归档，重载后不依赖专项目录。
 已通过完整门槛的短期少特征分支和长期分目标保护融合也写入唯一配置源，默认
 正式训练会独立拟合最终缺测分支；完整观测仍走选定的主模型。
 若只更新已通过联合验证的分支权重，可同时传 `--reuse-run <最终模型运行>` 与
 `--availability-study-run <专项>`；要求复用模型已训练至当前合法截止点，不重复训练。
+对通过完整门槛的 `observed` 专项，同一入口复用主模型，只独立重训缺少的新增特征分支。
 `pressure` 只诊断 10 月 1～9 日起报点，训练截止 9 月 30 日；该已查看分布的
 九天窗口不参加晋级，也不称为独立盲测。
 资源专项中断后，可在同一命令追加 `--study-resume tmp/tmp_outputs/<中断目录>`；

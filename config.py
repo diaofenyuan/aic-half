@@ -179,6 +179,27 @@ FEATURE_WINDOW_COLUMNS = (
 FEATURE_LAGS = (1, 4, 16, 96)
 FEATURE_ROLLS = (4, 16, 96)
 FEATURE_STD_WINDOW = 96
+# 新特征只供显式选择的 at_t 分支使用，保证旧模型重载时的特征口径不变。
+AT_T_DEVICE_COLUMNS = (
+    *(f"gas_blast_furnace_{i}" for i in range(1, 6)),
+    *(f"gas_air_heater_{i}" for i in range(1, 6)),
+    *(f"gas_user_blast_furnace_user{i}" for i in range(1, 5)),
+    *(f"gas_user_converter_user{i}" for i in range(1, 3)),
+    "gas_into_gas_mixed_blast_furnace", "gas_into_gas_mixed_coke",
+    "gas_into_gas_mixed_converter",
+)
+AT_T_MINUTE_GROUPS = {
+    "gen_blast": tuple(f"gas_blast_furnace_{i}" for i in range(1, 6)),
+    "gen_coke": ("gas_coke_oven_1",),
+    "gen_converter": ("gas_converter_1",),
+    "air_heater": tuple(f"gas_air_heater_{i}" for i in range(1, 6)),
+    "blast_user": tuple(f"gas_user_blast_furnace_user{i}" for i in range(1, 5)),
+    "converter_user": tuple(f"gas_user_converter_user{i}" for i in range(1, 3)),
+    "mixed_blast": ("gas_into_gas_mixed_blast_furnace",),
+    "mixed_coke": ("gas_into_gas_mixed_coke",),
+    "mixed_converter": ("gas_into_gas_mixed_converter",),
+    "holder": ("gas_holder_blast_furnace_gas_holder_2",),
+}
 PROFILE_DAYS = 28
 PROFILE_RATIO_CLIP = (0.5, 2.0)
 
@@ -244,6 +265,14 @@ AVAILABILITY_FALLBACK = {
                  "blend": {"generator_1": {"short": 1., "medium": 1., "long": 1.},
                            "generator_all": {"short": .2, "medium": .1, "long": 0.}}},
              "stage": "R2_target_mix", "source_study": "20261025_182342_plan_availability"},
+}
+# A/B/C 上以旧保留策略为对照通过保护门槛；分钟分支仅占 5%，不强行替换稳定分量。
+AVAILABILITY_FALLBACK["long"] = {
+    "kind": "global", "features": "gas_no_power_at_t", "fallback_weight": 1.,
+    "blend": {"generator_1": {"short": .8, "medium": .7, "long": .6},
+              "generator_all": {"short": .2, "medium": .1, "long": .1}},
+    "retained_mix_weight": .05, "retained_recipe": AVAILABILITY_FALLBACK["long"],
+    "stage": "R2_retained_mix", "source_study": "20261025_192733_plan_observed",
 }
 LONG_GROUPS = (("short", 1, 8), ("medium", 9, 32), ("long", 33, 96))
 SHORT_GROUPS = (("head", 1, 4), ("tail", 5, 8))

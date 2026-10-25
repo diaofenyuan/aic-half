@@ -643,6 +643,47 @@ def _power_gas_availability_check() -> dict:
     return {"passed": all(checks.values()), **checks}
 
 
+def _observed_at_t_check() -> dict:
+    from .pipeline import _observed_at_t_features
+    from main_s import _feature_columns, _with_observed_features
+    minutes = pd.date_range("2025-01-01", periods=121, freq="min")
+    grid = minutes[::15]
+    gas = pd.DataFrame({f"blast_furnace_{i}": np.arange(121.) + i * 100.
+                        for i in range(1, 6)}, index=minutes)
+    tables = {"gas": gas}
+    base = _observed_at_t_features(tables, grid)
+    t = grid[4]
+    future = gas.copy()
+    future.loc[future.index > t] *= 1000.
+    altered = _observed_at_t_features({"gas": future}, grid)
+    prefix = _observed_at_t_features({"gas": gas.loc[:t]}, grid[:5])
+    current = gas.copy()
+    current.loc[t, "blast_furnace_1"] += 150.
+    changed_t = _observed_at_t_features({"gas": current}, grid)
+    current = gas.copy()
+    current.loc[t - pd.Timedelta(minutes=1), "blast_furnace_1"] += 150.
+    changed_minute = _observed_at_t_features({"gas": current}, grid)
+    missing = gas.copy()
+    missing.loc[:, "blast_furnace_1"] = np.nan
+    absent = _observed_at_t_features({"gas": missing}, grid)
+    zeros = _observed_at_t_features({"gas": gas * 0.}, grid)
+    prepared = _synthetic_prepared(len(grid))
+    prepared.frame = prepared.frame.join(base.set_axis(prepared.index))
+    legacy = build_base_features(prepared, include_targets=True)
+    augmented = _with_observed_features(prepared, legacy, "gas_no_power_at_t")
+    cols = _feature_columns(augmented, "gas_no_power_at_t")
+    checks = {"future_unchanged": np.allclose(base.loc[:t], altered.loc[:t], equal_nan=True),
+              "prefix_identical": np.allclose(base.loc[:t], prefix, equal_nan=True),
+              "current_observation_used": changed_t.loc[t, "at_t_gas_blast_furnace_1"] != base.loc[t, "at_t_gas_blast_furnace_1"],
+              "previous_minute_used": changed_minute.loc[t, "at_t_gen_blast_mean15m"] != base.loc[t, "at_t_gen_blast_mean15m"],
+              "missing_not_zero": bool(absent["at_t_gen_blast_mean15m"].isna().all()),
+              "zero_preserved": zeros.loc[t, "at_t_gen_blast_mean15m"] == 0.,
+              "legacy_schema_unchanged": not any(c.startswith("at_t_") for c in legacy),
+              "new_features_selected": all(c in cols for c in base)}
+    return {"passed": bool(all(checks.values())), **{k: bool(v) for k, v in checks.items()},
+            "additional_features": len(base.columns), "window": "(t-window,t]"}
+
+
 def run_self_checks(config=C) -> dict:
     checks = {
         "stage_isolation": _stage_isolation_check(),
@@ -658,6 +699,7 @@ def run_self_checks(config=C) -> dict:
         "rolling_causality": _rolling_causality_check(),
         "plan_research": _plan_research_check(),
         "power_gas_availability": _power_gas_availability_check(),
+        "observed_at_t": _observed_at_t_check(),
     }
     checks["passed"] = all(v.get("passed", False) for v in checks.values())
     return checks

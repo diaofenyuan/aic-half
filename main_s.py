@@ -66,7 +66,7 @@ def design_inputs(prepared: PreparedData, base: pd.DataFrame,
     """构造与提前量相关的目标时刻日历、画像特征。"""
     extras = target_calendar(prepared, positions, horizons)
     # 少特征分支不得通过燃料缩放重新读到被排除的发电耗气。
-    ratio = (np.ones(len(positions)) if features == "gas_no_power"
+    ratio = (np.ones(len(positions)) if features.removesuffix("_at_t") == "gas_no_power"
              else fuel_level_ratio(prepared, positions))
     extras["fuel_profile_ratio"] = np.repeat(ratio[:, None], len(horizons), axis=1)
     # 同槽位画像与最近可见水平都来自起报点之前的历史，部署时同样可得；
@@ -334,7 +334,7 @@ SHORT_CANDIDATES = (
 
 
 def _gas_columns(base: pd.DataFrame) -> list[str]:
-    return [c for c in base.columns if not c.startswith(("tgt_", "last_"))]
+    return [c for c in base.columns if not c.startswith(("tgt_", "last_", "at_t_"))]
 
 
 def _feature_columns(base: pd.DataFrame, features: str) -> list[str]:
@@ -346,6 +346,8 @@ def _feature_columns(base: pd.DataFrame, features: str) -> list[str]:
       训练/服务不一致，历史上 gaslast 的前身 target 集因此掉到 82 分。
     - target：全列，仅作对照基线，不参与部署。
     """
+    if features.endswith("_at_t"):
+        return _feature_columns(base, features.removesuffix("_at_t")) + [c for c in base if c.startswith("at_t_")]
     cols = list(base.columns)
     if features == "gas_no_power":
         return [c for c in _gas_columns(base) if not c.startswith((
@@ -357,6 +359,15 @@ def _feature_columns(base: pd.DataFrame, features: str) -> list[str]:
         return [c for c in cols
                 if not c.startswith("tgt_") or c.endswith(("_last_level", "_age"))]
     return cols
+
+
+def _with_observed_features(prepared: PreparedData, base: pd.DataFrame, features: str) -> pd.DataFrame:
+    if not features.endswith("_at_t"):
+        return base
+    columns = [c for c in prepared.frame if c.startswith("at_t_")]
+    if not columns:
+        raise ValueError("at_t 模型缺少截至起报时刻的分钟特征，请重新读取官方原始数据")
+    return base.join(prepared.frame[columns])
 
 
 def _groups_for(horizons: tuple[int, ...]):
@@ -371,6 +382,7 @@ def _train_models(prepared: PreparedData, base_all: pd.DataFrame,
     prepared.require_training_data()
     if len(positions) == 0 or np.max(positions) + max(horizons) > ref_pos:
         raise ValueError("负荷训练目标跨越冻结截止点")
+    base_all = _with_observed_features(prepared, base_all, features)
     columns = _feature_columns(base_all, features)
     base = base_all[columns]
     base_values = base.to_numpy(dtype=np.float32)
@@ -412,6 +424,7 @@ def _predict_models(prepared: PreparedData, base_all: pd.DataFrame,
                     kind: str, features: str, models: dict,
                     feature_names: list[str], profile_state: dict | None = None,
                     future_features: dict | None = None) -> np.ndarray:
+    base_all = _with_observed_features(prepared, base_all, features)
     columns = _feature_columns(base_all, features)
     base = base_all[columns]
     base_values = base.to_numpy(dtype=np.float32)
@@ -791,10 +804,12 @@ def train_availability_fallback(prepared: PreparedData, horizons: tuple[int, ...
     """只按已冻结配方重训最终缺测分支，不重新访问开发折或确认折。"""
     if not recipe:
         return None
+    if (recipe.get("retained_recipe") or {}).get("retained_recipe"):
+        raise ValueError("缺测分支只支持一层已保留模型融合")
     prepared.require_training_data()
     ref = len(prepared.index) - 1
     training = prepared
-    if recipe["features"] == "gas":
+    if recipe["features"].removesuffix("_at_t") == "gas":
         for offset in range(7 * C.STEPS_PER_DAY, ref, 21 * C.STEPS_PER_DAY):
             training = training.masked_power_gas_copy(training.index[offset],
                 training.index[min(offset + 14 * C.STEPS_PER_DAY - 1, ref)])
@@ -804,8 +819,11 @@ def train_availability_fallback(prepared: PreparedData, horizons: tuple[int, ...
     models, names = _train_models(training, build_base_features(training, include_targets=True),
         positions, horizons, recipe["kind"], recipe["features"],
         C.LGBM_TREES_QUICK if quick else C.LGBM_TREES_LONG, ref)
-    return {**recipe, "models": models, "feature_names": names,
-            "train_end": str(training.index[ref]), "role": "final"}
+    state = {**recipe, "models": models, "feature_names": names,
+             "train_end": str(training.index[ref]), "role": "final"}
+    if recipe.get("retained_recipe"):
+        state["retained_state"] = train_availability_fallback(prepared, horizons, recipe["retained_recipe"], quick)
+    return state
 
 
 def apply_availability_fallback(bundle, prepared, positions, prediction, use_final):
@@ -842,6 +860,14 @@ def apply_availability_fallback(bundle, prepared, positions, prediction, use_fin
     result[missing] = (blend_cube(candidate, reference, target_weights, bundle.horizons,
                                   _groups_for(bundle.horizons)) if target_weights else
                        weight * candidate + (1. - weight) * reference)
+    if state.get("retained_state"):
+        from dataclasses import replace
+        retained = apply_availability_fallback(replace(bundle, final_availability=state["retained_state"]),
+                                               prepared, positions, prediction, use_final)
+        mix = float(state["retained_mix_weight"])
+        if not 0. <= mix <= 1.:
+            raise ValueError("新旧缺测分支融合权重超出范围")
+        result[missing] = enforce_physics(mix * result[missing] + (1. - mix) * retained[missing])
     return result
 
 

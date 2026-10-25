@@ -246,6 +246,12 @@ def load_final_models(directory: Path):
             for tag, filename in artifacts["availability"]["files"].items():
                 key = (tag.rsplit("__", 1)[0], int(tag.rsplit("__", 1)[1])) if "__" in tag else tag
                 state["models"][key] = lgb.Booster(model_str=(directory / filename).read_text(encoding="utf-8"))
+            if state.get("retained_state"):
+                retained = state["retained_state"]
+                retained["models"] = {}
+                for tag, filename in artifacts["availability"]["retained"]["files"].items():
+                    key = (tag.rsplit("__", 1)[0], int(tag.rsplit("__", 1)[1])) if "__" in tag else tag
+                    retained["models"][key] = lgb.Booster(model_str=(directory / "retained" / filename).read_text(encoding="utf-8"))
             bundles[-1].final_availability = state
     item, artifacts = meta["resource"], meta["artifacts"]["resource"]
     from main_opt import load_resource_model
@@ -309,6 +315,12 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
                 availability["models"], availability["feature_names"], temp_dir)
             summary[name]["availability"] = info
             summary["reload_ok"] &= info["reload_ok"]
+            if availability.get("retained_state"):
+                retained = availability["retained_state"]
+                retained_info = _save_boosters(ctx.model_dir / name / "final_availability" / "retained",
+                    "availability", retained["models"], retained["feature_names"], temp_dir)
+                info["retained"] = retained_info
+                summary["reload_ok"] &= retained_info["reload_ok"]
         nn = getattr(bundle, "final_nn_bundle" if use_final else "nn_bundle", None)
         if nn is not None:
             path = main_nn.save_nn(nn, ctx.model_dir / name / role)
@@ -350,8 +362,11 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
     def forecast_meta(bundle):
         nn = getattr(bundle, "final_nn_bundle" if use_final else "nn_bundle", None)
         availability = getattr(bundle, "final_availability", None) if use_final else None
+        state = {k: v for k, v in availability.items() if k != "models"} if availability else None
+        if state and state.get("retained_state"):
+            state["retained_state"] = {k: v for k, v in state["retained_state"].items() if k != "models"}
         return {"kind": bundle.kind, "features": bundle.features,
-                "availability": {k: v for k, v in availability.items() if k != "models"} if availability else None,
+                "availability": state,
                 "blend": bundle.blend, "feature_names": bundle.feature_names,
                 "lgb_kind": bundle.lgb_kind, "lgb_features": bundle.lgb_features,
                 "nn_weights": bundle.nn_weights,
