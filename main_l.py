@@ -18,7 +18,8 @@ import main_nn
 from main_s import (_fold_positions, _predict_models, _train_models,
                     baseline_cubes, blend_cube, effective_model_name,
                     enforce_physics, score_cube, select_blend, select_candidate, truth_cube,
-                    evaluate_blended_candidates, select_nn_tree_weights)
+                    evaluate_blended_candidates, select_nn_tree_weights, apply_availability_fallback,
+                    train_availability_fallback)
 
 
 LONG_CANDIDATES = (
@@ -48,6 +49,7 @@ class LongBundle:
     train_seconds: float = 0.0
     train_end: str | None = None
     final_train_end: str | None = None
+    final_availability: dict | None = None
 
 
 def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -> LongBundle:
@@ -125,7 +127,10 @@ def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -
                            "worst": float(min(s["accuracy"] for s in scores)),
                            "seconds": time.time() - started_cand})
 
-    # NN+LGBM 融合候选：两者各自过 profile 后的凸组合，常优于单一模型。
+    # 先按实际画像融合后的成绩挑选树组件，避免原始分高的树挤掉互补组件。
+    profiles = [item["baselines"]["profile"] for item in fold_cache]
+    evaluate_blended_candidates(candidates, profiles, C.HORIZONS_L, C.LONG_GROUPS)
+    # NN+LGBM 融合候选保持原始预测输入，画像只在候选末端应用一次。
     if any(c["kind"] == "nn" for c in candidates) and any(
             c["kind"] in ("global", "grouped") for c in candidates):
         nn_c = next(c for c in candidates if c["kind"] == "nn")
@@ -147,8 +152,7 @@ def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -
             "lgb_kind": lgb_c["kind"], "lgb_features": lgb_c["features"],
         })
 
-    profiles = [item["baselines"]["profile"] for item in fold_cache]
-    evaluate_blended_candidates(candidates, profiles, C.HORIZONS_L, C.LONG_GROUPS)
+        evaluate_blended_candidates([candidates[-1]], profiles, C.HORIZONS_L, C.LONG_GROUPS)
     chosen = select_candidate(candidates, "global")
     blend = chosen["blend"]
     blended_tuning = [blend_cube(p, prof, blend, C.HORIZONS_L, C.LONG_GROUPS)
@@ -191,6 +195,7 @@ def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -
                 confirm_masked, c_base_x, c_eval_x, C.HORIZONS_L,
                 chosen.get("lgb_kind", "global"), chosen.get("lgb_features", "gas"),
                 ens_models, ens_names)
+            lgb_pred = enforce_physics(lgb_pred)
             confirm_pred = blend_cube(nn_pred, lgb_pred, chosen["nn_weights"], C.HORIZONS_L, C.LONG_GROUPS)
             confirm_models, confirm_names = ens_models, ens_names
         confirm_baseline = baseline_cubes(confirm_masked, c_eval, C.HORIZONS_L)
@@ -221,7 +226,7 @@ def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -
             ens_final_models, ens_final_names = _train_models(
                 prepared, fb, fp, C.HORIZONS_L,
                 chosen.get("lgb_kind", "global"), chosen.get("lgb_features", "gas"),
-                num_round, len(prepared.index) - max(C.HORIZONS_L))
+                num_round, len(prepared.index) - 1)
     else:
         c_positions = c_positions[::stride]
         c_base = build_base_features(confirm_masked, include_targets=True)
@@ -242,7 +247,7 @@ def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -
                                     len(prepared.index) - max(C.HORIZONS_L))
         final_positions = final_positions[::stride]
         final_base = build_base_features(prepared, include_targets=True)
-        final_ref = len(prepared.index) - max(C.HORIZONS_L)
+        final_ref = len(prepared.index) - 1
         final_models, final_names = _train_models(
             prepared, final_base, final_positions, C.HORIZONS_L,
             chosen["kind"], chosen["features"], num_round, final_ref)
@@ -272,7 +277,9 @@ def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -
                 "confirm": confirm_score},
         train_rows=rows_trained, train_seconds=time.time() - started,
         train_end=confirm_fold["train_end"],
-        final_train_end=str(prepared.labels[list(C.TARGETS)].dropna().index[-1]))
+        final_train_end=str(prepared.labels[list(C.TARGETS)].dropna().index[-1]),
+        final_availability=train_availability_fallback(prepared, C.HORIZONS_L,
+            C.AVAILABILITY_FALLBACK.get("long"), quick))
 
 
 def predict_long(bundle: LongBundle, prepared: PreparedData,
@@ -295,6 +302,7 @@ def predict_long(bundle: LongBundle, prepared: PreparedData,
                 prepared, base_all, positions, C.HORIZONS_L,
                 bundle.lgb_kind or "global", bundle.lgb_features or "gas",
                 models, bundle.feature_names)
+            lgb_pred = enforce_physics(lgb_pred, fallback=baselines["profile"])
             pred = (blend_cube(pred, lgb_pred, bundle.nn_weights, C.HORIZONS_L, C.LONG_GROUPS)
                     if bundle.nn_weights else (pred + lgb_pred) / 2.0)
     else:
@@ -304,5 +312,6 @@ def predict_long(bundle: LongBundle, prepared: PreparedData,
                                bundle.kind, bundle.features, models,
                                bundle.feature_names)
     pred = enforce_physics(pred, fallback=baselines["profile"])
-    return blend_cube(pred, baselines["profile"], bundle.blend,
-                      C.HORIZONS_L, C.LONG_GROUPS)
+    result = blend_cube(pred, baselines["profile"], bundle.blend,
+                        C.HORIZONS_L, C.LONG_GROUPS)
+    return apply_availability_fallback(bundle, prepared, positions, result, use_final)

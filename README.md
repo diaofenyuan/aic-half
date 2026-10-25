@@ -21,6 +21,40 @@ python main.py run --experiment --nn-only --nn-span resource --folds A,B
 `--nn-config` 接收 JSON 对象覆盖本次实验参数。资源专项比较 MLP 与历史序列 TCN；
 通过误差初筛后仍须完成 A/B/C 控制回放，不能自动替换部署模型。
 
+2026-10-25 方案专项同样从唯一入口运行：
+
+```powershell
+python main.py run --experiment --plan-study baseline --study-reference outputs/<原始基线>
+python main.py run --experiment --plan-study E1,E2,E3 --study-reference tmp/tmp_outputs/<方案基线>
+python main.py run --experiment --plan-study E4,E5,E6 --study-reference tmp/tmp_outputs/<方案基线>
+python main.py run --experiment --plan-study pressure --study-reference tmp/tmp_outputs/<方案基线>
+python main.py run --experiment --plan-study availability --study-reference tmp/tmp_outputs/<方案基线> --nn-study-run tmp/tmp_outputs/<长期融合专项>
+python main.py infer --experiment --availability-study-run tmp/tmp_outputs/<全量可用性专项>
+```
+
+`baseline` 按原归档的结构和融合权重重建 A/B/C 折外预测；E1 比较树模型
+21/45 天半衰期，冻结三种子 TCN；E2 比较工况条件画像；E3 只改变小机组组分配，
+保护总负荷。E4 固定高炉预测和原资源修正动作，比较零状态概率与正气量条件均值。
+E5 在资源版本冻结且前缀折外路径齐备后推进，训练特征来自更早冻结的内层资源模型；
+E6 用训练前缀内完整折外误差路径校准库存裕度，不可行时保留 point。
+所有模型、必要参数、折外数组及精简摘要均留在当次 `tmp/tmp_outputs/`，
+专项不推理 half_test、不重选 D、不打正式交付包，也不自动部署未晋级候选。
+
+`availability` 固定正常输入、整窗缺发电耗气和第七天中断三种情景，重算全部耗气
+派生特征，比较独立少特征分支与必要的连续块遮挡对照。只用 A/B/C 选择全折共用
+的画像/分支权重，保持逐折逐目标保护；可通过 `--study-resume` 复用已保存模型。
+`--availability-study-run` 只接收已完成的全量专项，按冻结配方重训最终模型，
+不重新评估 D；实际使用的缺测分支及必要参考配方一并归档，可离线重载。
+已通过完整门槛的短期少特征分支和长期分目标保护融合也写入唯一配置源，默认
+正式训练会独立拟合最终缺测分支；完整观测仍走选定的主模型。
+若只更新已通过联合验证的分支权重，可同时传 `--reuse-run <最终模型运行>` 与
+`--availability-study-run <专项>`；要求复用模型已训练至当前合法截止点，不重复训练。
+`pressure` 只诊断 10 月 1～9 日起报点，训练截止 9 月 30 日；该已查看分布的
+九天窗口不参加晋级，也不称为独立盲测。
+资源专项中断后，可在同一命令追加 `--study-resume tmp/tmp_outputs/<中断目录>`；
+续跑核对原数据来源、训练截止、标签索引和模型重载预测，只补尚未完成的模型，
+原源码快照保留，续跑源码归档到 `源码/续跑/`。
+
 `--nn-benchmark` 在固定更新步数下比较 FP32/BF16 与 batch，使用合成输入，
 不产生预测分数。`--nn-reblend <专项目录>` 只重用已保存的 A/B/C 开发预测，
 选择全折共用的分目标/提前量融合系数；门槛固定为均分提升至少 0.20 个百分点，

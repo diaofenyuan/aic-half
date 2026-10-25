@@ -524,6 +524,125 @@ def _rolling_causality_check() -> dict:
             "first_commit_future_independent": no_oracle, "continuous_state": continuous}
 
 
+def _plan_research_check() -> dict:
+    from types import SimpleNamespace
+    import lightgbm as lgb
+    from .pipeline import fit_profile_state, state_slot_profile
+    from main_opt import (ZeroMixtureResource, load_resource_model, fit_inventory_risk,
+                          _holder_plan_bounds, _solve_day, _fit_resource_models)
+    from main_s import (_train_models, predict_allocation, design_inputs,
+                        future_resource_features)
+    prepared = _synthetic_prepared(40 * 96)
+    prepared.frame["d_use_share_coke"] = prepared.frame.d_use_coke / prepared.frame.d_use_total
+    prepared.frame["d_use_share_converter"] = prepared.frame.d_use_converter / prepared.frame.d_use_total
+    recipe = fit_profile_state(prepared, 20 * 96)
+    origin = 25 * 96 + 12
+    masked = prepared.masked_copy(prepared.index[20 * 96], prepared.index[-1])
+    profile = state_slot_profile(masked, np.array([origin]), (1, 8, 96), "generator_1", recipe)[0]
+    altered = copy.deepcopy(masked)
+    altered.frame.loc[prepared.index[origin + 1]:] = 1e9
+    altered.labels.loc[prepared.index[20 * 96]:] = 1e12
+    same = state_slot_profile(altered, np.array([origin]), (1, 8, 96), "generator_1", recipe)[0]
+    future_independent = np.array_equal(profile, same)
+    missing = copy.deepcopy(masked)
+    missing.frame.loc[prepared.index[origin], recipe["columns"]] = np.nan
+    fallback = state_slot_profile(missing, np.array([origin]), (1, 8, 96), "generator_1", recipe)[0]
+    missing_safe = np.array_equal(fallback, target_slot_profile(missing, np.array([origin]), (1, 8, 96), "generator_1"))
+    zero = copy.deepcopy(prepared)
+    zero.frame[C.TARGET_COLUMN["generator_1"]] = 0.
+    zeros_kept = np.all(state_slot_profile(zero, np.array([origin]), (1, 8, 96), "generator_1", recipe)[0] == 0.)
+    X = np.arange(120., dtype=float).reshape(-1, 1)
+    params = {**C.LGBM_BASE, "min_data_in_leaf": 5, "num_threads": 1}
+    classifier = lgb.train({**params, "objective": "binary"}, lgb.Dataset(X, label=(X[:, 0] < 30)), num_boost_round=3)
+    positive = lgb.train({**params, "objective": "regression_l2"}, lgb.Dataset(X, label=X[:, 0] + 1), num_boost_round=3)
+    mixture = ZeroMixtureResource(classifier, positive)
+    mixture_ok = np.array_equal(mixture.predict(X), load_resource_model(mixture.model_to_string()).predict(X))
+    mixture_ok &= np.allclose(mixture.predict(X), (1. - classifier.predict(X)) * positive.predict(X))
+    forecast = np.full((192, 96, 3), 100.)
+    risk = fit_inventory_risk(forecast, forecast.copy(), "2025-05-30", "2025-05-31")
+    impossible = fit_inventory_risk(forecast, forecast + 1e5, "2025-05-30", "2025-05-31")
+    cfg = SimpleNamespace(**vars(C))
+    cfg.OPT_CONFIG = {**C.OPT_CONFIG, "inventory_risk": impossible}
+    low, high = _holder_plan_bounds(96, cfg)
+    bad = _solve_day(forecast[0], np.ones(96), 1e5, np.zeros(6), np.full(3, 1e6),
+        {"coefficients_mw_per_m3h": {g: .001 for g in C.RESOURCE_NAMES}}, cfg)
+    risk_ok = risk["feasible"] and not impossible["feasible"] and (low > high).any() and bad["status"] == "RISK_INFEASIBLE"
+    units = fit_inventory_risk(forecast, forecast + 100., "2025-05-30", "2025-05-31")
+    risk_ok &= units["cumulative_diagnostics"]["blast"]["cumulative_paths"]["24h"]["mean_m3"] == 2400.
+    positions = np.arange(origin, origin + 3)
+    future = future_resource_features(masked, positions, forecast[:3], np.zeros_like(forecast[:3]))
+    future_changed = future_resource_features(altered, positions[:1], forecast[:1], np.zeros_like(forecast[:1]))
+    features_causal = all(np.array_equal(value[:1], future_changed[key], equal_nan=True) for key, value in future.items())
+    base = pd.DataFrame({"x": np.zeros(len(prepared.index))}, index=prepared.index)
+    _, names = design_inputs(masked, base, positions, (1, 8, 96), "gas")
+    class ConstantModel:
+        def __init__(self, value):
+            self.value = value
+
+        def predict(self, X):
+            return np.full(len(X), self.value)
+    protected = np.zeros((3, 3, 2))
+    protected[:, :, 1] = np.array([0., 150., 440.])[:, None]
+    allocation = predict_allocation(masked, base, positions, (1, 8, 96),
+        {"allocation": ConstantModel(.9)}, names, protected)
+    allocation_ok = (np.array_equal(allocation[:, :, 1], protected[:, :, 1]) and
+        (allocation[:, :, 0] <= 200.).all() and (allocation[:, :, 1] - allocation[:, :, 0] <= 240.).all())
+    import main_opt
+    original_prices = main_opt.load_prices
+    try:
+        main_opt.load_prices = lambda: {1: np.ones(96)}
+        resource_base = main_opt._resource_base(masked)
+        _, resource_names = main_opt._resource_design(masked, resource_base, positions, C.HORIZONS_L)
+        direct = {g: ConstantModel(1000.) for g in C.RESOURCE_NAMES}
+        selection = {"availability_adjustment": {"method": "positive_persistence_peak", "threshold_ratio": .05, "weight": 1.}}
+        heat = {"ok": True, "coefficients_mw_per_m3h": {g: .001 for g in C.RESOURCE_NAMES}}
+        baseline = main_opt.forecast_resources(main_opt.ResourceBundle(direct, {}, resource_names,
+            selection=selection, heat_rate=heat), masked, masked.index[positions])
+        replacement = {**direct, "coke": ConstantModel(1e6), **{g + "__reference": m for g, m in direct.items()}}
+        trial = main_opt.forecast_resources(main_opt.ResourceBundle(replacement, {}, resource_names,
+            selection={**selection, "frozen_adjustment_reference": True}, heat_rate=heat), masked, masked.index[positions])
+        blast_fixed = np.array_equal(baseline[:, :, 0], trial[:, :, 0]) and np.max(baseline[:, :8, 0]) > 1000.
+    finally:
+        main_opt.load_prices = original_prices
+    rejected = []
+    for call in (lambda: fit_inventory_risk(forecast, forecast, "2025-06-01", "2025-05-31"),
+                 lambda: _fit_resource_models(prepared, np.array([100]), 1, 100),
+                 lambda: _train_models(prepared, pd.DataFrame(), np.array([100]), (1,), "global", "gas", 1, 100)):
+        try:
+            call()
+        except ValueError:
+            rejected.append(True)
+        else:
+            rejected.append(False)
+    checks = {"state_profile_future_independent": bool(future_independent),
+              "state_profile_missing_fallback": bool(missing_safe), "state_profile_zero_preserved": bool(zeros_kept),
+              "mixture_mean_and_reload": bool(mixture_ok), "risk_infeasible_keeps_hard_bounds": bool(risk_ok),
+              "prefix_boundary_rejections": all(rejected), "future_resource_features_causal": bool(features_causal),
+              "allocation_preserves_total": bool(allocation_ok), "resource_replacement_protects_blast": bool(blast_fixed)}
+    return {"passed": all(checks.values()), **checks}
+
+
+def _power_gas_availability_check() -> dict:
+    from main_s import _feature_columns, design_inputs
+    prepared = _synthetic_prepared(480).masked_copy("2025-01-04", "2025-01-05 23:45")
+    original = prepared.frame.copy()
+    failed = prepared.masked_power_gas_copy(prepared.index[200])
+    full = build_base_features(prepared, include_targets=True)
+    missing = build_base_features(failed, include_targets=True)
+    columns = _feature_columns(full, "gas_no_power")
+    unchanged = np.allclose(full[columns], missing[columns], equal_nan=True)
+    extras, _ = design_inputs(prepared, full[columns], np.array([320, 420]), C.HORIZONS_S, "gas_no_power")
+    altered, _ = design_inputs(failed, missing[columns], np.array([320, 420]), C.HORIZONS_S, "gas_no_power")
+    extra_same = all(np.allclose(value, altered[key], equal_nan=True) for key, value in extras.items())
+    before_same = np.allclose(full.iloc[:200], missing.iloc[:200], equal_nan=True)
+    checks = {"no_power_inputs_invariant": bool(unchanged and extra_same),
+              "past_features_unchanged": bool(before_same),
+              "original_and_labels_preserved": bool(prepared.frame.equals(original) and failed.labels.equals(prepared.labels)),
+              "all_dependent_current_values_missing": bool(failed.frame.iloc[200:][[
+                  "d_use_blast", "d_use_coke", "d_use_converter", "d_use_total", "d_fuel_proxy"]].isna().all().all())}
+    return {"passed": all(checks.values()), **checks}
+
+
 def run_self_checks(config=C) -> dict:
     checks = {
         "stage_isolation": _stage_isolation_check(),
@@ -537,6 +656,8 @@ def run_self_checks(config=C) -> dict:
         "model_roles": _model_role_check(),
         "optimizer_contract": _optimizer_contract_check(),
         "rolling_causality": _rolling_causality_check(),
+        "plan_research": _plan_research_check(),
+        "power_gas_availability": _power_gas_availability_check(),
     }
     checks["passed"] = all(v.get("passed", False) for v in checks.values())
     return checks

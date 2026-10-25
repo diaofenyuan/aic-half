@@ -72,6 +72,22 @@ class PreparedData:
                        "time_range": [str(obj.index[0]), str(obj.index[-1])]}
         return obj
 
+    def masked_power_gas_copy(self, start=None, end=None) -> "PreparedData":
+        """遮挡发电耗气及同源派生量，标签独立保留给评分器。"""
+        obj = copy.copy(self)
+        obj.frame = self.frame.copy()
+        rows = np.ones(len(self.index), dtype=bool)
+        if start is not None:
+            rows &= self.index >= pd.Timestamp(start)
+        if end is not None:
+            rows &= self.index <= pd.Timestamp(end)
+        columns = [c for c in obj.frame if c.startswith(("load_generator_use_", "d_use_"))
+                   or c == "d_fuel_proxy"]
+        obj.frame.loc[rows, columns] = np.nan
+        if "d_use_valid_fraction" in obj.frame:
+            obj.frame.loc[rows, "d_use_valid_fraction"] = 0.
+        return obj
+
 
 # ---------------------------------------------------------------------------
 # 扫描与读取
@@ -651,6 +667,68 @@ def fuel_level_ratio(prepared: PreparedData, positions: np.ndarray,
     # 当前燃料缺测保留为缺失特征；画像融合侧单独禁用该次缩放。
     low, high = C.PROFILE_RATIO_CLIP
     return np.clip(ratio, low, high)
+
+
+def fit_profile_state(prepared: PreparedData, ref_pos: int) -> dict:
+    """工况距离只按训练前缀定标，参数随候选模型冻结。"""
+    prepared.require_training_data()
+    columns = ["d_use_total", "d_use_share_coke", "d_use_share_converter"]
+    values = prepared.frame[columns].iloc[:ref_pos + 1].to_numpy(dtype=float)
+    center = np.nanmedian(values, axis=0)
+    scale = np.nanquantile(values, .75, axis=0) - np.nanquantile(values, .25, axis=0)
+    return {"columns": columns, "center": center.tolist(),
+            "scale": np.maximum(scale, 1e-6).tolist(), "temperature": 1.,
+            "days": C.PROFILE_DAYS, "half_life_days": 14., "minimum_days": 3,
+            "train_end": str(prepared.index[ref_pos])}
+
+
+def state_slot_profile(prepared: PreparedData, positions: np.ndarray,
+                       horizons: tuple[int, ...], target: str, recipe: dict) -> tuple:
+    """按当前与历史同槽位供气状态加权；无足够相似日则回退原画像。"""
+    positions = np.asarray(positions, dtype=int)
+    fallback = target_slot_profile(prepared, positions, horizons, target)
+    result = fallback.copy()
+    count = np.zeros_like(result)
+    age = np.full_like(result, np.nan)
+    distance = np.full_like(result, np.nan)
+    labels = prepared.frame[C.TARGET_COLUMN[target]].to_numpy(dtype=float)
+    process = prepared.frame[recipe["columns"]].to_numpy(dtype=float)
+    state = (process - np.asarray(recipe["center"])) / np.asarray(recipe["scale"])
+    offsets = np.asarray(horizons, dtype=int)
+    for i, origin in enumerate(positions):
+        last_day = _day_reference(int(origin))
+        days = np.arange(max(0, last_day - int(recipe["days"]) + 1), last_day + 1)
+        slots = (origin + offsets) % C.STEPS_PER_DAY
+        indices = days[:, None] * C.STEPS_PER_DAY + slots
+        if len(days) == 0:
+            continue
+        values = labels[indices]
+        valid = np.isfinite(values)
+        count[i] = valid.sum(axis=0)
+        age[i] = np.min(np.where(valid, (origin - indices) / C.STEPS_PER_DAY, np.inf), axis=0)
+        age[i, ~valid.any(axis=0)] = np.nan
+        history = days * C.STEPS_PER_DAY + origin % C.STEPS_PER_DAY
+        usable = np.isfinite(state[history]).all(axis=1) & np.isfinite(state[origin]).all()
+        if usable.sum() < int(recipe["minimum_days"]):
+            continue
+        dist = np.sqrt(np.mean((state[history] - state[origin]) ** 2, axis=1))
+        weights = np.exp(-dist / float(recipe["temperature"])) * np.power(
+            .5, (origin - history) / C.STEPS_PER_DAY / float(recipe["half_life_days"]))
+        weights[~usable] = 0.
+        effective = valid & usable[:, None]
+        w = np.where(effective, weights[:, None], 0.)
+        # 极小有效样本量意味着由单日支配，此时保留保护基线。
+        ess = w.sum(axis=0) ** 2 / np.maximum((w ** 2).sum(axis=0), 1e-12)
+        eligible = (effective.sum(axis=0) >= int(recipe["minimum_days"])) & (ess >= 2.)
+        order = np.argsort(np.where(effective, values, np.inf), axis=0)
+        sorted_values = np.take_along_axis(values, order, axis=0)
+        sorted_weights = np.take_along_axis(w, order, axis=0)
+        median_index = (np.cumsum(sorted_weights, axis=0) < .5 * w.sum(axis=0)).sum(axis=0)
+        median_index = np.minimum(median_index, len(days) - 1)
+        estimate = sorted_values[median_index, np.arange(len(offsets))]
+        result[i, eligible] = estimate[eligible]
+        distance[i] = np.sum(np.where(effective, dist[:, None], 0.) * w, axis=0) / np.maximum(w.sum(axis=0), 1e-12)
+    return result, count, age, distance
 
 
 def last_valid_level(prepared: PreparedData, positions: np.ndarray,

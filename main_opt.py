@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 import time
 import copy
+import json
 import logging
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -25,6 +26,38 @@ from sklearn.linear_model import LinearRegression
 import config as C
 from data_cleaning import (PreparedData, build_base_features, resource_series,
                            target_calendar)
+
+
+@dataclass
+class ZeroMixtureResource:
+    """概率乘条件均值是均值候选，不将其称为无条件中位数。"""
+    zero_model: object
+    positive_model: object
+
+    def predict(self, X):
+        probability = np.clip(self.zero_model.predict(X), 0., 1.)
+        return (1. - probability) * np.maximum(self.positive_model.predict(X), 0.)
+
+    def feature_name(self):
+        return self.positive_model.feature_name()
+
+    def feature_importance(self, importance_type="split"):
+        return self.zero_model.feature_importance(importance_type=importance_type) + self.positive_model.feature_importance(importance_type=importance_type)
+
+    def model_to_string(self):
+        return "AIC_ZERO_MIXTURE\n" + json.dumps({"zero": self.zero_model.model_to_string(),
+            "positive": self.positive_model.model_to_string(), "point": "conditional_mean_times_nonzero_probability"})
+
+    def save_model(self, filename):
+        from pathlib import Path
+        Path(filename).write_text(self.model_to_string(), encoding="utf-8")
+
+
+def load_resource_model(text: str):
+    if text.startswith("AIC_ZERO_MIXTURE\n"):
+        payload = json.loads(text.split("\n", 1)[1])
+        return ZeroMixtureResource(lgb.Booster(model_str=payload["zero"]), lgb.Booster(model_str=payload["positive"]))
+    return lgb.Booster(model_str=text)
 
 
 @dataclass
@@ -93,7 +126,11 @@ def _fit_resource_models(prepared: PreparedData, positions: np.ndarray,
                          alpha: float | None = None,
                          objectives: dict | None = None,
                          horizons: tuple[int, ...] = C.HORIZONS_L,
-                         gases: tuple[str, ...] = C.RESOURCE_NAMES) -> tuple[dict, list[str]]:
+                         gases: tuple[str, ...] = C.RESOURCE_NAMES,
+                         two_stage_gases: tuple[str, ...] = ()) -> tuple[dict, list[str]]:
+    prepared.require_training_data()
+    if len(positions) == 0 or np.max(positions) + max(horizons) > ref_pos:
+        raise ValueError("资源模型训练目标跨越冻结截止点")
     base = _resource_base(prepared)
     base_values = base.to_numpy(dtype=np.float32)
     cal, names = _resource_design(prepared, base, positions, horizons)
@@ -114,6 +151,16 @@ def _fit_resource_models(prepared: PreparedData, positions: np.ndarray,
         gas_params = {**params}
         if alpha is None and objectives:
             gas_params["objective"] = objectives[gas]
+        if alpha is None and gas in two_stage_gases and (y == 0).sum() >= 100 and (y > 0).sum() >= 1000:
+            classifier = lgb.train({**params, "objective": "binary", "metric": "binary_logloss"},
+                lgb.Dataset(X, label=(y == 0).astype(float), weight=weights, feature_name=names),
+                num_boost_round=num_round)
+            positive = y > 0
+            conditional = lgb.train({**params, "objective": "regression_l2", "metric": "l2"},
+                lgb.Dataset(X[positive], label=y[positive], weight=weights[positive], feature_name=names),
+                num_boost_round=num_round)
+            models[gas] = ZeroMixtureResource(classifier, conditional)
+            continue
         logging.getLogger("aic-half").info("资源拟合: gas=%s objective=%s alpha=%s rows=%d",
                                           gas, gas_params["objective"], alpha, len(y))
         models[gas] = lgb.train(gas_params, lgb.Dataset(
@@ -165,7 +212,21 @@ def forecast_resources(bundle: ResourceBundle, prepared: PreparedData,
             if pack is None:
                 raise ValueError("选定的资源网络缺失，禁止冒用持久性预测")
             expert = main_nn.predict_resource_nn(pack, base, resource_series(prepared), positions)
-        out = _adjust_available_resources(out, prepared, origins, heat, adjustment, expert=expert)
+        if bundle.selection.get("frozen_adjustment_reference"):
+            reference = np.empty_like(out)
+            for gi, gas in enumerate(C.RESOURCE_NAMES):
+                reference[:, :, gi] = np.maximum(models[gas + "__reference"].predict(X).reshape(len(C.HORIZONS_L), n).T, 0.)
+                head = models.get(gas + "__head__reference")
+                if head is not None:
+                    weight = float(bundle.selection.get("head_selection", {}).get("weight", 1.))
+                    k = len(C.HORIZONS_S)
+                    reference[:, :k, gi] = ((1. - weight) * reference[:, :k, gi] +
+                        weight * np.maximum(head.predict(X[:k * n]).reshape(k, n).T, 0.))
+            # E4 固定原资源修正动作，防止分类器变化连带改动高炉预测与控制门控。
+            delta = _adjust_available_resources(reference, prepared, origins, heat, adjustment, expert=expert) - reference
+            out = np.maximum(out + delta, 0.)
+        else:
+            out = _adjust_available_resources(out, prepared, origins, heat, adjustment, expert=expert)
     return out
 
 
@@ -250,6 +311,7 @@ def forecast_resources_quantile(bundle: ResourceBundle, prepared: PreparedData,
 
 
 def estimate_heat_rate(prepared: PreparedData, end_pos: int) -> dict:
+    prepared.require_training_data()
     frame = prepared.frame.iloc[:end_pos]
     y = prepared.labels["generator_all"].iloc[:end_pos].to_numpy(dtype=float)
     X = frame[["d_use_blast", "d_use_coke", "d_use_converter"]].to_numpy(dtype=float)
@@ -285,6 +347,7 @@ def estimate_heat_rate(prepared: PreparedData, end_pos: int) -> dict:
 
 
 def _gas_caps(prepared: PreparedData, end_pos: int) -> dict:
+    prepared.require_training_data()
     history = resource_series(prepared).iloc[:end_pos + 1]
     return {gas: float(max(history[gas].quantile(C.OPT_CONFIG["gas_cap_quantile"])
                             * C.OPT_CONFIG["gas_cap_headroom"], 1.0))
@@ -320,6 +383,19 @@ def score_resources(forecast: np.ndarray, truth: np.ndarray) -> dict:
             "valid_cells": int(valid.sum()), "complete_paths": int(complete.sum()),
             "groups": {},
         }
+        metrics[gas]["cumulative_paths"] = {}
+        for count in (8, 32, 96):
+            if count > forecast.shape[1]:
+                continue
+            good = valid[:, :count].all(axis=1)
+            # 正号代表实际气量高于预测，直接对应实际库存减计划库存。
+            residual = -error[good, :count].sum(axis=1) * .25
+            metrics[gas]["cumulative_paths"][f"{count / 4:g}h"] = {
+                "paths": int(good.sum()), "mean_m3": float(np.mean(residual)) if len(residual) else None,
+                "p10_m3": float(np.quantile(residual, .1)) if len(residual) else None,
+                "p90_m3": float(np.quantile(residual, .9)) if len(residual) else None,
+                "min_m3": float(np.min(residual)) if len(residual) else None,
+                "max_m3": float(np.max(residual)) if len(residual) else None}
         for name, lo, hi in C.LONG_GROUPS:
             idx = [j for j, h in enumerate(horizons) if lo <= h <= hi]
             if not idx:
@@ -606,7 +682,7 @@ def train_resources(prepared: PreparedData, folds: list[dict],
     final_positions = np.arange(max(0, C.PROFILE_DAYS * C.STEPS_PER_DAY),
                                 len(prepared.index) - max(C.HORIZONS_L))
     final_positions = final_positions[::C.QUICK_TRAIN_STRIDE if quick else C.TRAIN_STRIDE_LONG]
-    final_ref = len(prepared.index) - max(C.HORIZONS_L)
+    final_ref = len(prepared.index) - 1
     final_models, _ = _fit_resource_models(prepared, final_positions, num_round, final_ref,
                                           objectives=selection["objectives"])
     head_gases = tuple(selection["head_selection"]["gases"])
@@ -706,6 +782,135 @@ def _resource_positions(prepared: PreparedData, fold: dict,
     return positions, eval_positions, ref_pos
 
 
+def resource_promotion_screen(trials: list[dict], baselines: list[dict]) -> dict:
+    selected, reasons = [], {}
+    for gas in ("coke", "converter"):
+        short = [r[gas]["groups"]["short"]["wape"] for r in trials]
+        before = [r[gas]["groups"]["short"]["wape"] for r in baselines]
+        valid = len(short) == 3 and all(v is not None for v in short + before)
+        tests = {"short_wape_gain_at_least_0.005": valid and np.mean(short) <= np.mean(before) - .005,
+            "every_fold_short_drop_at_most_0.02": valid and all(a <= b + .02 for a, b in zip(short, before)),
+            "full_wape_improves": all(t[gas]["wape"] is not None and b[gas]["wape"] is not None for t, b in zip(trials, baselines)) and
+                np.mean([t[gas]["wape"] for t in trials]) < np.mean([b[gas]["wape"] for b in baselines]),
+            "zero_false_supply_not_worse": all(t[gas]["zero_false_supply_mae_m3h"] is None or
+                (b[gas]["zero_false_supply_mae_m3h"] is not None and
+                 t[gas]["zero_false_supply_mae_m3h"] <= b[gas]["zero_false_supply_mae_m3h"] + 1.) for t, b in zip(trials, baselines)),
+            "bias_guard": all(abs(t[gas]["bias_ratio"]) <= abs(b[gas]["bias_ratio"]) + .02 for t, b in zip(trials, baselines))}
+        reasons[gas] = {k: bool(v) for k, v in tests.items()}
+        if all(tests.values()):
+            selected.append(gas)
+    return {"eligible_gases": selected, "tests": reasons, "accepted": False,
+            "dispatch_gate": "required_before_promotion" if selected else "not_eligible"}
+
+
+def paired_dispatch_gate(baselines: list[dict], trials: list[dict], full: bool) -> dict:
+    if len(baselines) != len(trials):
+        raise ValueError("调度晋级必须逐折成对比较")
+    gains, failures = [], []
+    capacity = C.GAS_HOLDER["capacity_m3"]
+    for i, (before, after) in enumerate(zip(baselines, trials)):
+        valid = all(r.get("plan_validation_passed") and r.get("replay_complete") and
+                    (r.get("proxy_inventory_adjusted_revenue_cny") or 0.) > 0. for r in (before, after))
+        if not valid:
+            failures.append({"fold_index": i, "reason": "incomplete_or_invalid_replay"})
+            continue
+        gain = after["proxy_inventory_adjusted_revenue_cny"] / before["proxy_inventory_adjusted_revenue_cny"] - 1.
+        gains.append(gain)
+        safe = (after["proxy_curtailed_generation_mwh"] <= before["proxy_curtailed_generation_mwh"] + 1e-5
+            and after["proxy_blast_vent_m3"] <= before["proxy_blast_vent_m3"] + 1.
+            and after["proxy_holder_min_m3"] >= capacity * C.GAS_HOLDER["safe_low_ratio"] - 1.
+            and after["proxy_holder_max_m3"] <= capacity * C.GAS_HOLDER["safe_high_ratio"] + 1.)
+        precision = max(float(before.get("solver_max_mip_gap") or 0.),
+                        float(after.get("solver_max_mip_gap") or 0.)) <= .001 + 1e-8
+        if not precision:
+            failures.append({"fold_index": i, "reason": "solver_gap_exceeds_0.001"})
+        if not safe:
+            failures.append({"fold_index": i, "reason": "curtailment_release_or_inventory_guard"})
+    passed = (len(gains) == 3 and not failures and np.mean(gains) >= .002 and min(gains) >= -.01)
+    return {"accepted": bool(full and passed), "passed_screen": bool(passed),
+            "gain_ratios": gains, "mean_gain_ratio": float(np.mean(gains)) if gains else None,
+            "failures": failures, "scope": "ABC_21_days" if full else "ABC_first_48h"}
+
+
+def fit_inventory_risk(forecast: np.ndarray, truth: np.ndarray,
+                       max_calibration_target: str, train_end: str) -> dict:
+    if forecast.shape != truth.shape or forecast.ndim != 3 or forecast.shape[1:] != (96, 3):
+        raise ValueError("累计风险校准要求完整同维度的96步三气种路径")
+    if pd.Timestamp(max_calibration_target) > pd.Timestamp(train_end):
+        raise ValueError("库存误差校准跨越训练截止点")
+    complete = np.isfinite(truth).all(axis=(1, 2)) & np.isfinite(forecast).all(axis=(1, 2))
+    residual = np.cumsum((truth[complete] - forecast[complete]) * .25, axis=1)
+    if len(residual) < C.STEPS_PER_DAY:
+        return {"feasible": False, "reason": "INSUFFICIENT_OOF_PATHS"}
+    low_q, high_q = np.quantile(residual[:, :, 0], (.1, .9), axis=0)
+    cap = C.GAS_HOLDER["capacity_m3"]
+    low = np.maximum(cap * (C.GAS_HOLDER["safe_low_ratio"] + C.OPT_CONFIG["holder_margin_ratio"]),
+                     cap * C.GAS_HOLDER["safe_low_ratio"] - low_q)
+    high = np.minimum(cap * (C.GAS_HOLDER["safe_high_ratio"] - C.OPT_CONFIG["holder_margin_ratio"]),
+                      cap * C.GAS_HOLDER["safe_high_ratio"] - high_q)
+    return {"feasible": bool((low <= high).all()), "lower_m3": low.tolist(), "upper_m3": high.tolist(),
+            "infeasible_horizons": (np.flatnonzero(low > high) + 1).tolist(),
+            "oof_paths": len(residual), "max_calibration_target": max_calibration_target,
+            "train_end": train_end, "joint_coverage_guaranteed": False,
+            "calibration": "frozen_training_prefix_contiguous_OOF_paths",
+            "cumulative_diagnostics": score_resources(forecast, truth)}
+
+
+def audit_resource_ledger(prepared: PreparedData, ref_pos: int) -> dict:
+    gas = resource_series(prepared).iloc[:ref_pos + 1]
+    fields = {}
+    for name, generated, demand, envelope in (
+            ("blast", "d_gen_blast", "d_air_heater_total", "d_use_blast"),
+            ("coke", "d_gen_coke", None, "d_use_coke"),
+            ("converter", "d_gen_converter_scaled", "d_converter_user_total", "d_use_converter")):
+        fields[name] = {"generation_column": generated, "known_demand_column": demand,
+            "power_envelope_column": envelope,
+            "valid_envelope_fraction": float(gas[name].notna().mean()),
+            "zero_envelope_fraction": float((gas[name] == 0).mean()),
+            "unit_assumption": "m3_per_hour; volume=flow*0.25h",
+            "net_resource_verified": False}
+    return {"train_end": str(prepared.index[ref_pos]), "gases": fields,
+            "closed_ledger": False, "physical_feasibility_certified": False,
+            "resource_mode": "historical_consumption_envelope",
+            "unresolved": ["mixing_and_user_meter_boundaries", "incomplete_production_demand",
+                           "converter_1_official_unit", "holder_2_mapping", "unit_gas_compatibility"],
+            "holder": {"column": C.GAS_HOLDER["column"], "capacity_m3": 200000.,
+                       "capacity_source": "official_task", "mapping_source": "inferred"},
+            "converter_scale": {"value": C.CONVERTER_GAS_SCALE, "source": "historical_inferred",
+                "historical_fit_window": "not_recorded", "study_policy": "frozen_baseline_assumption_not_recalibrated"}}
+
+
+def physical_prefix_comparison(prepared: PreparedData, ref_pos: int) -> dict:
+    """只比较训练前缀末七天，不据诊断直接替换物理标定。"""
+    prepared.require_training_data()
+    end = ref_pos + 1
+    split = end - 7 * C.STEPS_PER_DAY
+    X = resource_series(prepared).to_numpy(dtype=float)
+    y = prepared.labels.generator_all.to_numpy(dtype=float)
+    ok = np.isfinite(X).all(axis=1) & np.isfinite(y)
+    evaluation = np.arange(split, end)[ok[split:end]]
+    prices = _price_vector(load_prices(), prepared.index[split], end - split)[evaluation - split]
+    comparisons = {}
+    for days in (None, 60, 30):
+        first = 0 if days is None else max(0, split - days * C.STEPS_PER_DAY)
+        fitting = np.arange(first, split)[ok[first:split]]
+        if len(fitting) < 1000 or len(evaluation) < 96:
+            continue
+        model = LinearRegression(positive=True, fit_intercept=False).fit(X[fitting], y[fitting])
+        actual, predicted = y[evaluation], model.predict(X[evaluation])
+        error = predicted - actual
+        cut = np.quantile(y[fitting], (1 / 3, 2 / 3))
+        comparisons["all_prefix" if days is None else f"recent_{days}d"] = {
+            "fit_end": str(prepared.index[split - 1]), "coefficients": model.coef_.tolist(),
+            "wape": float(np.abs(error).sum() / max(np.abs(actual).sum(), 1e-9)),
+            "price_weighted_wape": float((np.abs(error) * prices).sum() / max((np.abs(actual) * prices).sum(), 1e-9)),
+            "load_group_bias_mw": {label: float(np.mean(error[mask])) if mask.any() else None
+                for label, mask in (("low", actual <= cut[0]), ("medium", (actual > cut[0]) & (actual <= cut[1])),
+                                    ("high", actual > cut[1]))}}
+    return {"comparisons": comparisons, "adopted": "unchanged_positive_regression",
+            "reason": "diagnosis_only_all_strategies_keep_same_frozen_coefficients"}
+
+
 # ---------------------------------------------------------------------------
 # 电价
 # ---------------------------------------------------------------------------
@@ -799,6 +1004,19 @@ def _last_level(prepared: PreparedData, target: str, pos: int) -> float:
     return float(values[valid[-1]]) if len(valid) else float("nan")
 
 
+def _holder_plan_bounds(n: int, config=C) -> tuple:
+    capacity = config.GAS_HOLDER["capacity_m3"]
+    low = np.full(n, capacity * (config.GAS_HOLDER["safe_low_ratio"] + config.OPT_CONFIG["holder_margin_ratio"]))
+    high = np.full(n, capacity * (config.GAS_HOLDER["safe_high_ratio"] - config.OPT_CONFIG["holder_margin_ratio"]))
+    risk = config.OPT_CONFIG.get("inventory_risk")
+    if risk:
+        lower, upper = np.asarray(risk["lower_m3"]), np.asarray(risk["upper_m3"])
+        if lower.shape != (n,) or upper.shape != (n,) or not np.isfinite([lower, upper]).all():
+            raise ValueError("库存风险边界维度错误或含非有限数")
+        low, high = np.maximum(low, lower), np.minimum(high, upper)
+    return low, high
+
+
 def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
                initial_power: np.ndarray, caps: np.ndarray, heat_rate: dict,
                config=C) -> dict:
@@ -814,6 +1032,9 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
     margin = capacity * float(config.OPT_CONFIG["holder_margin_ratio"])
     low = real_low + margin
     high = real_high - margin
+    lower_path, upper_path = _holder_plan_bounds(n_h, config)
+    if (lower_path > upper_path).any():
+        return {"status": "RISK_INFEASIBLE", "message": "累计误差裕度无可行域，保留安全硬边界"}
     if (not np.isfinite(avail).all() or not np.isfinite(price).all()
             or (avail < 0).any() or not real_low <= holder0 <= real_high):
         return {"status": "INVALID_INPUT", "message": "资源或初始柜位无效，禁止裁剪库存伪造可行性"}
@@ -840,8 +1061,8 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
         for k in range(n_h):
             ub[off_q + g * n_h + k] = caps[g]
     for k in range(n_h):
-        lb[off_s + k] = low
-        ub[off_s + k] = high
+        lb[off_s + k] = lower_path[k]
+        ub[off_s + k] = upper_path[k]
         # 偏离量上界取安全区宽度，足够覆盖极端柜位。
         ub[off_du + k] = capacity
         ub[off_dd + k] = capacity
@@ -892,9 +1113,9 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
         draw = {off_q + 0 * n_h + k: 1.0, off_v + 0 * n_h + k: 1.0}
         if k > 0:
             draw[off_s + k - 1] = -4.0
-            add(draw, -np.inf, float(avail[k, 0]) - 4.0 * low)
+            add(draw, -np.inf, float(avail[k, 0]) - 4.0 * lower_path[k])
         else:
-            add(draw, -np.inf, float(avail[k, 0]) - 4.0 * low + 4.0 * holder0)
+            add(draw, -np.inf, float(avail[k, 0]) - 4.0 * lower_path[k] + 4.0 * holder0)
     for g in (1, 2):
         for k in range(n_h):
             add({off_q + g * n_h + k: 1.0, off_v + g * n_h + k: 1.0},
@@ -923,7 +1144,11 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
     if config.OPT_CONFIG.get("terminal_holder") and low <= holder0 <= high:
         band = (capacity * config.OPT_CONFIG.get("terminal_band_ratio", .10)
                 if terminal_policy == "band_value" else 0.)
-        add({off_s + n_h - 1: 1.0}, max(low, holder0 - band), min(high, holder0 + band))
+        terminal_low = max(lower_path[-1], holder0 - band)
+        terminal_high = min(upper_path[-1], holder0 + band)
+        if terminal_low > terminal_high:
+            return {"status": "RISK_INFEASIBLE", "message": "风险裕度与末端库存约束冲突"}
+        add({off_s + n_h - 1: 1.0}, terminal_low, terminal_high)
     for k in range(n_h):
         coeffs = {off_p + i * n_h + k: 1.0 for i in range(n_u)}
         for g in range(n_g):
@@ -1012,6 +1237,7 @@ def validate_day(result: dict, avail: np.ndarray, holder0: float,
     margin = capacity * config.OPT_CONFIG["holder_margin_ratio"]
     low = capacity * config.GAS_HOLDER["safe_low_ratio"] + margin
     high = capacity * config.GAS_HOLDER["safe_high_ratio"] - margin
+    lower_path, upper_path = _holder_plan_bounds(n, config)
     beta = np.asarray([heat_rate["coefficients_mw_per_m3h"][g] for g in C.RESOURCE_NAMES])
     previous = np.r_[holder0, holder[:-1]]
     balance = holder - previous - 0.25 * (avail[:, 0] - gas[0] - vent[0])
@@ -1031,7 +1257,7 @@ def validate_day(result: dict, avail: np.ndarray, holder0: float,
         problems.append("无柜气种超出资源包络")
     if np.max(np.abs(energy)) > pt:
         problems.append("燃料与功率不守恒")
-    if np.max(np.abs(balance)) > st or (holder < low - st).any() or (holder > high + st).any():
+    if (lower_path > upper_path).any() or np.max(np.abs(balance)) > st or (holder < lower_path - st).any() or (holder > upper_path + st).any():
         problems.append("代理库存平衡或安全边界违规")
     terminal_band = (capacity * config.OPT_CONFIG.get("terminal_band_ratio", .10)
                      if config.OPT_CONFIG.get("terminal_policy", "return") == "band_value" else 0.)
@@ -1058,6 +1284,9 @@ def _fallback_day(prepared: PreparedData, pos: int, avail: np.ndarray,
     capacity = config.GAS_HOLDER["capacity_m3"]
     low = capacity * (config.GAS_HOLDER["safe_low_ratio"] + config.OPT_CONFIG["holder_margin_ratio"])
     high = capacity * (config.GAS_HOLDER["safe_high_ratio"] - config.OPT_CONFIG["holder_margin_ratio"])
+    lower_path, upper_path = _holder_plan_bounds(len(avail), config)
+    if (lower_path > upper_path).any():
+        return {"status": "BLOCKED_OPT", "message": "风险裕度不可行，不能回退时放宽边界"}
     if not capacity * config.GAS_HOLDER["safe_low_ratio"] <= holder0 <= capacity * config.GAS_HOLDER["safe_high_ratio"]:
         return {"status": "BLOCKED_OPT", "message": "回退初始柜位越界"}
     initial_power = np.zeros(len(units)) if initial_power is None else np.asarray(initial_power)
@@ -1068,7 +1297,7 @@ def _fallback_day(prepared: PreparedData, pos: int, avail: np.ndarray,
     ramp = units * config.OPT_CONFIG["ramp_fraction_per_min"] * config.STEP_MINUTES
     for k, supply in enumerate(avail):
         available = np.minimum(supply, caps).copy()
-        target_level = float(np.clip(level, low, high))
+        target_level = float(np.clip(level, lower_path[k], upper_path[k]))
         available[0] = min(available[0], max(0.0, supply[0] - (target_level - level) / 0.25))
         budget = float(beta @ available)
         best = None
@@ -1258,7 +1487,7 @@ def optimize_rolling(resource_forecast: np.ndarray, prepared: PreparedData,
     options = control_options or {}
     allowed = {"terminal_policy", "terminal_band_ratio", "execution_gas_mode",
                "holder_penalty_cny_per_m3", "unit_switch_penalty_cny",
-               "resource_bias_strength"}
+               "resource_bias_strength", "inventory_risk", "mip_rel_gap"}
     if set(options) - allowed:
         raise ValueError("不支持的控制参数: " + str(sorted(set(options) - allowed)))
     if options.get("terminal_policy", "return") not in ("return", "band_value"):
@@ -1345,6 +1574,10 @@ def optimize_rolling(resource_forecast: np.ndarray, prepared: PreparedData,
     historical_metrics = _dispatch_metrics(times,
         prepared.labels["generator_all"].reindex(times).to_numpy(dtype=float), prices)
     historical_revenue = historical_metrics["generation_revenue_cny"]
+    historical_gas = resource_series(prepared).reindex(times).to_numpy(dtype=float)
+    beta = np.array([heat["coefficients_mw_per_m3h"][g] for g in C.RESOURCE_NAMES])
+    converted_metrics = _dispatch_metrics(times, historical_gas @ beta, prices)
+    converted_revenue = converted_metrics["generation_revenue_cny"]
     # 包络溢出只是代理释放；无柜气种的未用上界不是实际放散，不能一并计罚。
     penalty_sensitivity = []
     for penalty in C.OPT_CONFIG.get("evaluation_release_penalties", (0., .5, 1.)):
@@ -1367,6 +1600,17 @@ def optimize_rolling(resource_forecast: np.ndarray, prepared: PreparedData,
         "planned_metrics": planned_metrics, "proxy_executed_metrics": executed_metrics,
         "historical_metrics": historical_metrics,
         "historical_generation_revenue_cny": historical_revenue,
+        "same_conversion_historical_gas_metrics": converted_metrics,
+        "same_conversion_historical_gas_revenue_cny": converted_revenue,
+        "proxy_gain_vs_same_conversion_ratio": (revenue / converted_revenue - 1.)
+        if complete and converted_revenue is not None and converted_revenue > 0 else None,
+        "physical_parameter_sources": {
+            "heat_rate": "training_prefix_positive_regression_inferred",
+            "gas_caps": "training_prefix_quantile_inferred",
+            "holder_capacity_and_safety": "official_task_200000m3_15_to_90_percent",
+            "holder_column_mapping": "inferred_not_officially_verified",
+            "converter_scale": "historical_inferred_not_official_unit",
+            "vent_switch_holder_penalties": "research_assumptions_not_official_costs"},
         "revenue_improvement_ratio": (planned_revenue / historical_revenue - 1.)
         if historical_revenue is not None and historical_revenue > 0 else None,
         "proxy_executed_revenue_improvement_ratio": (revenue / historical_revenue - 1.)

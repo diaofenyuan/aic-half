@@ -228,6 +228,23 @@ NN_CONFIG = {"look_back": 192, "epochs": 80, "quick_epochs": 8,
              "aug_noise": 0.0, "aug_channel_drop": 0.0}
 # 默认独立输出；重叠带覆盖只作为在开发折验证过的可选策略，不推断官方要求。
 LONG_HEAD_FROM_SHORT = False
+# 完整 A/B/C 缺测情景通过后冻结；配方随源码交付，不依赖 tmp 中的实验文件。
+AVAILABILITY_FALLBACK = {
+    "short": {"kind": "direct", "features": "gas_no_power", "fallback_weight": 1.,
+              "blend": {"generator_1": {"head": .9, "tail": .6},
+                        "generator_all": {"head": .4, "tail": .4}},
+              "stage": "R2", "source_study": "20261025_182342_plan_availability"},
+    "long": {"kind": "global", "features": "gas_no_power", "fallback_weight": 1.,
+             "fallback_weights": {
+                 "generator_1": {"short": .1, "medium": .1, "long": .1},
+                 "generator_all": {"short": 1., "medium": 1., "long": 1.}},
+             "blend": {"generator_1": {"short": .9, "medium": .9, "long": .9},
+                       "generator_all": {"short": 0., "medium": 0., "long": 0.}},
+             "reference_recipe": {"kind": "global", "features": "gas",
+                 "blend": {"generator_1": {"short": 1., "medium": 1., "long": 1.},
+                           "generator_all": {"short": .2, "medium": .1, "long": 0.}}},
+             "stage": "R2_target_mix", "source_study": "20261025_182342_plan_availability"},
+}
 LONG_GROUPS = (("short", 1, 8), ("medium", 9, 32), ("long", 33, 96))
 SHORT_GROUPS = (("head", 1, 4), ("tail", 5, 8))
 

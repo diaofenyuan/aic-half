@@ -64,7 +64,8 @@ def build_folds(prepared, config=C, quick: bool = False) -> list[dict]:
         if (positions < 0).any():
             raise ValueError(f"折 {spec['name']} 起报点不在数据网格")
         truth_pos = positions[:, None] + np.asarray(config.HORIZONS_L)[None, :]
-        truth_pos = np.clip(truth_pos, 0, len(prepared.labels) - 1)
+        if (truth_pos >= len(prepared.labels)).any():
+            raise ValueError(f"折 {spec['name']} 的最长提前量超出合法标签范围")
         labels = prepared.labels[list(config.TARGETS)].to_numpy(dtype=float)[truth_pos]
         coverage = float(np.isfinite(labels).any(axis=2).mean())
         train_end_pos = int(prepared.index.get_indexer([pd.Timestamp(spec["train_end"])])[0])
@@ -133,6 +134,11 @@ def run_verify(directory: Path | None = None) -> int:
             return 1
         directory = candidates[-1]
     directory = Path(directory)
+    report_path = directory / C.REPORT_DIR / C.REPORT_JSON
+    if report_path.exists():
+        saved = json.loads(report_path.read_text(encoding="utf-8"))
+        if saved.get("status") == "SUCCESS_PLAN_STUDY":
+            return _verify_plan_study(directory, saved)
     problems = []
     for name in ("s_result.csv", "l_result.csv", "opt_result.csv"):
         path = directory / name
@@ -222,8 +228,146 @@ def _inference_submission_check(window: str, optimization: dict, *,
     return {"passed": not problems, "problems": problems}
 
 
+def _train_frozen_availability_models(training, study: Path, quick=False):
+    """从完成的开发专项冻结配方，只重训最终模型，不再评估 D。"""
+    import main_nn
+    study = study.resolve()
+    if not study.is_relative_to(C.EXPERIMENT_OUTPUT_ROOT.resolve()):
+        raise ValueError("冻结配方必须来自本项目实验目录")
+    result = json.loads((study / C.REPORT_DIR / C.REPORT_JSON).read_text(encoding="utf-8"))
+    if (result.get("status") != "SUCCESS_PLAN_STUDY" or result.get("quick")
+            or result.get("stages") != ["availability"]
+            or not result.get("production_path_checks", {}).get("passed")):
+        raise ValueError("最终冻结要求已完成的全量可用性专项")
+    training.require_training_data()
+    recipes = json.loads((study / C.MODEL_DIR / "model_meta.json").read_text(encoding="utf-8"))
+    ref, end = len(training.index) - 1, str(training.index[-1])
+    base = main_s.build_base_features(training, include_targets=True)
+    bundles = []
+    for span, horizons, cls, stride in (("short", C.HORIZONS_S, main_s.ShortBundle, C.TRAIN_STRIDE_SHORT),
+                                       ("long", C.HORIZONS_L, main_l.LongBundle, C.TRAIN_STRIDE_LONG)):
+        tick = time.time()
+        recipe = dict(recipes[span])
+        promotion = next((r for r in result.get("R0", []) if r.get("accepted")), None) if span == "long" else None
+        if promotion:
+            recipe.update(kind="nn_lgb_ens", features="hybrid", lgb_kind="global", lgb_features="gas",
+                nn_weights=promotion["frozen_nn_weights"], blend=promotion["frozen_blend"])
+        is_neural = recipe["kind"] in ("nn", "nn_lgb_ens")
+        kind = recipe.get("lgb_kind") if is_neural else recipe["kind"]
+        features = recipe.get("lgb_features") if is_neural else recipe["features"]
+        positions = np.arange(C.PROFILE_DAYS * C.STEPS_PER_DAY, ref - max(horizons) + 1,
+                              C.QUICK_TRAIN_STRIDE if quick else stride)
+        models, names = ({}, [])
+        LOGGER.info("冻结配方重训 final/%s，截止=%s", span, end)
+        if recipe["kind"] != "nn":
+            models, names = main_s._train_models(training, base, positions, horizons,
+                kind or ("direct" if span == "short" else "global"), features or "gas",
+                C.LGBM_TREES_QUICK if quick else C.LGBM_TREES_LONG, ref)
+        neural = None
+        if is_neural:
+            nn_directory = (study / C.MODEL_DIR / "R0_long" / "A" if promotion else
+                            study / C.MODEL_DIR / span / "baseline" / "A" / "nn")
+            frozen_files = list(nn_directory.glob("*.pt"))
+            if not frozen_files:
+                raise ValueError("冻结配方缺少神经网络结构与预处理元信息")
+            frozen_nn = main_nn.load_nn(frozen_files[0])
+            neural = main_nn.train_nn(training, [{"name": "final", "role": "tuning", "train_end": end}],
+                frozen_nn.kind, horizons, quick=quick,
+                n_seeds=1 if quick else max(1, len(frozen_nn.seed_states)), cfg=frozen_nn.config)
+        fallback = None
+        selected = max(((stage, item) for stage, item in result["promotion"].get(span, {}).items()
+                        if item["accepted"]), key=lambda pair: pair[1]["tests"]["all_missing"]["mean_gain_pp"], default=None)
+        if selected:
+            stage, item = selected
+            model_stage = item.get("model_stage", stage)
+            state_recipe = {"kind": "direct" if span == "short" else "global",
+                "features": "gas_no_power" if model_stage == "R2" else "gas", "blend": item["blend"],
+                "fallback_weight": item.get("fallback_weight", 1.),
+                "fallback_weights": item.get("fallback_weights"),
+                "source_study": str(study), "stage": stage,
+                "development_gain_pp": item["tests"]["all_missing"]["mean_gain_pp"]}
+            if promotion and (state_recipe["fallback_weight"] < 1. or state_recipe["fallback_weights"]):
+                original = recipes[span]
+                state_recipe["reference_recipe"] = {"kind": original["kind"],
+                    "features": original["features"], "blend": original["blend"]}
+            fallback = main_s.train_availability_fallback(training, horizons, state_recipe, quick)
+        scores = {**recipe["scores"], "confirm": {"accuracy": None, "reason": "冻结开发配方，仅训练final，未重评D"}}
+        if promotion:
+            scores["tuning_mean"] = promotion["mean_accuracy"]
+        bundles.append(cls(kind=recipe["kind"], features=recipe["features"], horizons=horizons,
+            blend=recipe["blend"], models={}, final_models=models, feature_names=names,
+            final_nn_bundle=neural, nn_weights=recipe.get("nn_weights", {}), lgb_kind=recipe.get("lgb_kind"),
+            lgb_features=recipe.get("lgb_features"), final_availability=fallback,
+            train_end=end, final_train_end=end, scores=scores, train_seconds=time.time() - tick,
+            selection={"chosen": {"kind": recipe["kind"], "features": recipe["features"]},
+                       "frozen_availability_study": str(study), "D_reassessed": False}))
+    recipe = recipes["resource"]
+    positions = np.arange(C.PROFILE_DAYS * C.STEPS_PER_DAY, ref - max(C.HORIZONS_L) + 1,
+                          C.QUICK_TRAIN_STRIDE if quick else C.TRAIN_STRIDE_LONG)
+    rounds = C.LGBM_TREES_QUICK if quick else C.LGBM_TREES_LONG
+    LOGGER.info("冻结配方重训 final/resource，截止=%s", end)
+    models, names = main_opt._fit_resource_models(training, positions, rounds, ref,
+        objectives=recipe["selection"]["objectives"])
+    head_recipe = recipe.get("head_selection", {})
+    if head_recipe.get("gases"):
+        heads, _ = main_opt._fit_resource_models(training, main_opt._resource_head_positions(ref, quick),
+            rounds, ref, objectives=recipe["selection"]["objectives"], horizons=C.HORIZONS_S,
+            gases=tuple(head_recipe["gases"]))
+        models.update({g + "__head": model for g, model in heads.items()})
+    heat, caps = main_opt.estimate_heat_rate(training, ref), main_opt._gas_caps(training, ref)
+    adjustment = recipe["selection"].get("availability_adjustment") or {}
+    resource_nn = None
+    if adjustment.get("method") == "positive_nn_peak":
+        resource_nn = main_nn.train_resource_nn(main_opt._resource_base(training),
+            main_opt.resource_series(training), ref, heat, main_opt.load_prices(), quick,
+            use_history=C.OPT_CONFIG["resource_nn_history"])
+    resource = main_opt.ResourceBundle(models={}, final_models=models, feature_names=names,
+        metrics=recipe["metrics"], heat_rate=heat, final_heat_rate=heat, gas_caps=caps, final_gas_caps=caps,
+        train_end=end, final_train_end=end, final_resource_nn=resource_nn,
+        selection={**recipe["selection"], "head_selection": head_recipe},
+        dispatch_selection=recipe["dispatch_selection"], blocker=recipe.get("blocker"))
+    return bundles[0], bundles[1], resource
+
+
+def _refresh_availability_recipe(short_bundle, long_bundle, study):
+    """模型保持冻结，仅更新已通过联合验证的后处理配方。"""
+    root = study.resolve()
+    if not root.is_relative_to(C.EXPERIMENT_OUTPUT_ROOT.resolve()):
+        raise ValueError("联合配方必须来自本项目实验目录")
+    result = json.loads((root / C.REPORT_DIR / C.REPORT_JSON).read_text(encoding="utf-8"))
+    if (result.get("status") != "SUCCESS_PLAN_STUDY" or result.get("quick")
+            or not result.get("production_path_checks", {}).get("passed")):
+        raise ValueError("联合配方尚未通过完整实际入口验证")
+    originals = json.loads((root / C.MODEL_DIR / "model_meta.json").read_text(encoding="utf-8"))
+    for span, bundle in (("short", short_bundle), ("long", long_bundle)):
+        expected = dict(originals[span])
+        promoted = next((r for r in result.get("R0", []) if r.get("accepted")), None) if span == "long" else None
+        if promoted:
+            expected.update(kind="nn_lgb_ens", features="hybrid", lgb_kind="global", lgb_features="gas",
+                            blend=promoted["frozen_blend"], nn_weights=promoted["frozen_nn_weights"])
+        if any(getattr(bundle, key) != expected.get(key) for key in
+               ("kind", "features", "lgb_kind", "lgb_features", "blend", "nn_weights")):
+            raise ValueError("复用运行主模型与冻结联合配方不一致，需要重训")
+        selected = max(((s, item) for s, item in result["promotion"][span].items() if item["accepted"]),
+            key=lambda pair: pair[1]["tests"]["all_missing"]["mean_gain_pp"], default=None)
+        if not selected:
+            continue
+        stage, item = selected
+        state = bundle.final_availability
+        expected_features = "gas_no_power" if item.get("model_stage", stage) == "R2" else "gas"
+        if not state or state["features"] != expected_features:
+            raise ValueError("复用运行缺少对应缺测模型，需要按冻结配方重新训练")
+        state.update(blend=item["blend"], fallback_weight=item.get("fallback_weight", 1.),
+            fallback_weights=item.get("fallback_weights"), stage=stage, source_study=str(root),
+            development_gain_pp=item["tests"]["all_missing"]["mean_gain_pp"])
+        if state["fallback_weight"] < 1. or state["fallback_weights"]:
+            state["reference_recipe"] = {k: originals[span][k] for k in ("kind", "features", "blend")}
+        bundle.selection["joint_availability_study"] = str(root)
+
+
 def run_infer(quick: bool = False, experimental: bool = False,
-              reuse_run: Path | None = None, nn_studies: list[Path] | None = None) -> int:
+              reuse_run: Path | None = None, nn_studies: list[Path] | None = None,
+              availability_study: Path | None = None) -> int:
     """冻结模型后执行正式半决赛测试推理，并单独核验当次结果的提交条件。"""
     started = time.time()
     ctx = output.begin_run(C, mode="infer", experimental=quick or experimental)
@@ -250,7 +394,22 @@ def run_infer(quick: bool = False, experimental: bool = False,
         LOGGER.info("训练白名单: %s .. %s；半决赛测试输入仅用于冻结模型推理",
                     training.index[0], training.index[-1])
         stages.update(1)
-        if reuse_run is None:
+        if availability_study is not None:
+            if nn_studies:
+                raise ValueError("可用性冻结推理不同时覆盖其他 NN 专项")
+            if reuse_run is None:
+                short_bundle, long_bundle, resource_bundle = _train_frozen_availability_models(training, availability_study, quick)
+            else:
+                short_bundle, long_bundle, resource_bundle = output.load_final_models(reuse_run)
+                if any(pd.Timestamp(b.final_train_end) != training.index[-1]
+                       for b in (short_bundle, long_bundle, resource_bundle)):
+                    raise ValueError("复用模型没有覆盖当前合法训练截止点，必须重训")
+                _refresh_availability_recipe(short_bundle, long_bundle, availability_study)
+                summary["reused_models_from"] = str(reuse_run.resolve())
+            summary["availability_study"] = str(availability_study.resolve())
+            summary["validation_scope"] = "冻结A/B/C联合开发配方；D未重评；复用运行不重复训练" if reuse_run else "冻结A/B/C开发配方；仅重训最终模型；D未重评"
+            stages.update(3)
+        elif reuse_run is None:
             folds = build_folds(training, quick=quick)
             stages.set_description("推理 · 短期训练")
             short_bundle = main_s.train_short(training, folds, quick=quick)
@@ -356,6 +515,11 @@ def run_infer(quick: bool = False, experimental: bool = False,
                                           else "frozen_model_compatibility_dryrun")},
             "origins": int(len(origins)),
             "origin_range": [str(origins[0]), str(origins[-1])],
+            "prediction_input_support": {
+                "power_gas_missing_origins": int((~np.isfinite(masked.frame[["d_use_blast", "d_use_coke", "d_use_converter"]]
+                    .to_numpy(dtype=float)[masked.index.get_indexer(origins)]).all(axis=1)).sum()),
+                "short_fallback_active": bool(short_bundle.final_availability),
+                "long_fallback_active": bool(long_bundle.final_availability)},
             "short": {"scores": short_bundle.scores, "selection": short_bundle.selection,
                       "train_seconds": short_bundle.train_seconds},
             "long": {"scores": long_bundle.scores, "selection": long_bundle.selection,
@@ -376,6 +540,28 @@ def run_infer(quick: bool = False, experimental: bool = False,
             "duration_seconds": round(time.time() - started, 2),
         })
         report_path = output.write_report(ctx, summary)
+        if availability_study is not None:
+            # 同时检查正常与缺测起报点，验证归档包含实际使用的全部分支。
+            reloaded = output.load_final_models(ctx.root)
+            sample = np.unique(np.array([0, min(96, len(origins) - 1), min(192, len(origins) - 1), len(origins) - 1]))
+            short_full = main_s.predict_short(reloaded[0], masked, origins, use_final=True)
+            long_full = main_l.predict_long(reloaded[1], masked, origins, use_final=True)
+            differences = {"short": float(np.max(np.abs(short_full - short_pred))),
+                           "long": float(np.max(np.abs(long_full - long_pred)))}
+            if max(differences.values()) > 1e-5:
+                raise ValueError("最终模型归档重载未复现包含缺测分支的推理")
+            short_check = main_s.predict_short(reloaded[0], masked, origins[sample], use_final=True)
+            long_check = main_l.predict_long(reloaded[1], masked, origins[sample], use_final=True)
+            sampled = {"short": float(np.max(np.abs(short_check - short_full[sample]))),
+                       "long": float(np.max(np.abs(long_check - long_full[sample])))}
+            # FP32 在不同 GPU 批形状下可能换用卷积核；抽样误差与完整重载误差分开验收。
+            tolerance = float(16 * np.finfo(np.float32).eps * max(C.CAPACITY.values()))
+            if max(sampled.values()) > tolerance:
+                raise ValueError("抽样与整批预测差异超过 FP32 数值预算")
+            summary["availability_reload_check"] = {"passed": True, "origins": sample.tolist(),
+                "max_abs_diff": differences, "sampled_batch_max_abs_diff": sampled,
+                "sampled_tolerance_mw": tolerance}
+            output.write_report(ctx, summary)
         stages.update(1)
         stages.set_description("推理完成")
         LOGGER.info("报告: %s", report_path)
@@ -822,6 +1008,1136 @@ def run_nn_study(args) -> int:
         LOGGER.info("NN 专项结果: %s", ctx.root)
 
 
+def _verify_plan_study(directory: Path, summary: dict) -> int:
+    problems, checked, diagnostics = [], 0, []
+    prepared = prepare_data(C)
+    for path in sorted((directory / C.MODEL_DIR).rglob("predictions.npz")):
+        with np.load(path) as arrays:
+            pred, truth, positions = arrays["prediction"], arrays["truth"], arrays["positions"]
+            if pred.shape != truth.shape or not np.isfinite(pred).all() or not np.isfinite(truth).any():
+                problems.append(f"预测形状或有限值错误: {path.relative_to(directory)}")
+                continue
+            if len(positions) != len(pred) or (np.diff(positions) != 1).any():
+                problems.append(f"起报点不连续: {path.relative_to(directory)}")
+            metadata_path = path.parent / "meta.json"
+            if metadata_path.exists():
+                meta = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if (pd.Timestamp(meta["train_end"]) >= prepared.index[positions[0]] or
+                    pd.Timestamp(meta.get("max_training_target", meta["train_end"])) > pd.Timestamp(meta["train_end"])):
+                    problems.append(f"训练截止跨界: {path.relative_to(directory)}")
+            else:
+                problems.append(f"缺少训练截止元信息: {path.relative_to(directory)}")
+                continue
+            if pred.shape[2] == 2:
+                physical = (pred[:, :, 0] >= -1e-6).all() and (pred[:, :, 0] <= 200. + 1e-6).all()
+                physical &= (pred[:, :, 1] >= pred[:, :, 0] - 1e-6).all() and (pred[:, :, 1] - pred[:, :, 0] <= 240. + 1e-6).all()
+                if not physical:
+                    problems.append(f"组间容量关系错误: {path.relative_to(directory)}")
+                h = C.HORIZONS_S if pred.shape[1] == 8 else C.HORIZONS_L
+                name = "s_result.csv" if len(h) == 8 else "l_result.csv"
+                frame = output._cube_to_frame(pred, prepared.index[positions], h)
+                check = output.validate_official_frame(name, frame)
+                problems.extend(check["problems"])
+                groups = {}
+                ref = int(prepared.index.get_indexer([pd.Timestamp(meta["train_end"])])[0])
+                fuel_change = prepared.frame.d_fuel_proxy.diff(4).abs().to_numpy(dtype=float)
+                change_threshold = float(np.nanquantile(fuel_change[:ref + 1], .75))
+                observed_change = fuel_change[positions]
+                process_missing = ~np.isfinite(prepared.frame.d_use_total.to_numpy(dtype=float)[positions])
+                for ti, target in enumerate(C.TARGETS):
+                    threshold = float(prepared.labels[target].iloc[:ref + 1].quantile(.25))
+                    valid = np.isfinite(truth[:, :, ti]) & (truth[:, :, ti] > 0)
+                    low = valid & (truth[:, :, ti] <= threshold)
+                    groups[target] = {"low_threshold_from_training_mw": threshold,
+                        "low_cells": int(low.sum()),
+                        "low_accuracy": float(100 * (1 - np.mean(np.abs(pred[:, :, ti][low] - truth[:, :, ti][low]) / truth[:, :, ti][low]))) if low.any() else None,
+                        "daily_accuracy": [main_s.score_cube(pred[mask], truth[mask], h)["targets"][target]["accuracy"]
+                            for day in prepared.index[positions].normalize().unique()
+                            if (mask := prepared.index[positions].normalize() == day).any()]}
+                    groups[target]["process_change_threshold_from_training"] = change_threshold
+                    groups[target]["process_regimes"] = {}
+                    for label, rows in (("stable", observed_change <= change_threshold),
+                            ("changing", observed_change > change_threshold), ("missing", process_missing)):
+                        cells = valid & rows[:, None]
+                        zero = np.isfinite(truth[:, :, ti]) & (truth[:, :, ti] == 0) & rows[:, None]
+                        groups[target]["process_regimes"][label] = {
+                            "positive_cells": int(cells.sum()), "zero_cells": int(zero.sum()),
+                            "accuracy": float(100 * (1 - np.mean(np.abs(pred[:, :, ti][cells] - truth[:, :, ti][cells]) /
+                                truth[:, :, ti][cells]))) if cells.any() else None,
+                            "zero_mae": float(np.abs(pred[:, :, ti][zero]).mean()) if zero.any() else None}
+                    groups[target]["all_finite_bias_and_variation"] = main_s.score_cube(pred, truth, h)["targets"][target]
+                diagnostics.append({"archive": str(path.relative_to(directory)), "regimes": groups})
+            elif pred.shape[2] != 3 or (pred < 0).any():
+                problems.append(f"资源输出维度或非负约束错误: {path.relative_to(directory)}")
+            checked += 1
+    if not checked:
+        problems.append("没有可验证的折外预测")
+    if set(p.name for p in (directory / C.REPORT_DIR).iterdir()) != {C.REPORT_JSON, C.REPORT_LOG}:
+        problems.append("报告目录包含额外产物")
+    if any("half_test" in k or "semi_test" in k for k in summary.get("data_sources", {})):
+        problems.append("研究数据来源包含测试输入")
+    if summary.get("submittable") is not False:
+        problems.append("研究产物不能声明可提交")
+    if summary.get("stages") == ["availability"]:
+        production = _verify_availability_production(directory, summary, prepared)
+        summary["production_path_checks"] = production
+        if not production["passed"]:
+            problems.append("实际预测入口未复现冻结的可用性分支")
+    result = {"passed": not problems, "archives": checked, "problems": problems,
+              "regime_diagnostics": diagnostics, "reload_checked_during_training": True}
+    summary["verification"] = result
+    (directory / C.REPORT_DIR / C.REPORT_JSON).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({k: v for k, v in result.items() if k != "regime_diagnostics"}, ensure_ascii=False, indent=2))
+    return 0 if not problems else 1
+
+
+def _verify_availability_production(directory, summary, prepared):
+    import main_nn
+    recipes = json.loads((directory / C.MODEL_DIR / "model_meta.json").read_text(encoding="utf-8"))
+    results = []
+    promoted_long = next((r for r in summary.get("R0", []) if r.get("accepted")), None)
+    for span, horizons, cls, predictor in (("short", C.HORIZONS_S, main_s.ShortBundle, main_s.predict_short),
+                                          ("long", C.HORIZONS_L, main_l.LongBundle, main_l.predict_long)):
+        selected = max(((s, v) for s, v in summary["promotion"][span].items() if v["accepted"]),
+            key=lambda pair: pair[1]["tests"]["all_missing"]["mean_gain_pp"], default=None)
+        if not selected:
+            continue
+        stage, item = selected
+        for spec in C.FOLDS:
+            if spec["role"] != "tuning":
+                continue
+            root = directory / C.MODEL_DIR / span
+            old = root / "baseline" / spec["name"]
+            meta = json.loads((old / "meta.json").read_text(encoding="utf-8"))
+            models = _study_load_models(old, meta["files"])
+            normal = recipes[span]
+            nn_files = list((old / "nn").glob("*.pt"))
+            normal_archive = old / "predictions.npz"
+            if span == "long" and promoted_long:
+                normal = {**normal, "kind": "nn_lgb_ens", "features": "hybrid", "lgb_kind": "global",
+                    "lgb_features": "gas", "nn_weights": promoted_long["frozen_nn_weights"],
+                    "blend": promoted_long["frozen_blend"]}
+                nn_files = list((directory / C.MODEL_DIR / "R0_long" / spec["name"]).glob("nn_*.pt"))
+                normal_archive = directory / C.MODEL_DIR / "R0_long" / spec["name"] / "predictions.npz"
+            candidate = root / item.get("model_stage", stage) / spec["name"]
+            state = json.loads((candidate / "meta.json").read_text(encoding="utf-8"))
+            state.update(models=_study_load_models(candidate, state["files"]), blend=item["blend"],
+                         fallback_weight=item.get("fallback_weight", 1.),
+                         fallback_weights=item.get("fallback_weights"), role="final")
+            if span == "long" and promoted_long and (state["fallback_weight"] < 1. or state["fallback_weights"]):
+                state["reference_recipe"] = {k: recipes[span][k] for k in ("kind", "features", "blend")}
+            bundle = cls(kind=normal["kind"], features=normal["features"], horizons=horizons,
+                blend=normal["blend"], models={}, final_models=models, feature_names=meta["feature_names"],
+                final_nn_bundle=main_nn.load_nn(nn_files[0]) if nn_files else None,
+                nn_weights=normal.get("nn_weights", {}), lgb_kind=normal.get("lgb_kind"),
+                lgb_features=normal.get("lgb_features"), final_availability=state)
+            masked, _, positions, _ = _study_view(prepared, spec)
+            with np.load(normal_archive) as arrays:
+                normal_prediction = arrays["prediction"].copy()
+            for scenario in summary["contract"]["scenarios"]:
+                start = (spec["start"] if scenario == "all_missing" else
+                         pd.Timestamp(spec["start"]) + pd.Timedelta(days=7) if scenario == "outage_day7" else None)
+                view = masked if start is None else masked.masked_power_gas_copy(start)
+                missing = ~np.isfinite(view.frame[["d_use_blast", "d_use_coke", "d_use_converter"]]
+                                      .to_numpy(dtype=float)[positions]).all(axis=1)
+                expected = normal_prediction.copy()
+                with np.load(root / stage / scenario / spec["name"] / "predictions.npz") as arrays:
+                    expected[missing] = arrays["prediction"][missing]
+                actual = predictor(bundle, view, view.index[positions], use_final=True)
+                difference = float(np.max(np.abs(actual - expected)))
+                with np.load(root / "R1" / scenario / spec["name"] / "predictions.npz") as arrays:
+                    truth, baseline = arrays["truth"].copy(), arrays["prediction"].copy()
+                after, before = main_s.score_cube(actual, truth, horizons), main_s.score_cube(baseline, truth, horizons)
+                deltas = {t: after["targets"][t]["accuracy"] - before["targets"][t]["accuracy"] for t in C.TARGETS}
+                results.append({"span": span, "fold": spec["name"], "scenario": scenario,
+                    "max_abs_diff": difference, "accuracy": after["accuracy"],
+                    "gain_pp": after["accuracy"] - before["accuracy"], "target_deltas_pp": deltas})
+    return {"passed": all(r["max_abs_diff"] <= 1e-5 and min(r["target_deltas_pp"].values()) >= -.2 - 1e-8
+                          for r in results), "comparisons": results}
+
+
+def _study_archive_reference(directory: Path, reference: Path) -> None:
+    import shutil
+    if not directory.resolve().is_relative_to(C.EXPERIMENT_OUTPUT_ROOT.resolve()):
+        raise ValueError("冻结参考模型只能归档到实验目录")
+    for span in ("short", "long"):
+        source = reference / C.MODEL_DIR / span / "baseline"
+        target = directory / C.MODEL_DIR / span / "baseline"
+        if source.is_dir() and not target.exists():
+            shutil.copytree(source, target)
+
+
+def _study_save_models(directory: Path, models: dict) -> dict:
+    directory.mkdir(parents=True, exist_ok=True)
+    files = {}
+    for key, model in models.items():
+        tag = output._model_tag(key)
+        filename = tag + ".txt"
+        (directory / filename).write_text(model.model_to_string(), encoding="utf-8")
+        files[tag] = filename
+    return files
+
+
+def _study_load_models(directory: Path, files: dict) -> dict:
+    models = {}
+    for tag, name in files.items():
+        key = tag
+        if "__" in tag and tag.rsplit("__", 1)[1].isdigit():
+            target, h = tag.rsplit("__", 1)
+            key = (target, int(h))
+        models[key] = main_opt.load_resource_model((directory / name).read_text(encoding="utf-8"))
+    return models
+
+
+def _study_view(prepared, spec):
+    horizons = np.asarray(C.HORIZONS_L)
+    positions, evaluation, ref = main_s._fold_positions(prepared, spec, int(horizons.max()))
+    if evaluation[-1] + horizons.max() >= len(prepared.index):
+        raise ValueError("开发折标签延伸不完整")
+    end = prepared.index[evaluation[-1] + horizons.max()]
+    masked = prepared.masked_copy(spec["start"], end)
+    return masked, positions, evaluation, ref
+
+
+def _study_load_stage(ctx, summary, prepared, specs, reference, stages, quick):
+    import main_nn
+    from data_cleaning.pipeline import fit_profile_state, state_slot_profile
+    original = json.loads((reference / C.MODEL_DIR / "model_meta.json").read_text(encoding="utf-8"))
+    stage_names = ["baseline"] if stages == {"baseline"} else [s for s in ("E1_21", "E1_45", "E2", "E3")
+        if s.split("_")[0] in stages]
+    for span, horizons, stride, kind in (("short", C.HORIZONS_S, C.TRAIN_STRIDE_SHORT, "direct"),
+                                        ("long", C.HORIZONS_L, C.TRAIN_STRIDE_LONG, "global")):
+        all_truths = []
+        accepted = "baseline"
+        for stage in stage_names:
+            predictions, baselines = [], []
+            half_life = float(stage.split("_")[1]) if stage.startswith("E1_") else 60.
+            if stage in ("E2", "E3"):
+                half_life = summary.get("selected_decay", {}).get(span, 60.)
+            for spec in specs:
+                LOGGER.info("方案实验 %s/%s/%s，half_life=%s", stage, span, spec["name"], half_life)
+                masked, _, evaluation, ref = _study_view(prepared, spec)
+                positions, _, _ = main_s._fold_positions(masked, spec, max(horizons))
+                positions = positions[::C.QUICK_TRAIN_STRIDE if quick else stride]
+                directory = ctx.model_dir / span / stage / spec["name"]
+                base = main_s.build_base_features(masked, include_targets=True)
+                profile = main_s.baseline_cubes(masked, evaluation, horizons)["profile"]
+                truth = main_s.truth_cube(prepared, evaluation, horizons)
+                source = reference / C.MODEL_DIR / span / "baseline" / spec["name"]
+                if stage == "baseline":
+                    baseline = None
+                    neural = None
+                    if span == "short":
+                        pack = main_nn.train_nn(prepared, [{**spec, "role": "tuning"}], C.NN_CONFIG["kind_short"], horizons,
+                            quick=quick, n_seeds=1 if quick else C.NN_CONFIG["n_seeds"])
+                        path = main_nn.save_nn(pack, directory / "nn")
+                        neural = main_nn.predict_nn(pack, masked, masked.index[evaluation])
+                        reload_neural = main_nn.predict_nn(main_nn.load_nn(Path(path)), masked, masked.index[evaluation])
+                        if not np.allclose(neural, reload_neural, rtol=0., atol=1e-5):
+                            raise ValueError("基线 NN 重载不一致")
+                else:
+                    with np.load(source / "predictions.npz") as data:
+                        baseline, neural = data["prediction"].copy(), data["neural"].copy()
+                        if not np.array_equal(evaluation, data["positions"]):
+                            raise ValueError("基线起报点不匹配")
+                        if not np.allclose(truth, data["truth"], equal_nan=True):
+                            raise ValueError("基线标签不匹配")
+                    if stage in ("E2", "E3") and accepted != "baseline":
+                        with np.load(ctx.model_dir / span / accepted / spec["name"] / "predictions.npz") as data:
+                            baseline = data["prediction"].copy()
+                recipe = fit_profile_state(masked, ref) if stage == "E2" else None
+                previous_decay = C.DECAY_DAYS
+                try:
+                    C.DECAY_DAYS = half_life
+                    if stage == "E3":
+                        models, names = main_s.fit_allocation(masked, base, positions, horizons, ref,
+                            C.LGBM_TREES_QUICK if quick else C.LGBM_TREES_LONG)
+                        raw = main_s.predict_allocation(masked, base, evaluation, horizons,
+                            models, names, baseline)
+                    else:
+                        models, names = main_s._train_models(masked, base, positions, horizons, kind, "gas",
+                            C.LGBM_TREES_QUICK if quick else C.LGBM_TREES_LONG, ref, recipe)
+                        raw = main_s._predict_models(masked, base, evaluation, horizons, kind,
+                            "gas", models, names, recipe)
+                finally:
+                    C.DECAY_DAYS = previous_decay
+                raw = main_s.enforce_physics(raw, fallback=profile)
+                if stage == "E2":
+                    profile = main_s.enforce_physics(np.stack([state_slot_profile(masked, evaluation,
+                        horizons, target, recipe)[0] for target in C.TARGETS], axis=2), fallback=profile)
+                def assemble(tree):
+                    if stage == "E3":
+                        return tree
+                    tree = main_s.enforce_physics(tree, fallback=profile)
+                    if span == "short":
+                        tree = main_s.blend_cube(neural, tree, original[span]["nn_weights"], horizons, C.SHORT_GROUPS)
+                    return main_s.blend_cube(tree, profile, original[span]["blend"], horizons, main_s._groups_for(horizons))
+                prediction = assemble(raw)
+                files = _study_save_models(directory, models)
+                loaded = _study_load_models(directory, files)
+                if stage == "E3":
+                    reloaded = main_s.predict_allocation(masked, base, evaluation, horizons, loaded, names, baseline)
+                else:
+                    reloaded = main_s._predict_models(masked, base, evaluation, horizons, kind, "gas", loaded, names, recipe)
+                difference = float(np.max(np.abs(prediction - assemble(reloaded))))
+                if difference > 1e-8:
+                    raise ValueError("候选模型重载预测不一致")
+                meta = {"files": files, "feature_names": names, "kind": kind, "span": span,
+                        "half_life_days": half_life, "profile_state": recipe,
+                        "max_training_target": str(masked.index[max(positions) + max(horizons)]),
+                        "train_end": spec["train_end"], "reload_max_abs_diff": difference,
+                        "fixed_fusion": original[span]["blend"], "fixed_nn_weights": original[span]["nn_weights"]}
+                (directory / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+                np.savez_compressed(directory / "predictions.npz", prediction=prediction, raw=raw,
+                    truth=truth, profile=profile, neural=np.empty(0) if neural is None else neural, positions=evaluation)
+                predictions.append(prediction)
+                baselines.append(prediction if baseline is None else baseline)
+                scores = main_s.score_cube(prediction, truth, horizons)
+                summary["results"].append({"stage": stage, "span": span, "fold": spec["name"],
+                    "score": scores, "max_training_target": meta["max_training_target"],
+                    "reload_max_abs_diff": difference})
+                LOGGER.info("完成 %s/%s/%s: %.6f", stage, span, spec["name"], scores["accuracy"])
+                output.write_report(ctx, summary)
+                if stage == stage_names[0]:
+                    all_truths.append(truth)
+            result = main_s.load_promotion(predictions, baselines, all_truths, horizons)
+            summary.setdefault("promotion", {}).setdefault(span, {})[stage] = result
+            if stage.startswith("E1_") and result["accepted"]:
+                current = summary.get("promotion", {}).get(span, {}).get(accepted, {}).get("mean_accuracy", -np.inf)
+                if result["mean_accuracy"] > current:
+                    accepted = stage
+                    summary.setdefault("selected_decay", {})[span] = half_life
+            output.write_report(ctx, summary)
+
+
+def _study_resource_bundle(prepared, spec, recipe, quick, two_stage=(), baseline=None):
+    import copy
+    import main_nn
+    if recipe.get("two_stage_gases") and baseline is None:
+        plain_recipe = {k: v for k, v in recipe.items() if k != "two_stage_gases"}
+        reference_bundle, _, _, _ = _study_resource_bundle(prepared, spec, plain_recipe, quick)
+        return _study_resource_bundle(prepared, spec, plain_recipe, quick,
+            two_stage=tuple(recipe["two_stage_gases"]), baseline=reference_bundle)
+    masked, _, evaluation, ref = _study_view(prepared, spec)
+    positions, _, _ = main_opt._resource_positions(masked, spec, quick)
+    rounds = C.LGBM_TREES_QUICK if quick else C.LGBM_TREES_LONG
+    gases = tuple(two_stage) if baseline is not None else C.RESOURCE_NAMES
+    models, names = main_opt._fit_resource_models(masked, positions, rounds, ref,
+        objectives=recipe["selection"]["objectives"], gases=gases, two_stage_gases=tuple(two_stage))
+    head_gases = tuple(g for g in gases if g in recipe["head_selection"].get("gases", []))
+    heads = {}
+    if head_gases:
+        heads, _ = main_opt._fit_resource_models(masked, main_opt._resource_head_positions(ref, quick),
+            rounds, ref, objectives={g: "regression_l1" for g in head_gases}, horizons=C.HORIZONS_S,
+            gases=head_gases, two_stage_gases=tuple(two_stage))
+    models.update({g + "__head": m for g, m in heads.items()})
+    if baseline is not None:
+        bundle = copy.copy(baseline)
+        bundle.models = {**baseline.models, **models,
+                         **{g + "__reference": m for g, m in baseline.models.items()}}
+        bundle.selection = {**baseline.selection, "frozen_adjustment_reference": True}
+    else:
+        selection = {**recipe["selection"], "head_selection": recipe["head_selection"]}
+        bundle = main_opt.ResourceBundle(models, {}, names, selection=selection,
+            heat_rate=main_opt.estimate_heat_rate(masked, ref), gas_caps=main_opt._gas_caps(masked, ref),
+            train_end=spec["train_end"], dispatch_selection=recipe["dispatch_selection"])
+        if recipe["selection"].get("availability_adjustment", {}).get("method") == "positive_nn_peak":
+            bundle.resource_nn = main_nn.train_resource_nn(main_opt._resource_base(masked),
+                main_opt.resource_series(masked), ref, bundle.heat_rate, main_opt.load_prices(),
+                quick, use_history=C.OPT_CONFIG["resource_nn_history"])
+    forecast = main_opt.forecast_resources(bundle, masked, masked.index[evaluation])
+    return bundle, masked, evaluation, forecast
+
+
+def _study_save_resource(directory, bundle, prepared, evaluation, forecast):
+    import main_nn
+    files = _study_save_models(directory, bundle.models)
+    metadata = {"files": files, "feature_names": bundle.feature_names, "selection": bundle.selection,
+        "heat_rate": bundle.heat_rate, "gas_caps": bundle.gas_caps, "train_end": bundle.train_end,
+        "dispatch_selection": bundle.dispatch_selection}
+    if bundle.resource_nn:
+        main_nn.save_resource_nn(bundle.resource_nn, directory / "resource_nn.pt")
+    loaded = main_opt.ResourceBundle(_study_load_models(directory, files), {}, bundle.feature_names,
+        selection=bundle.selection, heat_rate=bundle.heat_rate, gas_caps=bundle.gas_caps,
+        resource_nn=main_nn.load_resource_nn(directory / "resource_nn.pt") if bundle.resource_nn else None)
+    reloaded = main_opt.forecast_resources(loaded, prepared, prepared.index[evaluation])
+    difference = float(np.max(np.abs(reloaded - forecast)))
+    if difference > 1e-5:
+        raise ValueError("资源候选保存重载预测不一致")
+    metadata["reload_max_abs_diff"] = difference
+    (directory / "meta.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    return metadata
+
+
+def _study_read_resource(directory, prepared, spec):
+    import main_nn
+    metadata_path, predictions_path = directory / "meta.json", directory / "predictions.npz"
+    if not metadata_path.exists() or not predictions_path.exists():
+        return None
+    meta = json.loads(metadata_path.read_text(encoding="utf-8"))
+    masked, _, evaluation, _ = _study_view(prepared, spec)
+    if pd.Timestamp(meta["train_end"]) != pd.Timestamp(spec["train_end"]):
+        raise ValueError("续跑资源模型截止点与当前折不一致")
+    bundle = main_opt.ResourceBundle(_study_load_models(directory, meta["files"]), {}, meta["feature_names"],
+        selection=meta["selection"], heat_rate=meta["heat_rate"], gas_caps=meta["gas_caps"],
+        train_end=meta["train_end"], dispatch_selection=meta["dispatch_selection"],
+        resource_nn=main_nn.load_resource_nn(directory / "resource_nn.pt") if (directory / "resource_nn.pt").exists() else None)
+    with np.load(predictions_path) as arrays:
+        forecast, truth = arrays["prediction"].copy(), arrays["truth"].copy()
+        if not np.array_equal(arrays["positions"], evaluation):
+            raise ValueError("续跑资源起报点与当前折不一致")
+    actual = main_opt.resource_series(prepared).to_numpy()[evaluation[:, None] + np.arange(1, 97)]
+    if not np.allclose(truth, actual, equal_nan=True):
+        raise ValueError("续跑资源评分标签与当前训练数据不一致")
+    loaded = main_opt.forecast_resources(bundle, masked, masked.index[evaluation])
+    if not np.allclose(forecast, loaded, rtol=0., atol=1e-5):
+        raise ValueError("续跑资源权重与已存折外预测不一致")
+    LOGGER.info("复用已完成资源模型 %s", directory.name)
+    return bundle, masked, evaluation, forecast
+
+
+def _study_inner_resources(ctx, prepared, outer, recipe, quick):
+    forecasts, truths, positions, records = [], [], [], []
+    # 完整内层误差路径的末目标必须留在外层训练前缀。
+    for offset in (28, 14):
+        start = pd.Timestamp(outer["start"]) - pd.Timedelta(days=offset)
+        inner = {"name": f"{outer['name']}_inner_{offset}", "role": "tuning", "start": str(start),
+            "train_end": str(start - pd.Timedelta(minutes=15)), "days": 13}
+        LOGGER.info("前缀折外资源 %s，冻结截止=%s", inner["name"], inner["train_end"])
+        directory = ctx.model_dir / "resource_oof" / inner["name"]
+        cached = _study_read_resource(directory, prepared, inner)
+        bundle, masked, evaluation, forecast = cached or _study_resource_bundle(prepared, inner, recipe, quick)
+        truth = main_opt.resource_series(prepared).to_numpy()[evaluation[:, None] + np.arange(1, 97)]
+        max_target = prepared.index[evaluation[-1] + 96]
+        if max_target > pd.Timestamp(outer["train_end"]):
+            raise ValueError("内层资源折外目标越过外层训练边界")
+        meta = json.loads((directory / "meta.json").read_text(encoding="utf-8")) if cached else _study_save_resource(directory, bundle, masked, evaluation, forecast)
+        if not cached:
+            np.savez_compressed(directory / "predictions.npz", prediction=forecast, truth=truth, positions=evaluation)
+        forecasts.append(forecast)
+        truths.append(truth)
+        positions.append(evaluation)
+        records.append({"train_end": inner["train_end"], "origins": [str(start), str(prepared.index[evaluation[-1]])],
+                        "max_target": str(max_target), "reload_max_abs_diff": meta["reload_max_abs_diff"]})
+    return np.concatenate(forecasts), np.concatenate(truths), np.concatenate(positions), records
+
+
+def _study_resource_stage(ctx, summary, prepared, specs, reference, stages, quick):
+    original = json.loads((reference / C.MODEL_DIR / "model_meta.json").read_text(encoding="utf-8"))["resource"]
+    original["dispatch_selection"]["control_options"]["mip_rel_gap"] = .001
+    summary["solver_settings"] = {"mip_rel_gap": .001,
+        "rolling_time_limit_s": C.OPT_CONFIG["rolling_solver_time_limit_s"], "paired_same_settings": True}
+    summary["resource_contract"] = {"mode": "historical_consumption_envelope",
+        "zero_state": "zero_historical_power_consumption_not_zero_generation",
+        "physical_feasibility_certified": False, "fixed_blast_forecast": True}
+    caches, before_metrics, after_metrics = [], [], []
+    for spec in specs:
+        LOGGER.info("资源保护基线 %s", spec["name"])
+        directory = ctx.model_dir / "resource" / "baseline" / spec["name"]
+        cached = _study_read_resource(directory, prepared, spec)
+        bundle, masked, evaluation, forecast = cached or _study_resource_bundle(prepared, spec, original, quick)
+        truth = main_opt.resource_series(prepared).to_numpy()[evaluation[:, None] + np.arange(1, 97)]
+        metadata = json.loads((directory / "meta.json").read_text(encoding="utf-8")) if cached else _study_save_resource(directory, bundle, masked, evaluation, forecast)
+        if not cached:
+            np.savez_compressed(directory / "predictions.npz", prediction=forecast, truth=truth, positions=evaluation)
+        row = {"fold": spec["name"], "baseline_metrics": main_opt.score_resources(forecast, truth),
+            "train_end": bundle.train_end, "reload_max_abs_diff": metadata["reload_max_abs_diff"]}
+        cache = {"spec": spec, "prepared": masked, "evaluation": evaluation, "bundle": bundle,
+                 "baseline": forecast, "truth": truth}
+        before_metrics.append(row["baseline_metrics"])
+        if "E4" in stages:
+            target = ctx.model_dir / "resource" / "E4" / spec["name"]
+            trial_cached = _study_read_resource(target, prepared, spec)
+            trial_bundle, _, _, trial = trial_cached or _study_resource_bundle(prepared, spec, original, quick,
+                two_stage=("coke", "converter"), baseline=bundle)
+            if not np.array_equal(trial[:, :, 0], forecast[:, :, 0]):
+                raise ValueError("E4 不得改变固定高炉气预测")
+            row["trial_metrics"] = main_opt.score_resources(trial, truth)
+            after_metrics.append(row["trial_metrics"])
+            trial_meta = json.loads((target / "meta.json").read_text(encoding="utf-8")) if trial_cached else _study_save_resource(target, trial_bundle, masked, evaluation, trial)
+            row["trial_reload_max_abs_diff"] = trial_meta["reload_max_abs_diff"]
+            row["two_stage_types"] = {g: type(trial_bundle.models[g]).__name__ for g in ("coke", "converter")}
+            if not trial_cached:
+                np.savez_compressed(target / "predictions.npz", prediction=trial, truth=truth, positions=evaluation)
+            cache["trial"] = trial
+            cache["trial_bundle"] = trial_bundle
+        stage = "E4_resource" if "E4" in stages else "resource_baseline"
+        summary["results"] = [r for r in summary["results"] if (r.get("stage"), r.get("fold")) != (stage, spec["name"])]
+        summary["results"].append({"stage": stage, **row})
+        LOGGER.info("资源折 %s: baseline=%s，trial=%s", spec["name"],
+            {g: round(m["wape"], 5) for g, m in row["baseline_metrics"].items()},
+            {g: round(m["wape"], 5) for g, m in row.get("trial_metrics", {}).items()})
+        caches.append(cache)
+        output.write_report(ctx, summary)
+    if "E4" in stages:
+        screen = main_opt.resource_promotion_screen(after_metrics, before_metrics)
+        summary["E4"] = screen
+        eligible = screen["eligible_gases"]
+        if eligible:
+            first_before, first_after = [], []
+            for cache in caches:
+                candidate = cache["baseline"].copy()
+                for gas in eligible:
+                    gi = C.RESOURCE_NAMES.index(gas)
+                    candidate[:, :, gi] = cache["trial"][:, :, gi]
+                cache["selected_trial"] = candidate
+                for name, values, collection in (("baseline", cache["baseline"], first_before),
+                                                  ("trial", candidate, first_after)):
+                    result = main_opt.optimize_rolling(values, cache["prepared"],
+                        cache["prepared"].index[cache["evaluation"]], cache["bundle"], quick=True,
+                        replan_steps=original["dispatch_selection"]["replan_steps"],
+                        control_options=original["dispatch_selection"]["control_options"])
+                    collection.append(result["summary"])
+            screen["screen_comparison"] = {"baseline": first_before, "trial": first_after}
+            screen["dispatch_screen"] = main_opt.paired_dispatch_gate(first_before, first_after, full=False)
+            output.write_report(ctx, summary)
+            if screen["dispatch_screen"]["passed_screen"] and not quick:
+                full_before, full_after = [], []
+                for cache in caches:
+                    for name, values, collection in (("baseline", cache["baseline"], full_before),
+                                                     ("trial", cache["selected_trial"], full_after)):
+                        result = main_opt.optimize_rolling(values, cache["prepared"],
+                            cache["prepared"].index[cache["evaluation"]], cache["bundle"],
+                            replan_steps=original["dispatch_selection"]["replan_steps"],
+                            control_options=original["dispatch_selection"]["control_options"])
+                        collection.append(result["summary"])
+                        if result.get("schedule") is not None:
+                            target = ctx.model_dir / "resource" / name / cache["spec"]["name"] / "dispatch.csv"
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            result["schedule"].to_csv(target, index=False)
+                        output.write_report(ctx, summary)
+                screen["full_comparison"] = {"baseline": full_before, "trial": full_after}
+                screen["dispatch_full"] = main_opt.paired_dispatch_gate(full_before, full_after, full=True)
+                screen["accepted"] = screen["dispatch_full"]["accepted"]
+                if screen["accepted"]:
+                    import copy
+                    original["two_stage_gases"] = list(eligible)
+                    for cache in caches:
+                        chosen = copy.copy(cache["bundle"])
+                        chosen.models = {**chosen.models, **{k: v for k, v in cache["trial_bundle"].models.items()
+                            if k.endswith("__reference") or k.split("__")[0] in eligible}}
+                        chosen.selection = cache["trial_bundle"].selection
+                        cache["bundle"] = chosen
+                        cache["baseline"] = main_opt.forecast_resources(chosen, cache["prepared"], cache["prepared"].index[cache["evaluation"]])
+                        if not np.allclose(cache["baseline"], cache["selected_trial"], rtol=0., atol=1e-8):
+                            raise ValueError("资源晋级组合与完整回放版本不一致")
+        output.write_report(ctx, summary)
+    if stages & {"E5", "E6"}:
+        for cache in caches:
+            forecast, truth, positions, records = _study_inner_resources(ctx, prepared, cache["spec"], original, quick)
+            cache.update(inner_forecast=forecast, inner_truth=truth, inner_positions=positions, inner_records=records)
+            maximum = max(r["max_target"] for r in records)
+            risk = main_opt.fit_inventory_risk(forecast, truth, maximum, cache["spec"]["train_end"])
+            summary["E6_calibration"] = [r for r in summary.get("E6_calibration", []) if r["fold"] != cache["spec"]["name"]]
+            summary["E6_calibration"].append({"fold": cache["spec"]["name"], "blocks": records, **risk})
+            cache["risk"] = risk
+            output.write_report(ctx, summary)
+        if "E5" in stages:
+            _study_future_load(ctx, summary, prepared, caches, reference, quick)
+        if "E6" in stages:
+            _study_risk_dispatch(ctx, summary, caches, original, quick)
+
+
+def _study_risk_dispatch(ctx, summary, caches, recipe, quick):
+    if not all(c["risk"].get("feasible") for c in caches):
+        summary["E6"] = {"accepted": False, "reason": "RISK_BOUNDS_HAVE_NO_FEASIBLE_DOMAIN",
+            "action": "keep_verified_point_control; never_relax_15_to_90_percent",
+            "infeasible_folds": [c["spec"]["name"] for c in caches if not c["risk"].get("feasible")]}
+        output.write_report(ctx, summary)
+        return
+    comparisons = {}
+    for full in (False, True):
+        before, after = [], []
+        for cache in caches:
+            origins = cache["prepared"].index[cache["evaluation"]]
+            for name, collection in (("baseline", before), ("risk", after)):
+                options = dict(recipe["dispatch_selection"]["control_options"])
+                if name == "risk":
+                    options["inventory_risk"] = cache["risk"]
+                result = main_opt.optimize_rolling(cache["baseline"], cache["prepared"], origins,
+                    cache["bundle"], quick=not full, replan_steps=recipe["dispatch_selection"]["replan_steps"],
+                    control_options=options)
+                collection.append(result["summary"])
+                if result.get("schedule") is not None:
+                    directory = ctx.model_dir / "inventory_risk" / ("full" if full else "screen") / cache["spec"]["name"]
+                    directory.mkdir(parents=True, exist_ok=True)
+                    result["schedule"].to_csv(directory / f"{name}.csv", index=False)
+        gate = main_opt.paired_dispatch_gate(before, after, full)
+        comparisons["full" if full else "screen"] = {"baseline": before, "trial": after, "gate": gate}
+        summary["E6"] = {"accepted": gate["accepted"], "comparisons": comparisons}
+        output.write_report(ctx, summary)
+        if not gate["passed_screen"] or quick:
+            break
+
+
+def _study_future_load(ctx, summary, prepared, caches, reference, quick):
+    if not caches or not all(c.get("inner_records") for c in caches):
+        summary["E5"] = {"accepted": False, "status": "NOT_STARTED_PREREQUISITE",
+            "reason": "missing_frozen_training_prefix_OOF_resource_paths"}
+        return
+    original = json.loads((reference / C.MODEL_DIR / "model_meta.json").read_text(encoding="utf-8"))["long"]
+    predictions, baselines, controls, truths = [], [], [], []
+    provenance = []
+    for cache in caches:
+        positions = cache["inner_positions"]
+        forecast, truth = cache["inner_forecast"], cache["inner_truth"]
+        widths = np.full_like(forecast, np.nan)
+        halfway = len(forecast) // 2
+        residual = truth[:halfway] - forecast[:halfway]
+        first_width = np.nanquantile(residual, .9, axis=0) - np.nanquantile(residual, .1, axis=0)
+        widths[halfway:] = first_width
+        outer_width = np.nanquantile(truth - forecast, .9, axis=0) - np.nanquantile(truth - forecast, .1, axis=0)
+        records = cache["inner_records"]
+        if pd.Timestamp(records[0]["max_target"]) >= pd.Timestamp(records[1]["origins"][0]):
+            raise ValueError("区间宽度校准标签越过下个内层块起报点")
+        extras = main_s.future_resource_features(cache["prepared"], positions, forecast, widths)
+        evaluation = cache["evaluation"]
+        outer_extras = main_s.future_resource_features(cache["prepared"], evaluation, cache["baseline"],
+            np.broadcast_to(outer_width, cache["baseline"].shape))
+        stride = C.QUICK_TRAIN_STRIDE if quick else C.TRAIN_STRIDE_LONG
+        ref = int(prepared.index.get_indexer([pd.Timestamp(cache["spec"]["train_end"])])[0])
+        base = main_s.build_base_features(cache["prepared"], include_targets=True)
+        profile = main_s.baseline_cubes(cache["prepared"], evaluation, C.HORIZONS_L)["profile"]
+        load_truth = main_s.truth_cube(prepared, evaluation, C.HORIZONS_L)
+        for name, features, output_features in (("oof_control", None, None),
+                ("E5", {k: v[::stride] for k, v in extras.items()}, outer_extras)):
+            LOGGER.info("两阶段负荷 %s/%s，训练起报点=%d", name, cache["spec"]["name"], len(positions[::stride]))
+            models, names = main_s._train_models(cache["prepared"], base, positions[::stride], C.HORIZONS_L,
+                "global", "gas", C.LGBM_TREES_QUICK if quick else C.LGBM_TREES_LONG, ref,
+                future_features=features)
+            raw = main_s._predict_models(cache["prepared"], base, evaluation, C.HORIZONS_L,
+                "global", "gas", models, names, future_features=output_features)
+            prediction = main_s.blend_cube(main_s.enforce_physics(raw, profile), profile,
+                original["blend"], C.HORIZONS_L, C.LONG_GROUPS)
+            directory = ctx.model_dir / "long" / name / cache["spec"]["name"]
+            files = _study_save_models(directory, models)
+            reloaded = main_s._predict_models(cache["prepared"], base, evaluation, C.HORIZONS_L,
+                "global", "gas", _study_load_models(directory, files), names, future_features=output_features)
+            if not np.allclose(raw, reloaded, rtol=0., atol=1e-8):
+                raise ValueError("两阶段负荷模型保存重载不一致")
+            np.savez_compressed(directory / "predictions.npz", prediction=prediction, truth=load_truth, positions=evaluation)
+            (directory / "meta.json").write_text(json.dumps({"files": files, "feature_names": names,
+                "train_end": cache["spec"]["train_end"], "inner_blocks": records,
+                "interval_width_source": "strictly_earlier_OOF_block; first_block_missing",
+                "outer_interval_width": outer_width.tolist()}, ensure_ascii=False, indent=2), encoding="utf-8")
+            (predictions if name == "E5" else controls).append(prediction)
+            LOGGER.info("完成两阶段负荷 %s/%s: %.6f", name, cache["spec"]["name"],
+                main_s.score_cube(prediction, load_truth, C.HORIZONS_L)["accuracy"])
+        with np.load(reference / C.MODEL_DIR / "long" / "baseline" / cache["spec"]["name"] / "predictions.npz") as data:
+            baselines.append(data["prediction"].copy())
+        truths.append(load_truth)
+        provenance.append({"fold": cache["spec"]["name"], "blocks": records, "train_positions": len(positions[::stride])})
+    gate = main_s.load_promotion(predictions, baselines, truths, C.HORIZONS_L)
+    control_gate = main_s.load_promotion(predictions, controls, truths, C.HORIZONS_L)
+    gate["accepted"] = bool(gate["accepted"] and control_gate["accepted"])
+    summary["E5"] = {**gate, "matched_sample_control": control_gate, "provenance": provenance,
+        "frozen_resource_version": "E4" if summary.get("E4", {}).get("accepted") else "protected_baseline"}
+
+
+def _study_e0(ctx, summary, prepared, specs, reference):
+    for spec in specs:
+        ref = int(prepared.index.get_indexer([pd.Timestamp(spec["train_end"])])[0])
+        summary.setdefault("E0_prefix", []).append({"fold": spec["name"],
+            "ledger": main_opt.audit_resource_ledger(prepared, ref),
+            "physical_comparison": main_opt.physical_prefix_comparison(prepared, ref)})
+    original = json.loads((reference / C.MODEL_DIR / "model_meta.json").read_text(encoding="utf-8"))
+    run = json.loads((reference / C.REPORT_DIR / C.REPORT_JSON).read_text(encoding="utf-8"))
+    optimization = run.get("optimization") or run.get("E0", {}).get("physical_parameters")
+    if optimization:
+        # D 仅重算既有回放的计值，不训练、不挑选新策略。
+        history = prepare_data(C, cutoff="2025-09-27 00:00:00")
+        times = pd.DatetimeIndex(pd.read_csv(reference / "opt_result.csv").datetime) if (reference / "opt_result.csv").exists() else None
+        if times is None and run.get("reference"):
+            source = Path(run["reference"])
+            times = pd.DatetimeIndex(pd.read_csv(source / "opt_result.csv").datetime)
+        if times is not None:
+            gas = main_opt.resource_series(history).reindex(times).to_numpy(dtype=float)
+            beta = np.array([original["resource"]["heat_rate"]["coefficients_mw_per_m3h"][g] for g in C.RESOURCE_NAMES])
+            converted = main_opt._dispatch_metrics(times, gas @ beta, main_opt.load_prices())
+            actual = main_opt._dispatch_metrics(times, history.labels.generator_all.reindex(times).to_numpy(), main_opt.load_prices())
+            executed = optimization["proxy_executed_revenue_cny"]
+            summary["E0_value_comparison"] = {"scope": "existing_D_replay_diagnosis_only",
+                "historical_generation_value_cny": actual["generation_revenue_cny"],
+                "same_conversion_gas_value_cny": converted["generation_revenue_cny"],
+                "proxy_executed_value_cny": executed,
+                "gain_vs_actual_ratio": executed / actual["generation_revenue_cny"] - 1.,
+                "gain_vs_same_conversion_ratio": executed / converted["generation_revenue_cny"] - 1.,
+                "physical_feasibility_certified": False,
+                "dictionary_conflict": "dictionary row21 mentions 200000/300000m3; task p5 uses 200000m3; holder2 mapping unresolved"}
+    output.write_report(ctx, summary)
+
+
+def _availability_fold_predictions(prepared, spec, horizons, directory):
+    """重用冻结折模型，重新构造故障输入，避免仅修改已经缓存的预测。"""
+    import main_nn
+    meta = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+    models = _study_load_models(directory, meta["files"])
+    masked, _, positions, _ = _study_view(prepared, spec)
+    neural_files = list((directory / "nn").glob("*.pt"))
+    neural = main_nn.load_nn(neural_files[0]) if neural_files else None
+    result = {}
+    for scenario, start in (("normal", None), ("all_missing", spec["start"]),
+                            ("outage_day7", pd.Timestamp(spec["start"]) + pd.Timedelta(days=7))):
+        view = masked if start is None else masked.masked_power_gas_copy(start)
+        base = main_s.build_base_features(view, include_targets=True)
+        profile = main_s.baseline_cubes(view, positions, horizons)["profile"]
+        pred = main_s._predict_models(view, base, positions, horizons,
+            meta["kind"], "gas", models, meta["feature_names"])
+        pred = main_s.enforce_physics(pred, fallback=profile)
+        if neural is not None:
+            pred = main_s.blend_cube(main_nn.predict_nn(neural, view, view.index[positions]),
+                pred, meta["fixed_nn_weights"], horizons, main_s._groups_for(horizons))
+        pred = main_s.blend_cube(pred, profile, meta["fixed_fusion"], horizons,
+                                 main_s._groups_for(horizons))
+        missing = ~np.isfinite(view.frame[["d_use_blast", "d_use_coke", "d_use_converter"]]
+                              .to_numpy(dtype=float)[positions]).all(axis=1)
+        result[scenario] = (pred, missing)
+    return result, positions, main_s.truth_cube(prepared, positions, horizons), meta
+
+
+def _availability_interval(predictions, baseline, truths):
+    """按两天连续起报块重采样，重叠提前量不当作独立样本。"""
+    rng = np.random.default_rng(20261025)
+    differences = []
+    for pred, before, truth in zip(predictions, baseline, truths):
+        valid = np.isfinite(truth) & (truth > 0)
+        relative = np.where(valid, (np.abs(before - truth) - np.abs(pred - truth)) /
+                            np.where(valid, truth, 1.), np.nan)
+        differences.append(100. * np.nanmean(relative, axis=(1, 2)))
+    values = []
+    width = 2 * C.STEPS_PER_DAY
+    for _ in range(400):
+        means = []
+        for delta in differences:
+            starts = rng.integers(0, len(delta), size=int(np.ceil(len(delta) / width)))
+            indices = ((starts[:, None] + np.arange(width)) % len(delta)).ravel()[:len(delta)]
+            means.append(float(np.mean(delta[indices])))
+        values.append(np.mean(means))
+    return {"block_steps": width, "replicates": 400,
+            "gain_pp_95_interval": np.quantile(values, [.025, .975]).tolist(),
+            "scope": "reused_development_windows_descriptive_only"}
+
+
+def _availability_joint_mix(ctx, summary):
+    """固定小机组保护权重，只比较总负荷权重；整条分支策略共同验收。"""
+    if summary["quick"] or not any(r.get("accepted") for r in summary.get("R0", [])):
+        return
+    span, horizons, groups = "long", C.HORIZONS_L, C.LONG_GROUPS
+    base = ctx.model_dir / span
+    r2 = summary["promotion"][span]["R2"]
+    conservative = summary["promotion"][span].get("R2_mix")
+    if not conservative:
+        return
+    cases = {}
+    specs = [s for s in C.FOLDS if s["role"] == "tuning"]
+    for scenario in summary["contract"]["scenarios"]:
+        rows = []
+        for spec in specs:
+            with np.load(base / "R1" / scenario / spec["name"] / "predictions.npz") as a:
+                before, truth, missing, positions = (a[k].copy() for k in ("prediction", "truth", "missing", "positions"))
+            with np.load(base / "R2" / scenario / spec["name"] / "predictions.npz") as a:
+                candidate = a["prediction"].copy()
+            with np.load(ctx.model_dir / "R0_long" / spec["name"] / "predictions.npz") as a:
+                normal = a["prediction"].copy()
+            rows.append((candidate, before, truth, missing, positions, normal))
+        cases[scenario] = rows
+    selected, search = None, []
+    for all_weight in sorted(set([conservative["fallback_weight"], .25, .5, .75, 1.])):
+        weights = {"generator_1": {g: conservative["fallback_weight"] for g, _, _ in groups},
+                   "generator_all": {g: float(all_weight) for g, _, _ in groups}}
+        tests, predictions = {}, {}
+        for scenario, rows in cases.items():
+            estimates = []
+            for candidate, before, truth, missing, positions, normal in rows:
+                mixed = main_s.blend_cube(candidate, before, weights, horizons, groups)
+                estimates.append(np.where(missing[:, None, None], mixed, normal))
+            predictions[scenario] = estimates
+            tests[scenario] = main_s.load_promotion(estimates, [r[1] for r in rows], [r[2] for r in rows], horizons)
+        protected = all(v >= -.2 for test in tests.values() for delta in test["fold_target_deltas_pp"] for v in delta.values())
+        gain = tests["all_missing"]["mean_gain_pp"]
+        passed = protected and gain >= .5 and tests["normal"]["mean_gain_pp"] >= .2
+        search.append({"total_load_weight": all_weight, "mean_missing_gain_pp": gain, "passed": bool(passed)})
+        if passed and (selected is None or gain > selected[0]):
+            selected = (gain, weights, tests, predictions)
+    summary["joint_recipe_search"] = {"small_group_weight_frozen": conservative["fallback_weight"],
+                                       "candidates": search, "scope": "ABC_only_no_retraining"}
+    if selected is None:
+        raise ValueError("长期正常与缺测分支组合未通过保护门槛，禁止冻结部署")
+    gain, weights, tests, predictions = selected
+    for scenario, estimates in predictions.items():
+        rows = cases[scenario]
+        tests[scenario]["paired_block_interval"] = _availability_interval(estimates, [r[1] for r in rows], [r[2] for r in rows])
+        for pred, row, spec in zip(estimates, rows, specs):
+            target = base / "R2_target_mix" / scenario / spec["name"]
+            target.mkdir(parents=True, exist_ok=True)
+            meta = json.loads((base / "R2" / spec["name"] / "meta.json").read_text(encoding="utf-8"))
+            meta.update(blend=r2["blend"], fallback_weights=weights, model_stage="R2")
+            (target / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+            np.savez_compressed(target / "predictions.npz", prediction=pred, truth=row[2], positions=row[4])
+    summary["promotion"][span]["R2_target_mix"] = {"accepted": True, "model_stage": "R2",
+        "blend": r2["blend"], "fallback_weights": weights, "tests": tests, "composition_includes_R0": True}
+    LOGGER.info("联合策略通过：缺测提升 %.4fpp，分目标权重=%s", gain, weights)
+
+
+def run_availability_study(args) -> int:
+    """输入可用性专项：冻结对照、全组缺测回放与独立短长期候选。"""
+    import shutil
+    from dataclasses import replace
+    reference = args.study_reference.resolve()
+    if not reference.is_relative_to(C.ROOT.resolve()):
+        raise ValueError("可用性专项参考模型必须来自本项目")
+    prior = json.loads((reference / C.REPORT_DIR / C.REPORT_JSON).read_text(encoding="utf-8"))
+    if prior.get("status") != "SUCCESS_PLAN_STUDY" or prior.get("quick"):
+        raise ValueError("可用性专项要求完整的冻结开发基线")
+    studies = [str(p.resolve()) for p in args.nn_study_run or []]
+    if args.study_resume:
+        root = args.study_resume.resolve()
+        if not root.is_relative_to(C.EXPERIMENT_OUTPUT_ROOT.resolve()):
+            raise ValueError("续跑只能使用本项目实验目录")
+        summary = json.loads((root / C.REPORT_DIR / C.REPORT_JSON).read_text(encoding="utf-8"))
+        if (summary.get("reference") != str(reference) or summary.get("quick") != args.quick
+                or summary.get("nn_studies") != studies or summary.get("stages") != ["availability"]):
+            raise ValueError("可用性专项续跑参数不一致")
+        ctx = output.RunContext(root.name, root, root / C.SOURCE_DIR, root / C.MODEL_DIR,
+            root / C.REPORT_DIR, root / C.REPORT_DIR / C.REPORT_LOG, "plan_availability")
+        summary.update(status="RUNNING", errors=[])
+    else:
+        ctx = output.begin_run(C, mode="plan_availability", experimental=True)
+        summary = {"status": "RUNNING", "submittable": False, "quick": args.quick,
+            "reference": str(reference), "nn_studies": studies, "stages": ["availability"],
+            "validation_scope": "ABC_21_days_only; reused_development; no_D; no_test_inputs",
+            "results": [], "errors": [], "promotion": {},
+            "contract": {"scenarios": ["normal", "all_missing", "outage_day7"],
+                "missing_gain_pp": .5, "fold_target_drop_pp": .2,
+                "scenario_source": "predeclared_generic_failure_cases_not_test_masks"}}
+    _setup_logger(ctx.log_path)
+    started, elapsed = time.time(), summary.get("duration_seconds", 0.)
+    try:
+        output.write_source_snapshot(replace(ctx, source_dir=ctx.source_dir / "续跑")
+                                     if args.study_resume else ctx, C)
+        specs = [dict(f) for f in C.FOLDS if f["role"] == "tuning"][:2 if args.quick else 3]
+        cutoff = max(pd.Timestamp(s["start"]) + pd.Timedelta(days=s["days"] + 1) for s in specs)
+        prepared = prepare_data(C, cutoff=cutoff)
+        prepared.require_training_data()
+        if args.study_resume and summary.get("data_sources") != prepared.source_hashes:
+            raise ValueError("训练来源已变化，禁止复用专项模型")
+        summary["data_sources"] = prepared.source_hashes
+        summary["data_contract"] = data_contract_check(prepared)
+        if not summary["data_contract"]["passed"]:
+            raise ValueError("可用性专项数据契约失败")
+        _study_archive_reference(ctx.root, reference)
+        shutil.copyfile(reference / C.MODEL_DIR / "model_meta.json", ctx.model_dir / "model_meta.json")
+        summary["R0"] = []
+        for study_name in studies:
+            study = Path(study_name)
+            if not study.is_relative_to(C.ROOT.resolve()):
+                raise ValueError("冻结专项必须来自本项目")
+            frozen = json.loads((study / C.REPORT_DIR / C.REPORT_JSON).read_text(encoding="utf-8"))
+            if frozen.get("span") != "long" or set(frozen.get("folds", [])) != {"A", "B", "C"}:
+                raise ValueError("R0 仅接收完整 A/B/C 长期专项")
+            chosen = next(c for c in frozen["selection"] if c["kind"] == "ensemble")
+            predictions, baselines, truths, raw_diffs, pipeline_diffs = [], [], [], [], []
+            for spec in specs:
+                target = ctx.model_dir / "R0_long" / spec["name"]
+                if not target.exists():
+                    shutil.copytree(study / C.MODEL_DIR / "long" / spec["name"], target)
+                with np.load(target / "development_predictions.npz") as a:
+                    nn, tree, truth, profile = (a[k].copy() for k in ("prediction", "reference", "truth", "profile"))
+                    positions = a["positions"].copy()
+                old = ctx.model_dir / "long" / "baseline" / spec["name"]
+                meta = json.loads((old / "meta.json").read_text(encoding="utf-8"))
+                with np.load(old / "predictions.npz") as a:
+                    if not np.array_equal(positions, a["positions"]) or not np.allclose(truth, a["truth"], equal_nan=True):
+                        raise ValueError("长期融合对照时刻或标签不一致")
+                    raw_diffs.append(float(np.max(np.abs(tree - a["raw"]))))
+                    baselines.append(a["prediction"].copy())
+                pred = main_s.blend_cube(nn, tree, chosen["nn_weights"], C.HORIZONS_L, C.LONG_GROUPS)
+                pred = main_s.blend_cube(pred, profile, chosen["blend"], C.HORIZONS_L, C.LONG_GROUPS)
+                predictions.append(pred)
+                truths.append(truth)
+                # 由真实预测入口重载组件复算，不在单折重新选择部署权重。
+                import main_nn
+                neural_path = next(target.glob("nn_*.pt"))
+                probe_bundle = main_l.LongBundle(kind="nn_lgb_ens", features="hybrid", horizons=C.HORIZONS_L,
+                    blend=chosen["blend"], models={}, final_models=_study_load_models(old, meta["files"]),
+                    feature_names=meta["feature_names"], final_nn_bundle=main_nn.load_nn(neural_path),
+                    nn_weights=chosen["nn_weights"], lgb_kind="global", lgb_features="gas")
+                view, _, _, _ = _study_view(prepared, spec)
+                reconstructed = main_l.predict_long(probe_bundle, view, view.index[positions], use_final=True)
+                pipeline_diffs.append(float(np.max(np.abs(pred - reconstructed))))
+                if pipeline_diffs[-1] > 1e-5:
+                    raise ValueError("长期冻结融合未被真实预测入口复现")
+                np.savez_compressed(target / "predictions.npz", prediction=pred, truth=truth,
+                    positions=positions, profile=profile)
+                (target / "meta.json").write_text(json.dumps({**meta, "nn_weights": chosen["nn_weights"],
+                    "blend": chosen["blend"], "source_study": str(study)}, ensure_ascii=False, indent=2), encoding="utf-8")
+            result = main_s.load_promotion(predictions, baselines, truths, C.HORIZONS_L)
+            result.update(reference_raw_max_abs_diff=max(raw_diffs), operator_max_abs_diff=max(pipeline_diffs),
+                reason="main_pipeline_ranked_tree_components_before_profile_blending",
+                component_projection="before_ensemble_in_both_validation_and_inference",
+                source_study=str(study), frozen_nn_weights=chosen["nn_weights"], frozen_blend=chosen["blend"])
+            if max(raw_diffs) > 1e-8:
+                result.update(accepted=False, reason="tree_reference_not_identical")
+            summary["R0"].append(result)
+        for span, horizons, stride, kind in (("short", C.HORIZONS_S, C.TRAIN_STRIDE_SHORT, "direct"),
+                                            ("long", C.HORIZONS_L, C.TRAIN_STRIDE_LONG, "global")):
+            cached = []
+            for spec in specs:
+                LOGGER.info("可用性回放 %s/%s，目录=%s", span, spec["name"], ctx.root)
+                directory = ctx.model_dir / span / "baseline" / spec["name"]
+                scenarios, evaluation, truth, meta = _availability_fold_predictions(prepared, spec, horizons, directory)
+                with np.load(directory / "predictions.npz") as a:
+                    difference = float(np.max(np.abs(scenarios["normal"][0] - a["prediction"])))
+                if difference > 1e-5:
+                    raise ValueError("正常输入未复现冻结基线")
+                for name, (pred, missing) in scenarios.items():
+                    target = ctx.model_dir / span / "R1" / name / spec["name"]
+                    target.mkdir(parents=True, exist_ok=True)
+                    np.savez_compressed(target / "predictions.npz", prediction=pred, truth=truth,
+                        positions=evaluation, missing=missing)
+                    (target / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+                    item = {"stage": "R1", "span": span, "scenario": name, "fold": spec["name"],
+                            "score": main_s.score_cube(pred, truth, horizons), "normal_reload_diff": difference}
+                    summary["results"] = [r for r in summary["results"] if not all(r.get(k) == item[k]
+                        for k in ("stage", "span", "scenario", "fold"))] + [item]
+                cached.append({"spec": spec, "evaluation": evaluation, "truth": truth, "scenarios": scenarios})
+                output.write_report(ctx, summary)
+            for stage in ("R2", "R3"):
+                if stage == "R3" and summary["promotion"][span]["R2"]["accepted"]:
+                    break
+                raws, profiles, truths = [], [], []
+                scenario_raws = {s: [] for s in summary["contract"]["scenarios"]}
+                feature_set = "gas_no_power" if stage == "R2" else "gas"
+                for cache in cached:
+                    spec, evaluation = cache["spec"], cache["evaluation"]
+                    target = ctx.model_dir / span / stage / spec["name"]
+                    masked, _, _, ref = _study_view(prepared, spec)
+                    pristine = masked
+                    positions, _, _ = main_s._fold_positions(masked, spec, max(horizons))
+                    positions = positions[::C.QUICK_TRAIN_STRIDE if args.quick else stride]
+                    if stage == "R3":
+                        for offset in range(7 * C.STEPS_PER_DAY, ref, 21 * C.STEPS_PER_DAY):
+                            masked = masked.masked_power_gas_copy(masked.index[offset],
+                                masked.index[min(offset + 14 * C.STEPS_PER_DAY - 1, ref)])
+                    inference = pristine.masked_power_gas_copy(spec["start"])
+                    profile = main_s.baseline_cubes(inference, evaluation, horizons)["profile"]
+                    base = main_s.build_base_features(masked, include_targets=True)
+                    metadata_path = target / "meta.json"
+                    if metadata_path.exists():
+                        meta = json.loads(metadata_path.read_text(encoding="utf-8"))
+                        if meta["train_end"] != spec["train_end"] or meta["features"] != feature_set:
+                            raise ValueError("已有可用性模型契约不匹配")
+                        models, names = _study_load_models(target, meta["files"]), meta["feature_names"]
+                    else:
+                        LOGGER.info("训练 %s/%s/%s，features=%s", stage, span, spec["name"], feature_set)
+                        models, names = main_s._train_models(masked, base, positions, horizons, kind,
+                            feature_set, C.LGBM_TREES_QUICK if args.quick else C.LGBM_TREES_LONG, ref)
+                        files = _study_save_models(target, models)
+                        meta = {"kind": kind, "features": feature_set, "feature_names": names, "files": files,
+                            "span": span, "train_end": spec["train_end"],
+                            "max_training_target": str(masked.index[max(positions) + max(horizons)]),
+                            "block_mask_training_days": [14, 21] if stage == "R3" else None}
+                        metadata_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+                    raw = main_s._predict_models(inference, main_s.build_base_features(inference, include_targets=True),
+                        evaluation, horizons, kind, feature_set, models, names)
+                    loaded = _study_load_models(target, meta["files"])
+                    probe = evaluation[::max(1, len(evaluation) // 9)]
+                    reloaded = main_s._predict_models(inference, main_s.build_base_features(inference, include_targets=True),
+                        probe, horizons, kind, feature_set, loaded, names)
+                    reload_diff = float(np.max(np.abs(reloaded - raw[::max(1, len(evaluation) // 9)])))
+                    if reload_diff > 1e-8:
+                        raise ValueError("可用性模型重载不一致")
+                    raw = main_s.enforce_physics(raw, fallback=profile)
+                    for scenario in scenario_raws:
+                        if stage == "R2" or scenario == "all_missing":
+                            scenario_raws[scenario].append(raw)
+                            continue
+                        start = (pd.Timestamp(spec["start"]) + pd.Timedelta(days=7)
+                                 if scenario == "outage_day7" else None)
+                        view = pristine if start is None else pristine.masked_power_gas_copy(start)
+                        extra_raw = main_s._predict_models(view,
+                            main_s.build_base_features(view, include_targets=True), evaluation,
+                            horizons, kind, feature_set, models, names)
+                        scenario_raws[scenario].append(main_s.enforce_physics(extra_raw, fallback=profile))
+                    raws.append(raw)
+                    profiles.append(profile)
+                    truths.append(cache["truth"])
+                    meta["reload_max_abs_diff"] = reload_diff
+                    metadata_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+                    np.savez_compressed(target / "predictions.npz", prediction=raw, raw=raw,
+                        profile=profile, truth=cache["truth"], positions=evaluation)
+                    output.write_report(ctx, summary)
+                blend = main_s.select_blend(raws, profiles, truths, horizons, main_s._groups_for(horizons))
+                tests = {}
+                for scenario in summary["contract"]["scenarios"]:
+                    predictions = [main_s.blend_cube(p, b, blend, horizons, main_s._groups_for(horizons))
+                                   for p, b in zip(scenario_raws[scenario], profiles)]
+                    baseline = [c["scenarios"][scenario][0] for c in cached]
+                    dispatched = [np.where(c["scenarios"][scenario][1][:, None, None], p, b)
+                                  for p, b, c in zip(predictions, baseline, cached)]
+                    test = main_s.load_promotion(dispatched, baseline, truths, horizons)
+                    test["paired_block_interval"] = _availability_interval(dispatched, baseline, truths)
+                    tests[scenario] = test
+                    for pred, cache in zip(dispatched, cached):
+                        target = ctx.model_dir / span / stage / scenario / cache["spec"]["name"]
+                        target.mkdir(parents=True, exist_ok=True)
+                        meta = json.loads((target.parent.parent / cache["spec"]["name"] / "meta.json").read_text(encoding="utf-8"))
+                        meta["blend"] = blend
+                        (target / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+                        np.savez_compressed(target / "predictions.npz", prediction=pred, truth=cache["truth"],
+                            positions=cache["evaluation"])
+                protected = all(v >= -.2 for t in tests.values() for d in t["fold_target_deltas_pp"] for v in d.values())
+                accepted = len(specs) == 3 and protected and tests["all_missing"]["mean_gain_pp"] >= .5
+                summary["promotion"].setdefault(span, {})[stage] = {"accepted": bool(accepted),
+                    "blend": blend, "tests": tests, "normal_path": "original_unless_current_power_gas_missing"}
+                LOGGER.info("完成 %s/%s：缺耗气提升 %.4fpp，晋级=%s", stage, span,
+                    tests["all_missing"]["mean_gain_pp"], accepted)
+                output.write_report(ctx, summary)
+            if not any(item["accepted"] for item in summary["promotion"][span].values()):
+                # 只重用同折预测试验一个共用权重，避免平均收益掩盖最差工况退化。
+                r2 = summary["promotion"][span]["R2"]
+                candidate_paths = {scenario: [] for scenario in summary["contract"]["scenarios"]}
+                for scenario in candidate_paths:
+                    for cache in cached:
+                        path = ctx.model_dir / span / "R2" / scenario / cache["spec"]["name"] / "predictions.npz"
+                        with np.load(path) as arrays:
+                            candidate_paths[scenario].append(arrays["prediction"].copy())
+                selected_mix = None
+                for weight in C.SELECTION["blend_grid"]:
+                    tests = {}
+                    for scenario, values in candidate_paths.items():
+                        before = [c["scenarios"][scenario][0] for c in cached]
+                        estimates = [weight * a + (1. - weight) * b for a, b in zip(values, before)]
+                        tests[scenario] = main_s.load_promotion(estimates, before, truths, horizons)
+                    protected = all(v >= -.2 for t in tests.values() for d in t["fold_target_deltas_pp"] for v in d.values())
+                    gain = tests["all_missing"]["mean_gain_pp"]
+                    if protected and gain >= .5 and (selected_mix is None or gain > selected_mix[0]):
+                        selected_mix = (gain, float(weight), tests)
+                if selected_mix:
+                    gain, weight, tests = selected_mix
+                    for scenario, values in candidate_paths.items():
+                        before = [c["scenarios"][scenario][0] for c in cached]
+                        estimates = [weight * a + (1. - weight) * b for a, b in zip(values, before)]
+                        tests[scenario]["paired_block_interval"] = _availability_interval(estimates, before, truths)
+                        for pred, cache in zip(estimates, cached):
+                            target = ctx.model_dir / span / "R2_mix" / scenario / cache["spec"]["name"]
+                            target.mkdir(parents=True, exist_ok=True)
+                            meta = json.loads((ctx.model_dir / span / "R2" / cache["spec"]["name"] / "meta.json").read_text(encoding="utf-8"))
+                            meta.update(blend=r2["blend"], fallback_weight=weight, model_stage="R2")
+                            (target / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+                            np.savez_compressed(target / "predictions.npz", prediction=pred, truth=cache["truth"], positions=cache["evaluation"])
+                    summary["promotion"][span]["R2_mix"] = {"accepted": len(specs) == 3,
+                        "model_stage": "R2", "fallback_weight": weight, "blend": r2["blend"], "tests": tests,
+                        "search_scope": "one_common_weight_from_existing_grid; frozen_ABC; no_D"}
+                    LOGGER.info("完成 R2_mix/%s：共用权重 %.2f，提升 %.4fpp", span, weight, gain)
+                    output.write_report(ctx, summary)
+        _availability_joint_mix(ctx, summary)
+        summary["status"] = "SUCCESS_PLAN_STUDY"
+        summary["R4_R5"] = {"status": "RESEARCH_ONLY_PREREQUISITES_UNRESOLVED",
+            "reason": "historical_consumption_envelope; holder_mapping_and_real_net_gas_unverified; feedback_availability_requires_separate_validation"}
+        return 0
+    except Exception as exc:
+        LOGGER.exception("可用性专项失败")
+        summary["status"] = "FAILED"
+        summary["errors"].append(f"{type(exc).__name__}: {exc}")
+        return 1
+    finally:
+        summary["duration_seconds"] = elapsed + time.time() - started
+        output.write_report(ctx, summary)
+        LOGGER.info("可用性专项结果: %s", ctx.root)
+
+
+def run_plan_study(args) -> int:
+    """方案专项只访问开发折，不触发正式推理、D 重选或交付打包。"""
+    if args.plan_study == "availability":
+        return run_availability_study(args)
+    stages = set(args.plan_study.split(","))
+    allowed = {"baseline", "pressure", "E1", "E2", "E3", "E4", "E5", "E6"}
+    if not stages or stages - allowed or (stages & {"baseline", "pressure"} and len(stages) != 1):
+        raise ValueError("方案阶段仅允许 baseline、pressure 或 E1～E6 的组合")
+    reference = args.study_reference.resolve()
+    if not reference.is_relative_to(C.ROOT.resolve()):
+        raise ValueError("研究基线必须来自本项目")
+    if stages != {"baseline"}:
+        previous = json.loads((reference / C.REPORT_DIR / C.REPORT_JSON).read_text(encoding="utf-8"))
+        if previous.get("status") != "SUCCESS_PLAN_STUDY" or previous.get("quick"):
+            raise ValueError("候选研究要求已完成的全量开发基线")
+    if args.study_resume:
+        root = args.study_resume.resolve()
+        if not root.is_relative_to(C.EXPERIMENT_OUTPUT_ROOT.resolve()) or stages - {"E4", "E5", "E6"}:
+            raise ValueError("续跑仅支持 tmp/tmp_outputs 内的资源方案专项")
+        summary = json.loads((root / C.REPORT_DIR / C.REPORT_JSON).read_text(encoding="utf-8"))
+        if (summary["reference"] != str(reference) or set(summary["stages"]) != stages or summary["quick"] != args.quick
+                or summary["status"] == "SUCCESS_PLAN_STUDY"):
+            raise ValueError("续跑参数不匹配或该专项已完成")
+        ctx = output.RunContext(root.name, root, root / C.SOURCE_DIR, root / C.MODEL_DIR,
+            root / C.REPORT_DIR, root / C.REPORT_DIR / C.REPORT_LOG, "plan_" + "_".join(sorted(stages)))
+        summary["status"] = "RUNNING"
+        summary.setdefault("resumes", []).append({"time": str(pd.Timestamp.now()), "previous_errors": summary["errors"][:]})
+        summary["duration_scope"] = "recorded_completed_invocations_only; interrupted_process_time_unavailable"
+        summary["errors"] = []
+    else:
+        ctx = output.begin_run(C, mode="plan_" + "_".join(sorted(stages)), experimental=True)
+        summary = {"status": "RUNNING", "submittable": False, "quick": args.quick,
+            "reference": str(reference), "stages": sorted(stages), "results": [], "errors": [],
+            "validation_scope": "ABC_21_days_only; no_D; no_half_test; no_formal_delivery"}
+    _setup_logger(ctx.log_path)
+    started = time.time()
+    previous_seconds = summary.get("duration_seconds", 0.)
+    try:
+        if args.study_resume:
+            from dataclasses import replace
+            output.write_source_snapshot(replace(ctx, source_dir=ctx.source_dir / "续跑"), C)
+        else:
+            output.write_source_snapshot(ctx, C)
+        specs = [dict(f) for f in C.FOLDS if f["role"] == "tuning"][:2 if args.quick else 3]
+        if stages == {"pressure"}:
+            specs = [{"name": "P", "role": "diagnostic", "start": "2025-10-01 00:00:00",
+                      "train_end": "2025-09-30 23:45:00", "days": 9}]
+            summary["validation_scope"] = "recent_9_day_diagnosis_only; previously_viewed_distribution; no_reselection"
+        prepared = prepare_data(C, cutoff=max(pd.Timestamp(f["start"]) + pd.Timedelta(days=f["days"] + 1) for f in specs))
+        prepared.require_training_data()
+        if args.study_resume and summary.get("data_sources") != prepared.source_hashes:
+            raise ValueError("训练数据来源变化，禁止续用旧折外数组")
+        summary["data_sources"] = prepared.source_hashes
+        summary["data_contract"] = data_contract_check(prepared)
+        if not summary["data_contract"]["passed"]:
+            raise ValueError("方案专项数据契约未通过")
+        if stages == {"baseline"}:
+            import shutil
+            shutil.copyfile(reference / C.MODEL_DIR / "model_meta.json", ctx.model_dir / "model_meta.json")
+            baseline_summary = json.loads((reference / C.REPORT_DIR / C.REPORT_JSON).read_text(encoding="utf-8"))
+            summary["E0"] = {"source": str(reference), "physical_feasibility_certified": False,
+                "resource_mode": "historical_consumption_envelope",
+                "physical_parameters": baseline_summary["optimization"].get("summary", baseline_summary["optimization"])}
+        else:
+            import shutil
+            shutil.copyfile(reference / C.MODEL_DIR / "model_meta.json", ctx.model_dir / "model_meta.json")
+            _study_archive_reference(ctx.root, reference)
+        if "E1" in stages or stages == {"baseline"}:
+            _study_e0(ctx, summary, prepared, specs, reference)
+        if stages & {"baseline", "E1", "E2", "E3"}:
+            _study_load_stage(ctx, summary, prepared, specs, reference, stages, args.quick)
+        if stages == {"pressure"}:
+            _study_load_stage(ctx, summary, prepared, specs, reference, {"baseline"}, args.quick)
+            summary["diagnostic_scores"] = summary.pop("promotion")
+            for item in summary["diagnostic_scores"].values():
+                item["baseline"]["scope"] = "recent_9_day_diagnosis_only_not_independent"
+        if stages & {"E4", "E5", "E6"}:
+            _study_resource_stage(ctx, summary, prepared, specs, reference, stages, args.quick)
+        summary["status"] = "SUCCESS_PLAN_STUDY"
+        return 0
+    except Exception as exc:
+        LOGGER.exception("方案专项失败")
+        summary["status"] = "FAILED"
+        summary["errors"].append(f"{type(exc).__name__}: {exc}")
+        return 1
+    finally:
+        summary["duration_seconds"] = previous_seconds + time.time() - started
+        output.write_report(ctx, summary)
+        LOGGER.info("方案专项结果: %s", ctx.root)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="AIC 半决赛煤气发电预测与优化")
     parser.add_argument("command", nargs="?", default="infer",
@@ -848,8 +2164,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--nn-reblend", type=Path, help="重用ABC开发预测选择NN与树的统一融合权重")
     parser.add_argument("--reuse-run", type=Path, help="infer复用本项目已归档的final模型")
     parser.add_argument("--nn-study-run", type=Path, action="append", help="infer读取已通过ABC门槛的冻结NN专项")
+    parser.add_argument("--availability-study-run", type=Path, help="infer按完整可用性专项冻结配方重训final，不重评D")
+    parser.add_argument("--plan-study", help="方案开发专项：baseline、pressure、availability 或 E1～E6")
+    parser.add_argument("--study-reference", type=Path, help="原始运行或已生成的方案开发基线")
+    parser.add_argument("--study-resume", type=Path, help="续跑已中断的资源方案专项，核验后复用已完成数组")
     args = parser.parse_args(argv)
     C.PROGRESS_ENABLED = args.progress
+    if args.study_resume and not args.plan_study:
+        parser.error("--study-resume 必须搭配 --plan-study")
+    if args.plan_study:
+        if args.command != "run" or not args.experiment or args.study_reference is None:
+            parser.error("--plan-study 必须搭配 run --experiment --study-reference")
+        return run_plan_study(args)
     if args.reuse_run and args.command != "infer":
         parser.error("--reuse-run 只用于 infer")
     if args.nn_only:
@@ -862,7 +2188,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.nn_study_run and not args.reuse_run:
             parser.error("--nn-study-run 必须同时指定 --reuse-run")
         return run_infer(quick=args.quick, experimental=args.experiment,
-                         reuse_run=args.reuse_run, nn_studies=args.nn_study_run)
+                         reuse_run=args.reuse_run, nn_studies=args.nn_study_run,
+                         availability_study=args.availability_study_run)
     if args.command == "self-check":
         return run_self_check()
     if args.command == "verify":

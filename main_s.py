@@ -61,16 +61,31 @@ def training_weights(prepared: PreparedData, positions: np.ndarray,
 
 def design_inputs(prepared: PreparedData, base: pd.DataFrame,
                   positions: np.ndarray, horizons: tuple[int, ...],
-                  features: str) -> tuple[dict[str, np.ndarray], list[str]]:
+                  features: str, profile_state: dict | None = None,
+                  future_features: dict | None = None) -> tuple[dict[str, np.ndarray], list[str]]:
     """构造与提前量相关的目标时刻日历、画像特征。"""
     extras = target_calendar(prepared, positions, horizons)
-    ratio = fuel_level_ratio(prepared, positions)
+    # 少特征分支不得通过燃料缩放重新读到被排除的发电耗气。
+    ratio = (np.ones(len(positions)) if features == "gas_no_power"
+             else fuel_level_ratio(prepared, positions))
     extras["fuel_profile_ratio"] = np.repeat(ratio[:, None], len(horizons), axis=1)
     # 同槽位画像与最近可见水平都来自起报点之前的历史，部署时同样可得；
     # 它们不是未来真值，放入所有特征集可避免树模型只靠当前气量外推。
     for target in C.TARGETS:
         extras[f"profile_{target}"] = target_slot_profile(
             prepared, positions, horizons, target)
+        if profile_state:
+            from data_cleaning.pipeline import state_slot_profile
+            values, count, age, distance = state_slot_profile(
+                prepared, positions, horizons, target, profile_state)
+            extras[f"profile_{target}"] = values
+            extras[f"profile_{target}_count"] = count
+            extras[f"profile_{target}_age"] = age
+            extras[f"profile_{target}_distance"] = distance
+    for key, value in (future_features or {}).items():
+        if np.asarray(value).shape != (len(positions), len(horizons)):
+            raise ValueError("折外资源特征与起报点/提前量不匹配")
+        extras[key] = value
     names = list(base.columns) + list(extras.keys()) + ["h"]
     return extras, names
 
@@ -151,6 +166,7 @@ def score_cube(pred: np.ndarray, truth: np.ndarray,
         actual = truth[:, :, ti]
         estimate = pred[:, :, ti]
         valid = np.isfinite(actual) & (actual > 0) & np.isfinite(estimate)
+        all_valid = np.isfinite(actual) & np.isfinite(estimate)
         rel = np.abs(estimate - actual) / np.where(actual > 0, actual, np.nan)
         score = 100.0 * (1.0 - float(np.nanmean(rel)))
         zero_mask = np.isfinite(actual) & (actual == 0) & np.isfinite(estimate)
@@ -162,6 +178,12 @@ def score_cube(pred: np.ndarray, truth: np.ndarray,
             "zero_load_mae": (float(np.nanmean(np.abs(estimate[zero_mask])))
                               if zero_mask.any() else None),
             "valid_points": int(valid.sum()),
+            "bias_ratio": float(np.sum(estimate[all_valid] - actual[all_valid]) / np.sum(actual[all_valid])) if valid.any() else None,
+            "prediction_std_mw": float(np.std(estimate[all_valid])) if all_valid.any() else None,
+            "truth_std_mw": float(np.std(actual[all_valid])) if all_valid.any() else None,
+            "lead_groups": {name: score_cell(pred, truth, ti,
+                [j for j, h in enumerate(horizons) if lo <= h <= hi])
+                for name, lo, hi in _groups_for(horizons)},
         }
         target_scores.append(score)
         result["per_horizon"][target] = {
@@ -325,6 +347,10 @@ def _feature_columns(base: pd.DataFrame, features: str) -> list[str]:
     - target：全列，仅作对照基线，不参与部署。
     """
     cols = list(base.columns)
+    if features == "gas_no_power":
+        return [c for c in _gas_columns(base) if not c.startswith((
+            "d_use_", "d_fuel_proxy", "obs_d_use_", "obs_d_fuel_proxy",
+            "ratio_d_use_", "load_generator_use_"))]
     if features == "gas":
         return _gas_columns(base)
     if features == "gaslast":
@@ -340,11 +366,15 @@ def _groups_for(horizons: tuple[int, ...]):
 def _train_models(prepared: PreparedData, base_all: pd.DataFrame,
                   positions: np.ndarray, horizons: tuple[int, ...],
                   kind: str, features: str, num_round: int,
-                  ref_pos: int) -> tuple[dict, list[str]]:
+                  ref_pos: int, profile_state: dict | None = None,
+                  future_features: dict | None = None) -> tuple[dict, list[str]]:
+    prepared.require_training_data()
+    if len(positions) == 0 or np.max(positions) + max(horizons) > ref_pos:
+        raise ValueError("负荷训练目标跨越冻结截止点")
     columns = _feature_columns(base_all, features)
     base = base_all[columns]
     base_values = base.to_numpy(dtype=np.float32)
-    extras, names = design_inputs(prepared, base, positions, horizons, features)
+    extras, names = design_inputs(prepared, base, positions, horizons, features, profile_state, future_features)
     extra_names = names[len(columns):-1]
     weights = training_weights(prepared, positions, horizons, ref_pos)
     models: dict = {}
@@ -380,11 +410,12 @@ def _train_models(prepared: PreparedData, base_all: pd.DataFrame,
 def _predict_models(prepared: PreparedData, base_all: pd.DataFrame,
                     positions: np.ndarray, horizons: tuple[int, ...],
                     kind: str, features: str, models: dict,
-                    feature_names: list[str]) -> np.ndarray:
+                    feature_names: list[str], profile_state: dict | None = None,
+                    future_features: dict | None = None) -> np.ndarray:
     columns = _feature_columns(base_all, features)
     base = base_all[columns]
     base_values = base.to_numpy(dtype=np.float32)
-    extras, names = design_inputs(prepared, base, positions, horizons, features)
+    extras, names = design_inputs(prepared, base, positions, horizons, features, profile_state, future_features)
     extra_names = names[len(columns):-1]
     if names != feature_names:
         raise ValueError("预测特征顺序与训练不一致")
@@ -425,6 +456,82 @@ def _predict_models(prepared: PreparedData, base_all: pd.DataFrame,
     return out
 
 
+def future_resource_features(prepared: PreparedData, positions: np.ndarray,
+                             forecast: np.ndarray, widths: np.ndarray) -> dict:
+    from data_cleaning import resource_series
+    if forecast.shape != (len(positions), 96, 3) or widths.shape != forecast.shape:
+        raise ValueError("未来资源特征必须由匹配起报点的完整预测路径构造")
+    if not np.isfinite(forecast).all():
+        raise ValueError("资源点预测含非有限数")
+    current = resource_series(prepared).to_numpy(dtype=float)[positions]
+    result = {}
+    for gi, gas in enumerate(C.RESOURCE_NAMES):
+        result[f"future_{gas}"] = forecast[:, :, gi]
+        result[f"future_{gas}_width"] = widths[:, :, gi]
+        result[f"future_{gas}_change"] = (forecast[:, :, gi] - current[:, gi, None]) / np.maximum(np.abs(current[:, gi, None]), 1.)
+        for count in (8, 32, 96):
+            amount = forecast[:, :count, gi].sum(axis=1) * .25
+            result[f"future_{gas}_volume_{count}"] = np.repeat(amount[:, None], 96, axis=1)
+    return result
+
+
+def fit_allocation(prepared: PreparedData, base: pd.DataFrame, positions: np.ndarray,
+                   horizons: tuple[int, ...], ref_pos: int, rounds: int,
+                   profile_state: dict | None = None) -> tuple:
+    """只学习小机组组分配，评分时总负荷由保护基线提供。"""
+    prepared.require_training_data()
+    if len(positions) == 0 or max(positions) + max(horizons) > ref_pos:
+        raise ValueError("分配模型训练目标跨越冻结截止点")
+    base = base[_feature_columns(base, "gas")]
+    extras, names = design_inputs(prepared, base, positions, horizons, "gas", profile_state)
+    X, y1, weights = stack_training(prepared, base.to_numpy(dtype=np.float32), extras,
+        list(extras), positions, horizons, "generator_1",
+        training_weights(prepared, positions, horizons, ref_pos))
+    # 两目标缺失位置可能不同，联合筛选后才能构造比例监督。
+    first = np.concatenate([prepared.labels.generator_1.to_numpy()[positions + h] for h in horizons])
+    total = np.concatenate([prepared.labels.generator_all.to_numpy()[positions + h] for h in horizons])
+    total = total[np.isfinite(first)]
+    valid = np.isfinite(total) & (total > 0) & (y1 >= 0) & (y1 <= total)
+    ratio = y1[valid] / total[valid]
+    weights = weights[valid] * total[valid] / np.maximum(y1[valid], 1.)
+    model = lgb.train(C.LGBM_BASE, lgb.Dataset(X[valid], label=ratio,
+        weight=weights / max(weights.mean(), 1e-9), feature_name=names), num_boost_round=rounds)
+    return {"allocation": model}, names
+
+
+def predict_allocation(prepared: PreparedData, base: pd.DataFrame, positions: np.ndarray,
+                       horizons: tuple[int, ...], models: dict, names: list,
+                       protected: np.ndarray, profile_state: dict | None = None) -> np.ndarray:
+    base = base[_feature_columns(base, "gas")]
+    extras, expected = design_inputs(prepared, base, positions, horizons, "gas", profile_state)
+    if names != expected:
+        raise ValueError("分配模型特征顺序不一致")
+    X = np.concatenate([_block(base.to_numpy(dtype=np.float32), positions, extras,
+                        list(extras), h, j) for j, h in enumerate(horizons)])
+    ratio = np.clip(models["allocation"].predict(X).reshape(len(horizons), len(positions)).T, 0., 1.)
+    result = protected.copy()
+    total = protected[:, :, 1]
+    result[:, :, 0] = np.clip(ratio * total, np.maximum(total - 240., 0.), np.minimum(total, 200.))
+    return result
+
+
+def load_promotion(predictions: list, baseline: list, truths: list,
+                   horizons: tuple[int, ...]) -> dict:
+    if not predictions or len(predictions) != len(baseline) or len(predictions) != len(truths):
+        raise ValueError("负荷晋级必须逐折成对比较，不能截断缺失折")
+    scores = [score_cube(p, y, horizons) for p, y in zip(predictions, truths)]
+    references = [score_cube(p, y, horizons) for p, y in zip(baseline, truths)]
+    gain = float(np.mean([a["accuracy"] - b["accuracy"] for a, b in zip(scores, references)]))
+    deltas = [{t: a["targets"][t]["accuracy"] - b["targets"][t]["accuracy"]
+               for t in C.TARGETS} for a, b in zip(scores, references)]
+    passed = (len(scores) == 3 and gain >= C.SELECTION["min_mean_gain_pp"]
+              and all(v >= -C.SELECTION["max_worst_fold_drop_pp"] for d in deltas for v in d.values()))
+    return {"accepted": bool(passed), "mean_gain_pp": gain,
+            "mean_accuracy": float(np.mean([s["accuracy"] for s in scores])),
+            "fold_target_deltas_pp": deltas, "scores": scores,
+            "scope": "ABC_21_days" if len(scores) == 3 else "screen_only"}
+
+
 @dataclass
 class ShortBundle:
     kind: str
@@ -445,6 +552,7 @@ class ShortBundle:
     train_seconds: float = 0.0
     train_end: str | None = None
     final_train_end: str | None = None
+    final_availability: dict | None = None
 
 
 def _fold_positions(prepared: PreparedData, fold: dict,
@@ -601,6 +709,7 @@ def train_short(prepared: PreparedData, folds: list[dict], quick: bool = False) 
                 confirm_masked, c_base_x, c_eval_x, C.HORIZONS_S,
                 chosen.get("lgb_kind", "direct"), chosen.get("lgb_features", "gas"),
                 ens_models, ens_names)
+            lgb_pred = enforce_physics(lgb_pred)
             confirm_pred = blend_cube(confirm_pred, lgb_pred, chosen["nn_weights"], C.HORIZONS_S, C.SHORT_GROUPS)
             confirm_models, confirm_names = ens_models, ens_names
     else:
@@ -639,13 +748,13 @@ def train_short(prepared: PreparedData, folds: list[dict], quick: bool = False) 
             final_models, final_names = _train_models(
                 prepared, fb, fp, C.HORIZONS_S,
                 chosen.get("lgb_kind", "direct"), chosen.get("lgb_features", "gas"),
-                num_round, len(prepared.index) - max(C.HORIZONS_S))
+                num_round, len(prepared.index) - 1)
     else:
         final_positions = np.arange(max(0, C.PROFILE_DAYS * C.STEPS_PER_DAY),
                                     len(prepared.index) - max(C.HORIZONS_S))
         final_positions = final_positions[::stride]
         final_base = build_base_features(prepared, include_targets=True)
-        final_ref = len(prepared.index) - max(C.HORIZONS_S)
+        final_ref = len(prepared.index) - 1
         final_models, final_names = _train_models(
             prepared, final_base, final_positions, C.HORIZONS_S,
             chosen["kind"], chosen["features"], num_round, final_ref)
@@ -672,7 +781,68 @@ def train_short(prepared: PreparedData, folds: list[dict], quick: bool = False) 
                 "confirm": confirm_score},
         train_rows=rows_trained, train_seconds=time.time() - started,
         train_end=confirm_fold["train_end"],
-        final_train_end=str(prepared.labels[list(C.TARGETS)].dropna().index[-1]))
+        final_train_end=str(prepared.labels[list(C.TARGETS)].dropna().index[-1]),
+        final_availability=train_availability_fallback(prepared, C.HORIZONS_S,
+            C.AVAILABILITY_FALLBACK.get("short"), quick))
+
+
+def train_availability_fallback(prepared: PreparedData, horizons: tuple[int, ...],
+                                recipe: dict | None, quick: bool = False) -> dict | None:
+    """只按已冻结配方重训最终缺测分支，不重新访问开发折或确认折。"""
+    if not recipe:
+        return None
+    prepared.require_training_data()
+    ref = len(prepared.index) - 1
+    training = prepared
+    if recipe["features"] == "gas":
+        for offset in range(7 * C.STEPS_PER_DAY, ref, 21 * C.STEPS_PER_DAY):
+            training = training.masked_power_gas_copy(training.index[offset],
+                training.index[min(offset + 14 * C.STEPS_PER_DAY - 1, ref)])
+    stride = C.TRAIN_STRIDE_SHORT if max(horizons) <= 8 else C.TRAIN_STRIDE_LONG
+    positions = np.arange(C.PROFILE_DAYS * C.STEPS_PER_DAY, ref - max(horizons) + 1,
+                          C.QUICK_TRAIN_STRIDE if quick else stride)
+    models, names = _train_models(training, build_base_features(training, include_targets=True),
+        positions, horizons, recipe["kind"], recipe["features"],
+        C.LGBM_TREES_QUICK if quick else C.LGBM_TREES_LONG, ref)
+    return {**recipe, "models": models, "feature_names": names,
+            "train_end": str(training.index[ref]), "role": "final"}
+
+
+def apply_availability_fallback(bundle, prepared, positions, prediction, use_final):
+    state = getattr(bundle, "final_availability", None)
+    if not use_final or not state:
+        return prediction
+    if pd.Timestamp(state["train_end"]) >= prepared.index[positions.min()]:
+        raise ValueError("缺测分支的训练截止进入推理窗口")
+    current = prepared.frame[["d_use_blast", "d_use_coke", "d_use_converter"]]
+    missing = ~np.isfinite(current.to_numpy(dtype=float)[positions]).all(axis=1)
+    if not missing.any():
+        return prediction
+    selected = positions[missing]
+    profile = baseline_cubes(prepared, selected, bundle.horizons)["profile"]
+    raw = _predict_models(prepared, build_base_features(prepared, include_targets=True),
+        selected, bundle.horizons, state["kind"], state["features"], state["models"], state["feature_names"])
+    raw = enforce_physics(raw, fallback=profile)
+    result = prediction.copy()
+    candidate = blend_cube(raw, profile, state["blend"], bundle.horizons,
+                            _groups_for(bundle.horizons))
+    weight = float(state.get("fallback_weight", 1.))
+    if not 0. <= weight <= 1.:
+        raise ValueError("缺测分支融合权重超出范围")
+    reference = result[missing]
+    target_weights = state.get("fallback_weights")
+    if (weight < 1. or target_weights) and state.get("reference_recipe"):
+        recipe = state["reference_recipe"]
+        if (bundle.lgb_kind or bundle.kind) != recipe["kind"]:
+            raise ValueError("缺测分支的保护参考与实际树组件不匹配")
+        raw_reference = _predict_models(prepared, build_base_features(prepared, include_targets=True),
+            selected, bundle.horizons, recipe["kind"], recipe["features"], bundle.final_models, bundle.feature_names)
+        reference = blend_cube(enforce_physics(raw_reference, fallback=profile), profile,
+            recipe["blend"], bundle.horizons, _groups_for(bundle.horizons))
+    result[missing] = (blend_cube(candidate, reference, target_weights, bundle.horizons,
+                                  _groups_for(bundle.horizons)) if target_weights else
+                       weight * candidate + (1. - weight) * reference)
+    return result
 
 
 def predict_short(bundle: ShortBundle, prepared: PreparedData,
@@ -695,6 +865,7 @@ def predict_short(bundle: ShortBundle, prepared: PreparedData,
                 prepared, base_all, positions, C.HORIZONS_S,
                 bundle.lgb_kind or "direct", bundle.lgb_features or "gas",
                 models, bundle.feature_names)
+            lgb_pred = enforce_physics(lgb_pred, fallback=baselines["profile"])
             pred = (blend_cube(pred, lgb_pred, bundle.nn_weights, C.HORIZONS_S, C.SHORT_GROUPS)
                     if bundle.nn_weights else (pred + lgb_pred) / 2.0)
     else:
@@ -704,5 +875,6 @@ def predict_short(bundle: ShortBundle, prepared: PreparedData,
                                bundle.kind, bundle.features, models,
                                bundle.feature_names)
     pred = enforce_physics(pred, fallback=baselines["profile"])
-    return blend_cube(pred, baselines["profile"], bundle.blend,
-                      C.HORIZONS_S, C.SHORT_GROUPS)
+    result = blend_cube(pred, baselines["profile"], bundle.blend,
+                        C.HORIZONS_S, C.SHORT_GROUPS)
+    return apply_availability_fallback(bundle, prepared, positions, result, use_final)

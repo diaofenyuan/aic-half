@@ -239,8 +239,17 @@ def load_final_models(directory: Path):
             nn_weights=item.get("nn_weights", {}),
             lgb_features=item.get("lgb_features"), selection=report[name]["selection"], scores=item["scores"],
             train_end=item["train_end"], final_train_end=item["train_end"]))
+        if item.get("availability"):
+            state = dict(item["availability"])
+            directory = model_root / name / "final_availability"
+            state["models"] = {}
+            for tag, filename in artifacts["availability"]["files"].items():
+                key = (tag.rsplit("__", 1)[0], int(tag.rsplit("__", 1)[1])) if "__" in tag else tag
+                state["models"][key] = lgb.Booster(model_str=(directory / filename).read_text(encoding="utf-8"))
+            bundles[-1].final_availability = state
     item, artifacts = meta["resource"], meta["artifacts"]["resource"]
-    models = {tag: lgb.Booster(model_str=(model_root / "resource" / "final" / filename).read_text(encoding="utf-8"))
+    from main_opt import load_resource_model
+    models = {tag: load_resource_model((model_root / "resource" / "final" / filename).read_text(encoding="utf-8"))
               for tag, filename in artifacts["final"]["files"].items()}
     neural = main_nn.load_resource_nn(model_root / artifacts["nn"]["path"]) if "nn" in artifacts else None
     resource = ResourceBundle(models={}, final_models=models,
@@ -268,7 +277,8 @@ def _save_boosters(directory: Path, prefix: str, models: dict,
         booster.save_model(str(temp_path))
         # LightGBM 的 C++ 层在 Windows 下无法直接读写中文路径；
         # 先写 ASCII 临时目录，再用 Python 文件系统移动并以 model_str 复载。
-        loaded = lgb.Booster(model_str=temp_path.read_text(encoding="utf-8"))
+        from main_opt import load_resource_model
+        loaded = load_resource_model(temp_path.read_text(encoding="utf-8"))
         same = np.allclose(booster.predict(probe), loaded.predict(probe), rtol=1e-6, atol=1e-6)
         reload_ok &= bool(same)
         shutil.move(str(temp_path), str(directory / file_name))
@@ -292,6 +302,12 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
             info = _save_boosters(ctx.model_dir / name / role, prefix, models,
                                   bundle.feature_names, temp_dir)
             summary[name][role] = info
+            summary["reload_ok"] &= info["reload_ok"]
+        availability = getattr(bundle, "final_availability", None) if use_final else None
+        if availability:
+            info = _save_boosters(ctx.model_dir / name / "final_availability", "availability",
+                availability["models"], availability["feature_names"], temp_dir)
+            summary[name]["availability"] = info
             summary["reload_ok"] &= info["reload_ok"]
         nn = getattr(bundle, "final_nn_bundle" if use_final else "nn_bundle", None)
         if nn is not None:
@@ -333,7 +349,9 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
 
     def forecast_meta(bundle):
         nn = getattr(bundle, "final_nn_bundle" if use_final else "nn_bundle", None)
+        availability = getattr(bundle, "final_availability", None) if use_final else None
         return {"kind": bundle.kind, "features": bundle.features,
+                "availability": {k: v for k, v in availability.items() if k != "models"} if availability else None,
                 "blend": bundle.blend, "feature_names": bundle.feature_names,
                 "lgb_kind": bundle.lgb_kind, "lgb_features": bundle.lgb_features,
                 "nn_weights": bundle.nn_weights,
