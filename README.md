@@ -3,9 +3,9 @@
 ## 运行
 
 ```powershell
-python main.py            # 完整链路（历史 21 天开发验证）——须由真人启动或明确授权
-python main.py infer --experiment # 历史验证及冻结训练后，对半决赛测试集推理——须由真人启动
-python main.py --quick    # 单折开发模式
+python main.py            # 正式半决赛完整测试推理（默认 infer）——须由真人启动或明确授权
+python main.py infer      # 与默认入口相同，训练冻结后生成半决赛结果包
+python main.py run --quick # A/B 历史开发验证
 python main.py infer --quick
 python main.py run --experiment # 获准后的全量开发实验，写入 tmp/tmp_outputs
 python main.py doctor     # 只读扫描数据目录
@@ -36,6 +36,11 @@ python main.py run --experiment --nn-only --nn-span resource --folds A,B
 
 `--quick` 的完整运行产物写入 `tmp/tmp_outputs/<run_id>/`。开发实验也必须使用
 该目录；`outputs/` 只保留用户明确归档的选定最终运行。
+
+当前已进入正式半决赛阶段。`python main.py` 默认使用完整 `half_test` 窗口；
+`python main.py run` 保留历史回测用途，生成的回测包不能作为半决赛测试结果。
+本次结果是否满足提交条件单独记录于 `submission_check` 和 `submittable`，
+未通过时终端与运行摘要列出具体原因，不再由固定的预开发状态统一判定。
 
 ## 数据
 
@@ -85,8 +90,9 @@ python main.py run --experiment --nn-only --nn-span resource --folds A,B
 - 优化摘要分别保存计划、代理执行和历史发电的收入/电量/按日平均电价计算的
   加权负荷比；代理高炉气释放按多个假设罚金做敏感性评价。无柜气种的未用包络
   不作为实际放散，缺真实净余气、历史放散及官方罚金时不计算官方净效益提升率。
-- 压缩包统一命名为 `咕咕嘎嘎-半决赛.zip`。半决赛数据已接入，官方优化模板及
-  物理口径尚待核对；当前产物仍按本地验证/模拟包标记，`submittable=false`。
+- 压缩包统一命名为 `咕咕嘎嘎-半决赛.zip`。五个优化输出字段已核对本地赛题
+  PDF 第十三节（三）；物理口径仍须核验，代理优化保留模拟标记。
+  正式测试推理成功记录为 `SUCCESS_INFER`，提交核验结果单独记录。
 
 ## 输出
 
@@ -104,12 +110,10 @@ python main.py run --experiment --nn-only --nn-span resource --folds A,B
 （2025-10-01～10-10）做链路干跑；这不代表当前项目缺少半决赛数据。
 已提供但不完整的官方四表会报错，不静默缩短评测窗口或退回旧窗口。
 
-`opt_result.csv` 的 `datetime` 采用调度目标时刻（t+15min…t+1440min）。官方
-优化模板尚待核对，正式提交前必须核验行列、单位和时间语义并完成适配。
+`opt_result.csv` 的 `datetime` 采用调度目标时刻（t+15min…t+1440min）。五个
+优化输出字段已按赛题要求实现；提交前仍须核验覆盖范围、单位和时间语义。
 
-datetime 格式与原始 CSV 一致（`YYYY-MM-DD HH:MM:SS`，带空格）。赛题 PDF
-文本写作 `YYYY-MM-DDHH:MM:SS`，疑似排版丢失空格；若官方校验器要求无空格，
-只改 `output.py` 的 strftime 一行即可。
+datetime 格式按赛题第十三节要求使用 `YYYY-MM-DD HH:MM:SS`，带空格。
 
 ## 环境
 

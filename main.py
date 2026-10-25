@@ -1,8 +1,8 @@
 """半决赛唯一日常入口：python main.py
 
-默认 run 执行历史 21 天时序验证、模型训练、资源预测、调度与归档；infer 在
-历史验证和冻结训练后，对已接入的半决赛测试窗口生成预测。当前测试负荷标签
-为空，不计算测试集本地分数；优化模板及物理口径尚待核对，结果包不可提交。
+默认 infer 在历史验证和冻结训练后，对正式半决赛测试窗口生成预测与优化结果；
+run 保留历史 21 天时序回测。测试标签为空，不计算测试集本地分数；
+当次结果能否提交由窗口、运行范围和优化核验共同判定。
 """
 from __future__ import annotations
 
@@ -196,14 +196,41 @@ def _inference_window(prepared) -> tuple[pd.DatetimeIndex, str]:
     return origins, "semi_test_dryrun"
 
 
+def _inference_submission_check(window: str, optimization: dict, *,
+                                quick: bool, experimental: bool) -> dict:
+    """正式参赛阶段与当次产物是否通过提交核验分别记录，避免沿用预开发总开关。"""
+    problems = []
+    if window != "half_test":
+        problems.append("未使用完整 half_test 半决赛评测窗口")
+    if quick:
+        problems.append("quick 仅用于开发验证，调度未覆盖完整评测窗口")
+    if experimental:
+        problems.append("本次为开发实验，未归档为选定正式运行")
+    if not C.OPT_CONFIG["template_confirmed"]:
+        problems.append("优化输出字段尚未核对官方要求")
+    if optimization.get("schedule") is None:
+        problems.append("缺少有效 opt_result.csv 调度结果")
+    opt_summary = optimization.get("summary", {})
+    if not opt_summary.get("plan_validation_passed"):
+        problems.append("优化计划约束核验未通过")
+    if not optimization.get("submittable", False):
+        if optimization.get("status") == "SIMULATED_NOT_SUBMITTABLE":
+            problems.append("发电优化仍为代理资源模拟计划，尚未通过正式物理约束核验")
+        else:
+            problems.append("优化提交核验未通过：" + str(
+                opt_summary.get("reason") or optimization.get("status") or "未返回核验状态"))
+    return {"passed": not problems, "problems": problems}
+
+
 def run_infer(quick: bool = False, experimental: bool = False,
               reuse_run: Path | None = None, nn_studies: list[Path] | None = None) -> int:
-    """冻结模型后对半决赛测试窗口推理，结果仍按本地验证包标记。"""
+    """冻结模型后执行正式半决赛测试推理，并单独核验当次结果的提交条件。"""
     started = time.time()
     ctx = output.begin_run(C, mode="infer", experimental=quick or experimental)
     _setup_logger(ctx.log_path)
     LOGGER.info("推理运行目录: %s", ctx.root)
     summary = {"run_id": ctx.run_id, "status": "FAILED", "mode": "INFER",
+               "competition_stage": "SEMIFINAL",
                "experimental": bool(quick or experimental), "output_root": str(ctx.root),
                "quick": bool(quick), "validation_scope": "A/B开发验证" if quick else "历史开发验证，D已被多次查看", "errors": []}
     stages = C.progress(total=8, desc="推理 · 数据准备", unit="阶段", leave=True)
@@ -312,18 +339,21 @@ def run_infer(quick: bool = False, experimental: bool = False,
         calibration_report = output.write_calibration(
             ctx, short_bundle, long_bundle, resource_bundle, use_final=True)
         source_report = output.write_source_snapshot(ctx, C)
-        official = False  # 数据已接入；优化模板及物理口径尚待核对，本地验证不自动转为正式交付。
-        zip_report = output.build_zip(ctx, submittable=bool(official), config=C)
+        submission_check = _inference_submission_check(
+            window, optimization, quick=quick, experimental=experimental)
+        submittable = submission_check["passed"]
+        zip_report = output.build_zip(ctx, submittable=submittable, config=C)
         stages.update(1)
         stages.set_description("推理 · 保存摘要")
 
         summary.update({
-            "status": "SUCCESS_INFER" if official else "SUCCESS_DRYRUN",
+            "status": "SUCCESS_INFER" if window == "half_test" else "SUCCESS_DRYRUN",
             "window": window,
             "data_usage": {"training_range": [str(training.index[0]), str(training.index[-1])],
                            "training_stages": list(training.stage_ranges),
                            "official_test_training_used": False,
-                           "test_usage": "frozen_model_local_evaluation_only"},
+                           "test_usage": ("frozen_model_official_inference" if window == "half_test"
+                                          else "frozen_model_compatibility_dryrun")},
             "origins": int(len(origins)),
             "origin_range": [str(origins[0]), str(origins[-1])],
             "short": {"scores": short_bundle.scores, "selection": short_bundle.selection,
@@ -340,10 +370,9 @@ def run_infer(quick: bool = False, experimental: bool = False,
             "calibration": calibration_report,
             "source": source_report,
             "zip": zip_report,
-            "submittable": bool(official),
-            "reason": None if official else
-                      ("半决赛测试输入已接入，负荷标签为空，不计算测试集本地分数；优化模板及物理口径尚待核对"
-                       if window == "half_test" else "本次使用 semi_test 兼容窗口干跑，未使用 half_test 正式评测窗口"),
+            "submittable": submittable,
+            "submission_check": submission_check,
+            "reason": "; ".join(submission_check["problems"]) or None,
             "duration_seconds": round(time.time() - started, 2),
         })
         report_path = output.write_report(ctx, summary)
@@ -351,10 +380,12 @@ def run_infer(quick: bool = False, experimental: bool = False,
         stages.set_description("推理完成")
         LOGGER.info("报告: %s", report_path)
         print("\n推理摘要")
+        print("  阶段: 正式半决赛")
         print(f"  窗口: {window} | 起报点 {len(origins)}")
         print(f"  优化状态: {optimization.get('status')}")
         print(f"  输出目录: {ctx.root}")
-        print(f"  本地验证包: {zip_report['name']}（不可提交）")
+        print(f"  半决赛结果包: {zip_report['name']}")
+        print("  提交核验: " + ("通过" if submittable else "; ".join(submission_check["problems"])))
         return 0
     except Exception as exc:  # noqa: BLE001
         LOGGER.error("推理失败: %s", exc)
@@ -530,7 +561,7 @@ def run_full(quick: bool = False, experimental: bool = False) -> int:
                 "source": source_report,
                 "zip": zip_report,
                 "submittable": False,
-                "reason": "历史时序回测，分数不代表半决赛测试集成绩；优化模板及物理口径尚待核对",
+                "reason": "历史时序回测，分数和结果包不代表半决赛测试集结果",
             },
             "duration_seconds": round(time.time() - started, 2),
         })
@@ -547,7 +578,7 @@ def run_full(quick: bool = False, experimental: bool = False) -> int:
         print(f"  优化状态: {optimization.get('status')} | "
               f"计划可行={optimization.get('summary', {}).get('plan_feasible')}（收益口径见 JSON）")
         print(f"  输出目录: {ctx.root}")
-        print(f"  本地验证包: {zip_report['name']}（不可提交）")
+        print(f"  历史回测包: {zip_report['name']}（仅用于历史验证）")
         return 0
     except Exception as exc:  # noqa: BLE001
         LOGGER.error("运行失败: %s", exc)
@@ -793,8 +824,9 @@ def run_nn_study(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="AIC 半决赛煤气发电预测与优化")
-    parser.add_argument("command", nargs="?", default="run",
-                        choices=("run", "infer", "doctor", "self-check", "verify"))
+    parser.add_argument("command", nargs="?", default="infer",
+                        choices=("run", "infer", "doctor", "self-check", "verify"),
+                        help="默认 infer 执行半决赛测试推理；run 执行历史回测")
     parser.add_argument("--run-dir", type=Path, help="verify 指定选定运行或实验结果目录")
     parser.add_argument("--quick", action="store_true", help="单折、低迭代的开发模式")
     progress_args = parser.add_mutually_exclusive_group()

@@ -309,8 +309,8 @@ OPT_CONFIG = {
     # P4：启停切换惩罚，压机组频繁开关（元/次·台）。
     "unit_switch_penalty_cny": 150.0,
     "max_daily_milp": 31,
-    # 优化模板及物理口径尚待核对；数据接入不等于已满足正式提交条件。
-    "template_confirmed": False,
+    # 已核对本地赛题 PDF 第十三节（三）的五个 opt_ 字段；物理可行性另行核验。
+    "template_confirmed": True,
     "price_file": "first_train/price.xlsx",
     "price_unit": "CNY_per_kWh",
 }

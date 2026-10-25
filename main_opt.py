@@ -4,7 +4,7 @@
 - 高炉气柜只有 2 号柜数据可用，焦炉/转炉没有独立柜位，不虚构库存。
 - 热值/效率没有官方数值，只由历史 ``generator_all`` 与三气种耗气做正系数回归，
   标记为 inferred；正式提交前必须按官方数据字典复核。
-- 半决赛数据已接入；官方优化模板及完整物理口径尚待核对，调度保留模拟标记。
+- 已进入正式半决赛；输出字段已核对赛题，代理资源调度仍保留模拟标记。
 """
 from __future__ import annotations
 
@@ -1627,7 +1627,7 @@ def optimize(resource_forecast: np.ndarray, prepared: PreparedData,
         "template_confirmed": bool(C.OPT_CONFIG["template_confirmed"]),
         "availability_mode": availability_mode or C.OPT_CONFIG.get("availability_mode"),
         "time_semantics": "target_time t+15min ... t+1440min",
-        "note": "官方优化模板及完整物理口径尚待核对，调度为代理资源包络下的模拟计划；"
+        "note": "优化输出字段已核对赛题，完整物理口径仍待核验；调度为代理资源包络下的模拟计划；"
                 "计划收益与包络回放仅作代理诊断，非真实可执行净收益；未计放散罚金官方系数。",
         "daily": records,
     }
