@@ -693,8 +693,9 @@ def _generator1_contract_check() -> dict:
     origin = 35 * 96
     changed = copy.deepcopy(prepared)
     changed.frame.loc[changed.index > changed.index[origin], :] = np.nan
-    causal = all(np.allclose(main_s.generator1_base(prepared, days).iloc[:origin + 1],
-        main_s.generator1_base(changed, days).iloc[:origin + 1], equal_nan=True) for days in (0, 21))
+    causal = all(np.allclose(main_s.generator1_base(prepared, days, power).iloc[:origin + 1],
+        main_s.generator1_base(changed, days, power).iloc[:origin + 1], equal_nan=True)
+        for days in (0, 21) for power in (False, True))
     positions = np.array([origin, origin + 1])
     first = C.PROFILE_DAYS * 96
     start = first + ((origin - first) // (21 * 96)) * 21 * 96
@@ -714,9 +715,26 @@ def _generator1_contract_check() -> dict:
     changed_prediction[..., 1] = 999.
     take = torch.arange(3, device=main_nn.DEVICE)
     target_only = sample.loss(prediction, take).item() == sample.loss(changed_prediction, take).item()
+    class ConstantHead(torch.nn.Module):
+        def __init__(self, value):
+            super().__init__()
+            self.value = value
+
+        def forward(self, x, future):
+            return torch.full((len(x), future.shape[1], 2), self.value, device=x.device)
+
+    aggregation_ok = True
+    for aggregation, weights, expected in (("mean", [1, 1, 1], 4.), ("median", [1, 1, 1], 4.),
+                                            ("validation_weighted", [1, 0, 0], 1.)):
+        actual = main_nn._predict_cube([{}, {}, {}], torch.zeros((10, 1), device=main_nn.DEVICE),
+            np.array([5]), np.zeros((1, 2, 1), np.float32), 2, 2, "tsmixer", 1,
+            {"ensemble_aggregation": aggregation, "ensemble_weights": weights}, 16,
+            runtime_models=[ConstantHead(1.), ConstantHead(4.), ConstantHead(7.)])
+        aggregation_ok &= np.allclose(actual, expected)
     checks = {"future_independent": causal, "blocked_profile_matches_service": profiles_same,
               "total_preserved": total_same, "structure_bounds": bool(bounds),
-              "specialist_loss_ignores_total_output": target_only}
+              "specialist_loss_ignores_total_output": target_only,
+              "seed_aggregation_values": bool(aggregation_ok)}
     return {"passed": bool(all(checks.values())), **checks}
 
 

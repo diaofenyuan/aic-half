@@ -369,9 +369,9 @@ def build_feature_table(prepared: PreparedData, load_history: bool = False,
 
     base = build_base_features(prepared, include_targets=True)
     columns = list(_feature_columns(base, "gas"))
-    if feature_set == "generator1":
+    if feature_set in ("generator1", "generator1_observed"):
         from main_s import generator1_base
-        base = generator1_base(prepared)
+        base = generator1_base(prepared, include_power=feature_set == "generator1_observed")
         # 目标历史由带整窗遮挡的条件向量提供，避免序列中混入训练期新鲜标签。
         columns = [c for c in base if not c.startswith(("g1_generator_1_", "g1_generator_all_"))]
     elif feature_set == "compact":
@@ -1109,21 +1109,41 @@ def _predict_cube(model_states: list[dict], table: torch.Tensor, positions: np.n
     pos = torch.as_tensor(positions, dtype=torch.long, device=DEVICE)
     fut = torch.as_tensor(future, dtype=torch.float32, device=DEVICE)
     total = torch.zeros((len(positions), horizon, 2), dtype=torch.float32, device=DEVICE)
+    aggregation = cfg.get("ensemble_aggregation", "mean")
+    if aggregation not in ("mean", "median", "validation_weighted"):
+        raise ValueError("未知NN种子聚合方式")
+    members = []
+    weights = np.asarray(cfg.get("ensemble_weights", np.ones(len(model_states))), dtype=float)
+    if len(weights) != len(model_states) or not np.isfinite(weights).all() or np.any(weights < 0) or weights.sum() <= 0:
+        raise ValueError("NN集成权重不合法")
+    weights = weights / weights.sum()
     if runtime_models is None:
         runtime_models = []
         for state in model_states:
             model = build_model(kind, look_back, horizon, table.shape[1], n_fut, cfg)
             model.load_state_dict(state)
             runtime_models.append(model)
-    for model in C.progress(runtime_models, desc=f"NN {kind} 集成预测", unit="模型"):
+    for index, model in C.progress(enumerate(runtime_models), total=len(runtime_models), desc=f"NN {kind} 集成预测", unit="模型"):
         model.eval()
+        member = torch.empty_like(total) if aggregation == "median" else None
         with torch.inference_mode():
             for start in C.progress(range(0, len(positions), max(1, batch)),
                                     desc=f"NN {kind} 预测批次", unit="批"):
                 take = slice(start, start + max(1, batch))
                 x = _windows(table, pos[take], look_back)
-                total[take] += model(x, fut[take]).float()
-    return (total / len(model_states)).cpu().numpy()
+                value = model(x, fut[take]).float()
+                if aggregation == "median":
+                    member[take] = value
+                elif aggregation == "validation_weighted":
+                    total[take] += float(weights[index]) * value
+                else:
+                    total[take] += value
+        if member is not None:
+            members.append(member)
+    if aggregation == "median":
+        # 稳定排序避免CUDA median的非确定性索引实现影响离线复验。
+        return torch.sort(torch.stack(members), dim=0, stable=True).values[len(members) // 2].cpu().numpy()
+    return (total if aggregation == "validation_weighted" else total / len(model_states)).cpu().numpy()
 
 
 def predict_nn(bundle: NNBundle, prepared: PreparedData,
@@ -1145,6 +1165,9 @@ def predict_nn(bundle: NNBundle, prepared: PreparedData,
     gpu = _gpu_table(table, bundle.feat_mean, bundle.feat_std)
     cfg = dict(bundle.config)
     cfg["head_mode"] = bundle.head_mode
+    if cfg.get("ensemble_aggregation") == "validation_weighted":
+        losses = np.asarray(bundle.scores["early_stop"]["loss"], dtype=float)
+        cfg["ensemble_weights"] = 1. / np.maximum(losses, 1e-4) ** float(cfg.get("aggregation_power", 1.))
     future = _future_columns(prepared, sub, bundle.horizons, cfg)
     profile = None
     if bundle.head_mode in ("ratio", "residual") or cfg.get("profile_conditions_scaled"):

@@ -926,11 +926,12 @@ def generator1_project(candidate: np.ndarray, reference: np.ndarray) -> np.ndarr
     return result
 
 
-def generator1_base(prepared: PreparedData, block_days: int = 0) -> pd.DataFrame:
+def generator1_base(prepared: PreparedData, block_days: int = 0, include_power: bool = False) -> pd.DataFrame:
     """专项特征单独构造，既有模型的列集合及数值保持不变。"""
     from data_cleaning.pipeline import _last_valid
-    base = _with_observed_features(prepared, build_base_features(prepared, True), "gas_no_power_at_t")
-    base = base[_feature_columns(base, "gas_no_power_at_t")].copy()
+    features = "gas_at_t" if include_power else "gas_no_power_at_t"
+    base = _with_observed_features(prepared, build_base_features(prepared, True), features)
+    base = base[_feature_columns(base, features)].copy()
     frame, positions = prepared.frame, np.arange(len(prepared.index))
     for col in ("d_use_blast", "d_use_coke", "d_use_converter", "d_gen_blast", "d_gen_coke"):
         _, age = _last_valid(frame[col])
@@ -1030,6 +1031,22 @@ def apply_generator1_specialist(bundle, prepared, positions, prediction, use_fin
     if pd.Timestamp(state["train_end"]) >= prepared.index[np.min(positions)]:
         raise ValueError("generator_1专项训练截止进入推理窗口")
     recipe, horizons = state["recipe"], bundle.horizons
+    if recipe["kind"] == "refined_nn":
+        import copy
+        if state["base_state"]["recipe"]["kind"] == "refined_nn":
+            raise ValueError("精修分支只保留一层，禁止不断堆叠历史模型")
+        base_bundle = copy.copy(bundle)
+        base_bundle.final_generator1 = state["base_state"]
+        before = apply_generator1_specialist(base_bundle, prepared, positions, prediction, use_final)
+        update = recipe["refinement"]
+        observed = np.isfinite(prepared.frame[["d_use_blast", "d_use_coke", "d_use_converter"]].to_numpy()[positions]).all(axis=1)
+        active = ~observed if update["mode"] == "missing" else observed if update["mode"] == "normal" else np.ones(len(positions), dtype=bool)
+        if not active.any():
+            return before
+        estimate = main_nn.predict_nn(state["nn"], prepared, prepared.index[positions])[..., 0]
+        result = generator1_project(before[..., 0] + update["weight"] * active[:, None] * (estimate - before[..., 0]), before)
+        result[~active] = before[~active]
+        return result
     active = np.ones(len(positions), dtype=bool)
     if recipe.get("missing_only", True):
         observed = prepared.frame[["d_use_blast", "d_use_coke", "d_use_converter"]].to_numpy()[positions]
@@ -1042,9 +1059,11 @@ def apply_generator1_specialist(bundle, prepared, positions, prediction, use_fin
         expert = main_nn.predict_nn(state["nn"], prepared, prepared.index[positions])[..., 0]
     else:
         base = build_base_features(prepared, True)
-        expert = np.mean([np.clip(_predict_models(prepared, base, positions, horizons,
+        members = [np.clip(_predict_models(prepared, base, positions, horizons,
             state["expert_kind"], state["expert_features"], seed["models"], seed["feature_names"],
-            targets=("generator_1",))[..., 0], 0., 200.) for seed in state.get("experts", [state])], axis=0)
+            targets=("generator_1",))[..., 0], 0., 200.) for seed in state.get("experts", [state])]
+        expert = (np.median(members, axis=0) if recipe.get("expert_aggregation") == "median"
+                  else np.mean(members, axis=0))
         profile = target_slot_profile(prepared, positions, horizons, "generator_1")
         for group, lo, hi in _groups_for(horizons):
             js = [j for j, h in enumerate(horizons) if lo <= h <= hi]
@@ -1070,7 +1089,10 @@ def save_generator1(state, directory):
     """仅保存当前专项实际使用的模型，不把内层折外模型或数组混入交付物。"""
     import json
     directory.mkdir(parents=True, exist_ok=True)
-    meta = {k: v for k, v in state.items() if k not in ("tree", "nn", "models", "gate", "experts")}
+    meta = {k: v for k, v in state.items() if k not in ("tree", "nn", "models", "gate", "experts", "base_state")}
+    if state.get("base_state"):
+        save_generator1(state["base_state"], directory / "base")
+        meta["base_path"] = "base"
     if state.get("experts"):
         meta["expert_paths"] = []
         for i, expert in enumerate(state["experts"]):
@@ -1097,6 +1119,8 @@ def save_generator1(state, directory):
 def load_generator1(directory):
     import json
     meta = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+    if meta.get("base_path"):
+        meta["base_state"] = load_generator1(directory / meta["base_path"])
     if meta.get("expert_paths"):
         meta["experts"] = [load_generator1(directory / name) for name in meta["expert_paths"]]
     if "tree" in meta:

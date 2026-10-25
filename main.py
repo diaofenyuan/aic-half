@@ -141,6 +141,8 @@ def run_verify(directory: Path | None = None) -> int:
             return _verify_plan_study(directory, saved)
         if saved.get("status") == "SUCCESS_GENERATOR1_STUDY":
             return _verify_generator1_study(directory, saved)
+        if saved.get("status") == "SUCCESS_GENERATOR1_REFINEMENT":
+            return _verify_generator1_refinement(directory, saved)
     problems = []
     for name in ("s_result.csv", "l_result.csv", "opt_result.csv"):
         path = directory / name
@@ -2450,6 +2452,227 @@ def run_generator1_study(args) -> int:
     return 0 if summary["status"] == "SUCCESS_GENERATOR1_STUDY" else 1
 
 
+def run_generator1_refinement(args) -> int:
+    """第二轮直接对照已晋级策略，先复用既有权重，再比较不同信息和目标表示。"""
+    import main_nn
+    requested = set(args.g1_refine_stages.split(","))
+    if not requested or requested - {"reuse", "train", "normal", "seeds", "combine"}:
+        raise ValueError("精修阶段必须为reuse、train、normal、seeds、combine的非空列表")
+    reference = args.study_reference.resolve()
+    if not reference.is_relative_to(C.EXPERIMENT_OUTPUT_ROOT.resolve()):
+        raise ValueError("精修参考目录必须来自本项目实验目录")
+    prior = json.loads((reference / C.REPORT_DIR / C.REPORT_JSON).read_text(encoding="utf-8"))
+    if prior.get("status") != "SUCCESS_GENERATOR1_STUDY" or not prior.get("verification", {}).get("passed"):
+        raise ValueError("精修要求已完成核验的全量专项")
+    if args.study_resume:
+        root = args.study_resume.resolve()
+        if not root.is_relative_to(C.EXPERIMENT_OUTPUT_ROOT.resolve()):
+            raise ValueError("精修续跑目录越界")
+        summary = json.loads((root / C.REPORT_DIR / C.REPORT_JSON).read_text(encoding="utf-8"))
+        if summary["reference"] != str(reference) or summary["quick"] != args.quick:
+            raise ValueError("精修续跑契约不一致")
+        ctx = output.RunContext(root.name, root, root / C.SOURCE_DIR, root / C.MODEL_DIR,
+            root / C.REPORT_DIR, root / C.REPORT_DIR / C.REPORT_LOG, "generator1_refine")
+    else:
+        ctx = output.begin_run(C, mode="generator1_refine", experimental=True)
+        summary = {"reference": str(reference), "quick": args.quick, "submittable": False,
+            "validation_scope": ("AB_screen_only" if args.quick else "ABC_reused_development") + "; current_promoted_baseline; no_D_no_test",
+            "candidates": {}, "neural_recipes": {}, "completed_stages": [], "errors": [],
+            "contract": {**C.GENERATOR1_GATE, "total_load_frozen": True,
+                "normal_path_is_independently_evaluated": True,
+                "hypotheses": ["seed_aggregation", "complementary_models", "observed_power_gas",
+                               "profile_residual", "profile_ratio"]}}
+    _setup_logger(ctx.log_path)
+    tick, elapsed = time.time(), summary.get("duration_seconds", 0.)
+    summary.setdefault("run_id", ctx.run_id)
+    if "base_recipes" not in summary:
+        # 冻结配置会随晋级更新，复现实验须读取参考专项自己的配方。
+        summary["base_recipes"] = _generator1_study_recipes(reference, prior)
+        if set(summary["base_recipes"]) != {"short", "long"}:
+            raise ValueError("精修参考专项必须同时提供短期与长期已晋级配方")
+    summary.update(status="RUNNING", errors=[])
+    output.write_source_snapshot(ctx, C)
+    output.write_report(ctx, summary)
+    LOGGER.info("generator_1第二轮目录：%s", ctx.root)
+    try:
+        specs = [dict(f) for f in C.FOLDS if f["role"] == "tuning"][:2 if args.quick else 3]
+        cutoff = max(pd.Timestamp(s["start"]) + pd.Timedelta(days=s["days"] + 1) for s in specs)
+        prepared = prepare_data(C, cutoff=cutoff)
+        prepared.require_training_data()
+        if summary.get("data_sources") and summary["data_sources"] != prepared.source_hashes:
+            raise ValueError("精修续跑训练来源已变化")
+        summary["data_sources"] = prepared.source_hashes
+        pools = {}
+        for span, horizons in (("short", C.HORIZONS_S), ("long", C.HORIZONS_L)):
+            cases, selected = [], prior["selection"][span]["chosen"]
+            for spec in specs:
+                view, _, positions, ref = _study_view(prepared, spec)
+                for scenario, start in (("normal", None), ("all_missing", spec["start"]),
+                    ("outage_day7", pd.Timestamp(spec["start"]) + pd.Timedelta(days=7))):
+                    current = view if start is None else view.masked_power_gas_copy(start)
+                    with np.load(reference / C.MODEL_DIR / span / selected / scenario / spec["name"] / "predictions.npz") as data:
+                        baseline, truth = data["prediction"].copy(), data["truth"].copy()
+                        if not np.array_equal(positions, data["positions"]):
+                            raise ValueError("精修起报点与参考不一致")
+                    if not np.array_equal(main_s.truth_cube(prepared, positions, horizons), truth, equal_nan=True):
+                        raise ValueError("精修真值与参考不一致")
+                    missing = ~np.isfinite(current.frame[["d_use_blast", "d_use_coke", "d_use_converter"]].to_numpy()[positions]).all(axis=1)
+                    case = {"span": span, "spec": spec, "scenario": scenario, "view": current,
+                        "positions": positions, "ref": ref, "baseline": baseline, "truth": truth, "missing": missing}
+                    folder = ctx.model_dir / span / "baseline" / scenario / spec["name"]
+                    folder.mkdir(parents=True, exist_ok=True)
+                    np.savez_compressed(folder / "predictions.npz", prediction=baseline, truth=truth, positions=positions)
+                    cases.append(case)
+            pools[span] = cases
+            summary["candidates"].setdefault(span, {})
+            summary["candidates"][span]["baseline"] = _generator1_evaluate(cases, [c["baseline"] for c in cases], horizons)
+        if "reuse" in args.g1_refine_stages.split(","):
+            _generator1_refine_reuse(ctx, summary, prior, pools)
+            summary["completed_stages"] = sorted(set(summary["completed_stages"]) | {"reuse"})
+        if set(args.g1_refine_stages.split(",")) & {"train", "normal"}:
+            common = {"feature_set": "generator1", "head_mode": "scaled", "profile_base": "plain",
+                "profile_conditions": True, "profile_conditions_scaled": True, "training_mask_days": 21,
+                "load_history": False, "target_indices": [0], "n_seeds": 1}
+            configs = [("H_observed", {**common, "feature_set": "generator1_observed"}),
+                       ("H_residual", {**common, "head_mode": "residual", "residual_limit": .25}),
+                       ("H_ratio", {**common, "head_mode": "ratio"}),
+                       ("H_normal", {**common, "feature_set": "generator1_observed", "power_mask_training": False})]
+            if "normal" in args.g1_refine_stages.split(",") and "train" not in args.g1_refine_stages.split(","):
+                configs = [x for x in configs if x[0] == "H_normal"]
+            for span, horizons in (("short", C.HORIZONS_S), ("long", C.HORIZONS_L)):
+                for name, cfg in configs:
+                    summary["neural_recipes"][name] = {"kind": "tsmixer", "config": cfg}
+                    _generator1_neural_candidate(args, ctx, summary, prepared, specs, pools[span], span,
+                                                 horizons, name, "tsmixer", cfg, False)
+            summary["completed_stages"] = sorted(set(summary["completed_stages"]) | set(args.g1_refine_stages.split(",")) & {"train", "normal"})
+        if "seeds" in args.g1_refine_stages.split(","):
+            if not summary["neural_recipes"]:
+                raise ValueError("种子复核需要先完成train或normal阶段")
+            for span, horizons in (("short", C.HORIZONS_S), ("long", C.HORIZONS_L)):
+                ranking = []
+                for name, recipe in summary["neural_recipes"].items():
+                    rows = [r for r in summary["candidates"][span].values() if r.get("recipe", {}).get("model_stage") == name]
+                    if rows:
+                        gain = max(np.mean([t["mean_gain_pp"] for t in r["tests"].values()]) for r in rows)
+                        ranking.append((gain, name, recipe))
+                for _, name, recipe in sorted(ranking, key=lambda x: x[0], reverse=True)[:2]:
+                    _generator1_neural_candidate(args, ctx, summary, prepared, specs, pools[span], span,
+                        horizons, name + "_3seeds", recipe["kind"], recipe["config"], True, name)
+            summary["completed_stages"] = sorted(set(summary["completed_stages"]) | {"seeds"})
+        if "combine" in requested:
+            for span, horizons in (("short", C.HORIZONS_S), ("long", C.HORIZONS_L)):
+                rows = summary["candidates"][span]
+                score = lambda row: np.mean([x["mean_gain_pp"] for x in row["tests"].values()])
+                aggregations = [(n, r) for n, r in rows.items() if r.get("accepted") and r.get("recipe", {}).get("kind") == "primary_aggregation"]
+                networks = [(n, r) for n, r in rows.items() if r.get("accepted") and r.get("recipe", {}).get("kind") == "nn"
+                            and r["recipe"].get("seeds") == 3 and r["recipe"]["weight"] < 1. and not r["recipe"].get("base_aggregation")]
+                if not aggregations or not networks:
+                    continue
+                first, aggregate = max(aggregations, key=lambda x: score(x[1]))
+                second, neural = max(networks, key=lambda x: score(x[1]))
+                update, predictions = neural["recipe"], []
+                for spec in specs:
+                    bundle = main_nn.load_nn(ctx.model_dir / span / update["model_stage"] / spec["name"] / f"nn_{update['nn_kind']}.pt")
+                    for case in [c for c in pools[span] if c["spec"]["name"] == spec["name"]]:
+                        with np.load(ctx.model_dir / span / first / case["scenario"] / spec["name"] / "predictions.npz") as data:
+                            before = data["prediction"].copy()
+                        raw = main_nn.predict_nn(bundle, case["view"], case["view"].index[case["positions"]])[..., 0]
+                        active = ~case["missing"] if update.get("normal_only") else case["missing"] if update.get("missing_only") else np.ones(len(raw), dtype=bool)
+                        predictions.append(main_s.generator1_project(before[..., 0] + update["weight"] * active[:, None] * (raw - before[..., 0]), before))
+                    del bundle
+                    main_nn.clear_cache()
+                _generator1_record(ctx, summary, span, "combined_" + second, pools[span], predictions, horizons,
+                    {**update, "base_aggregation": aggregate["recipe"], "components": [first, second]})
+            summary["completed_stages"] = sorted(set(summary["completed_stages"]) | {"combine"})
+        summary["selection"] = {}
+        for span, results in summary["candidates"].items():
+            eligible = [(name, r) for name, r in results.items() if r.get("accepted")]
+            chosen = max(eligible, key=lambda x: np.mean([t["mean_gain_pp"] for t in x[1]["tests"].values()]), default=None)
+            summary["selection"][span] = {"chosen": chosen[0] if chosen else "baseline", "accepted": chosen is not None}
+        summary["status"] = "SUCCESS_GENERATOR1_REFINEMENT"
+    except Exception as exc:
+        summary["errors"].append(str(exc))
+        summary["status"] = "FAILED"
+        LOGGER.exception("generator_1第二轮失败")
+    summary["duration_seconds"] = elapsed + time.time() - tick
+    output.write_report(ctx, summary)
+    print(f"generator_1第二轮：{summary['status']} | {ctx.root}")
+    return 0 if summary["status"] == "SUCCESS_GENERATOR1_REFINEMENT" else 1
+
+
+def _generator1_refine_reuse(ctx, summary, prior, pools):
+    import main_nn
+    reference = Path(summary["reference"])
+    for span, horizons in (("short", C.HORIZONS_S), ("long", C.HORIZONS_L)):
+        cases = pools[span]
+        # 共用少量权重，验证互补性；不逐折、逐日或逐样本拟合权重。
+        names = ["G6_price_mixer_3seeds_all", "G5_specialist_tcn_3seeds_all"] if span == "short" else ["G6_price_mixer_3seeds_all", "G6_specialist_mixer_3seeds_all"]
+        for source in names:
+            estimates = []
+            for case in cases:
+                with np.load(reference / C.MODEL_DIR / span / source / case["scenario"] / case["spec"]["name"] / "predictions.npz") as data:
+                    estimates.append(data["prediction"][..., 0].copy())
+            for weight in (.1, .25):
+                for mode in ("missing", "normal", "all"):
+                    predictions = []
+                    for case, estimate in zip(cases, estimates):
+                        active = case["missing"] if mode == "missing" else ~case["missing"] if mode == "normal" else np.ones(len(estimate), dtype=bool)
+                        predictions.append(main_s.generator1_project(case["baseline"][..., 0] +
+                            weight * active[:, None] * (estimate - case["baseline"][..., 0]), case["baseline"]))
+                    _generator1_record(ctx, summary, span, f"reuse_{source}_{mode}_{weight:g}", cases, predictions,
+                        horizons, {"kind": "secondary_blend", "source": source, "weight": weight, "mode": mode})
+        if span == "short":
+            source = prior["candidates"][span][prior["selection"][span]["chosen"]]["recipe"]["model_stage"]
+            for aggregation, power in (("median", 1.), ("validation_weighted", 1.), ("validation_weighted", 2.)):
+                predictions = []
+                for spec in [dict(f) for f in C.FOLDS if f["role"] == "tuning"][:2 if summary["quick"] else 3]:
+                    bundle = main_nn.load_nn(reference / C.MODEL_DIR / span / source / spec["name"] / "nn_tsmixer.pt")
+                    bundle.config.update(ensemble_aggregation=aggregation, aggregation_power=power)
+                    for case in [c for c in cases if c["spec"]["name"] == spec["name"]]:
+                        estimate = main_nn.predict_nn(bundle, case["view"], case["view"].index[case["positions"]])[..., 0]
+                        predictions.append(main_s.generator1_project(np.where(case["missing"][:, None],
+                            estimate, case["baseline"][..., 0]), case["baseline"]))
+                    del bundle
+                    main_nn.clear_cache()
+                _generator1_record(ctx, summary, span, f"aggregation_{aggregation}_{power:g}", cases, predictions,
+                    horizons, {"kind": "primary_aggregation", "aggregation": aggregation, "power": power})
+        else:
+            original_reference = Path(prior["reference"])
+            expert_values, originals = [], []
+            for spec in [dict(f) for f in C.FOLDS if f["role"] == "tuning"][:2 if summary["quick"] else 3]:
+                folder = original_reference / C.MODEL_DIR / span / "R2" / spec["name"]
+                meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
+                seed_models = [_study_load_models(folder, meta["files"])]
+                for seed in (20261022, 20261023):
+                    seed_folder = reference / C.MODEL_DIR / span / "G7_availability" / str(seed) / spec["name"]
+                    other = json.loads((seed_folder / "meta.json").read_text(encoding="utf-8"))
+                    seed_models.append(_study_load_models(seed_folder, other["files"]))
+                for case in [c for c in cases if c["spec"]["name"] == spec["name"]]:
+                    with np.load(reference / C.MODEL_DIR / span / "baseline" / case["scenario"] / spec["name"] / "predictions.npz") as data:
+                        originals.append(data["prediction"].copy())
+                    members = [np.clip(main_s._predict_models(case["view"], main_s.build_base_features(case["view"], True),
+                        case["positions"], horizons, meta["kind"], meta["features"], models, meta["feature_names"],
+                        targets=("generator_1",))[..., 0], 0., 200.) for models in seed_models]
+                    profile = main_s.target_slot_profile(case["view"], case["positions"], horizons, "generator_1")
+                    for values in members:
+                        for group, lo, hi in main_s._groups_for(horizons):
+                            js = [j for j, h in enumerate(horizons) if lo <= h <= hi]
+                            w = C.GENERATOR1_SPECIALIST[span]["expert_blend"]["generator_1"][group]
+                            values[:, js] = w * values[:, js] + (1. - w) * profile[:, js]
+                    expert_values.append(members)
+            for aggregation in ("mean", "median"):
+                for margin in (16., 20., 24.):
+                    predictions = []
+                    for case, members, original in zip(cases, expert_values, originals):
+                        expert = np.mean(members, axis=0) if aggregation == "mean" else np.median(members, axis=0)
+                        delta = expert - original[..., 0]
+                        w = case["missing"][:, None] * np.clip((np.abs(delta) - margin) / margin, 0., 1.)
+                        predictions.append(main_s.generator1_project(original[..., 0] + w * delta, case["baseline"]))
+                    _generator1_record(ctx, summary, span, f"tree_aggregation_{aggregation}_gate{margin:g}", cases,
+                        predictions, horizons, {"kind": "primary_tree_gate", "expert_aggregation": aggregation,
+                                               "disagreement_margin_mw": margin})
+
+
 def _generator1_train_stages(args, ctx, summary, prepared, specs, pools, stages):
     import lightgbm as lgb
     for span, horizons in (("short", C.HORIZONS_S), ("long", C.HORIZONS_L)):
@@ -2751,9 +2974,10 @@ def _generator1_neural_candidate(args, ctx, summary, prepared, specs, cases, spa
         else:
             training = prepared.prefix_copy(spec["train_end"])
             ref = len(training.index) - 1
-            for offset in range(7 * C.STEPS_PER_DAY, ref, 21 * C.STEPS_PER_DAY):
-                training = training.masked_power_gas_copy(training.index[offset],
-                    training.index[min(offset + 14 * C.STEPS_PER_DAY - 1, ref)])
+            if cfg.get("power_mask_training", True):
+                for offset in range(7 * C.STEPS_PER_DAY, ref, 21 * C.STEPS_PER_DAY):
+                    training = training.masked_power_gas_copy(training.index[offset],
+                        training.index[min(offset + 14 * C.STEPS_PER_DAY - 1, ref)])
             LOGGER.info("generator_1 NN %s/%s/%s开始", span, name, spec["name"])
             bundle = main_nn.train_nn(training, [spec], kind, horizons, quick=args.quick,
                 n_seeds=2 if ensemble else 1, cfg={**cfg, "seed_base": 20261022 if ensemble else 20261021})
@@ -2788,6 +3012,13 @@ def _generator1_neural_candidate(args, ctx, summary, prepared, specs, cases, spa
             {"kind": "nn", "model_stage": name, "weight": weight, "missing_only": True,
              "nn_kind": kind, "config": cfg, "seeds": 3 if ensemble else 1,
              "training": audits, "reload_passed": True, "reload_tolerance_mw": .002})
+        if summary.get("contract", {}).get("normal_path_is_independently_evaluated"):
+            predictions = [main_s.generator1_project(case["baseline"][..., 0] + weight * (~case["missing"])[:, None] *
+                (raw - case["baseline"][..., 0]), case["baseline"]) for case, raw in zip(cases, raw_predictions)]
+            _generator1_record(ctx, summary, span, f"{name}_normal_w{weight:g}", cases, predictions, horizons,
+                {"kind": "nn", "model_stage": name, "weight": weight, "normal_only": True,
+                 "nn_kind": kind, "config": cfg, "seeds": 3 if ensemble else 1,
+                 "training": audits, "reload_passed": True, "reload_tolerance_mw": .002})
     predictions = [main_s.generator1_project(raw, case["baseline"]) for case, raw in zip(cases, raw_predictions)]
     _generator1_record(ctx, summary, span, f"{name}_all", cases, predictions, horizons,
         {"kind": "nn", "model_stage": name, "weight": 1., "missing_only": False,
@@ -2888,31 +3119,178 @@ def _verify_generator1_study(directory, summary):
     return 0 if not problems else 1
 
 
-def _train_generator1_final(training, short_bundle, long_bundle, study=None, quick=False):
+def _generator1_study_recipes(study, summary):
+    """从已核验专项还原冻结配方，避免当前配置覆盖历史对照。"""
+    import copy
+    prior = json.loads((Path(summary["reference"]) / C.REPORT_DIR / C.REPORT_JSON).read_text(encoding="utf-8"))
+    recipes = {}
+    for span, selected in summary["selection"].items():
+        if not selected["accepted"]:
+            continue
+        result = summary["candidates"][span][selected["chosen"]]
+        recipe = {k: copy.deepcopy(v) for k, v in result["recipe"].items() if k not in
+                  ("training", "provenance", "inner_reference", "reload_passed", "reload_tolerance_mw", "seed_checks")}
+        if recipe["kind"] in ("availability_expert", "nested_gate"):
+            meta = json.loads((Path(summary["reference"]) / C.MODEL_DIR / span / "R2" / "A" / "meta.json").read_text(encoding="utf-8"))
+            recipe.update(expert_kind=meta["kind"], expert_features=meta["features"],
+                expert_blend=copy.deepcopy(prior["promotion"][span]["R2"]["blend"]))
+        recipe.update(source_study=study.name, candidate=selected["chosen"], development=copy.deepcopy(result["tests"]))
+        recipes[span] = recipe
+    return recipes
+
+
+def _generator1_refinement_recipes(summary):
+    import copy
+    recipes = copy.deepcopy(summary["base_recipes"])
+    for span, selection in summary["selection"].items():
+        if not selection["accepted"]:
+            continue
+        candidate = summary["candidates"][span][selection["chosen"]]
+        update = candidate["recipe"]
+        recipe = recipes[span]
+        if update.get("base_aggregation"):
+            if recipe["kind"] != "nn":
+                raise ValueError("仅独立网络支持组合种子聚合精修")
+            aggregation = update["base_aggregation"]
+            recipe["config"].update(ensemble_aggregation=aggregation["aggregation"], aggregation_power=aggregation["power"])
+        if update["kind"] == "primary_aggregation" and recipe["kind"] == "nn":
+            recipe["config"].update(ensemble_aggregation=update["aggregation"], aggregation_power=update["power"])
+        elif update["kind"] == "primary_tree_gate" and recipe["kind"] == "availability_expert":
+            recipe.update(expert_aggregation=update["expert_aggregation"], disagreement_margin_mw=update["disagreement_margin_mw"])
+        elif update["kind"] == "nn" and update.get("seeds") == 3 and update["weight"] == 1. and not update.get("normal_only"):
+            recipe = {k: v for k, v in update.items() if k not in ("training", "reload_passed", "reload_tolerance_mw")}
+            recipes[span] = recipe
+        elif update["kind"] == "nn" and update.get("seeds") == 3:
+            if recipe["kind"] == "refined_nn":
+                raise ValueError("精修模型须先整合，不能无限嵌套")
+            base = recipe
+            mode = "normal" if update.get("normal_only") else "missing" if update.get("missing_only") else "all"
+            recipe = {"kind": "refined_nn", "base_recipe": base,
+                "refinement": {"nn_kind": update["nn_kind"], "config": update["config"],
+                    "seeds": update["seeds"], "model_stage": update["model_stage"],
+                    "weight": update["weight"], "mode": mode}}
+            recipes[span] = recipe
+        else:
+            raise ValueError(f"{span}精修候选尚未完成相应的多种子或部署算子核验")
+        recipe.update(previous_candidate=summary["base_recipes"][span]["candidate"],
+            previous_source_study=summary["base_recipes"][span]["source_study"],
+            source_study=summary["run_id"], candidate=selection["chosen"], development=candidate["tests"],
+            comparison="previous_promoted_generator1_strategy")
+    return recipes
+
+
+def _generator1_reference_fold_state(reference, prior, span, spec, recipe):
+    import main_nn
+    state = {"recipe": recipe, "train_end": spec["train_end"]}
+    if recipe["kind"] == "nn":
+        state["nn"] = main_nn.load_nn(reference / C.MODEL_DIR / span / recipe["model_stage"] / spec["name"] / f"nn_{recipe['nn_kind']}.pt")
+        if state["nn"].train_end != spec["train_end"]:
+            raise ValueError("精修引用网络的训练截止不一致")
+        state["nn"].config.update(recipe["config"])
+    elif recipe["kind"] == "availability_expert":
+        source = Path(prior["reference"]) / C.MODEL_DIR / span / "R2" / spec["name"]
+        meta = json.loads((source / "meta.json").read_text(encoding="utf-8"))
+        experts = [{"models": _study_load_models(source, meta["files"]), "feature_names": meta["feature_names"]}]
+        for seed in range(1, recipe["seeds"]):
+            folder = reference / C.MODEL_DIR / span / "G7_availability" / str(20261021 + seed) / spec["name"]
+            other = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
+            experts.append({"models": _study_load_models(folder, other["files"]), "feature_names": other["feature_names"]})
+        state.update(experts=experts, expert_kind=recipe["expert_kind"],
+            expert_features=recipe["expert_features"], expert_blend=recipe["expert_blend"])
+    else:
+        raise ValueError("精修参考分支必须先整合为独立网络或树专家")
+    return state
+
+
+def _verify_generator1_refinement(directory, summary):
+    import main_nn
+    from types import SimpleNamespace
+    summary.setdefault("run_id", directory.name)
+    recipes = _generator1_refinement_recipes(summary)
+    problems, checks = [], []
+    if summary["quick"]:
+        print(json.dumps({"passed": False, "problems": ["quick精修不能晋级"]}, ensure_ascii=False))
+        return 1
+    reference = Path(summary["reference"])
+    prior = json.loads((reference / C.REPORT_DIR / C.REPORT_JSON).read_text(encoding="utf-8"))
+    specs = [dict(f) for f in C.FOLDS if f["role"] == "tuning"]
+    prepared = prepare_data(C, cutoff=max(pd.Timestamp(s["start"]) + pd.Timedelta(days=s["days"] + 1) for s in specs))
+    for span, horizons in (("short", C.HORIZONS_S), ("long", C.HORIZONS_L)):
+        chosen = summary["selection"][span]["chosen"]
+        predictions, baselines, truths, cases = [], [], [], []
+        for spec in specs:
+            state = None
+            if chosen != "baseline":
+                recipe = recipes[span]
+                if recipe["kind"] == "refined_nn":
+                    update = recipe["refinement"]
+                    state = {"recipe": recipe, "train_end": spec["train_end"],
+                        "base_state": _generator1_reference_fold_state(reference, prior, span, spec, recipe["base_recipe"]),
+                        "nn": main_nn.load_nn(directory / C.MODEL_DIR / span / update["model_stage"] / spec["name"] / f"nn_{update['nn_kind']}.pt")}
+                else:
+                    model_root = directory if summary["candidates"][span][chosen]["recipe"]["kind"] == "nn" else reference
+                    state = _generator1_reference_fold_state(model_root, prior, span, spec, recipe)
+            for scenario in ("normal", "all_missing", "outage_day7"):
+                folder = directory / C.MODEL_DIR / span
+                with np.load(folder / "baseline" / scenario / spec["name"] / "predictions.npz") as data:
+                    before, truth, positions = [data[k].copy() for k in ("prediction", "truth", "positions")]
+                with np.load(folder / chosen / scenario / spec["name"] / "predictions.npz") as data:
+                    pred = data["prediction"].copy()
+                    if not np.array_equal(data["truth"], truth, equal_nan=True) or not np.array_equal(data["positions"], positions):
+                        problems.append(f"{span}/{scenario}/{spec['name']}索引或真值不一致")
+                if not output.validate_cube(pred, len(horizons), 21 * 96)["valid"] or not np.array_equal(pred[..., 1], before[..., 1]):
+                    problems.append(f"{span}/{scenario}/{spec['name']}总负荷或结构校验失败")
+                diff = 0.
+                if state:
+                    view, _, _, _ = _study_view(prepared, spec)
+                    if scenario != "normal":
+                        view = view.masked_power_gas_copy(pd.Timestamp(spec["start"]) + pd.Timedelta(days=7 if scenario == "outage_day7" else 0))
+                    with np.load(reference / C.MODEL_DIR / span / "baseline" / scenario / spec["name"] / "predictions.npz") as data:
+                        original = data["prediction"].copy()
+                    actual = main_s.apply_generator1_specialist(SimpleNamespace(final_generator1=state, horizons=horizons),
+                        view, positions, original, True)
+                    diff = float(np.max(np.abs(actual - pred)))
+                    if diff > .002:
+                        problems.append(f"{span}/{scenario}/{spec['name']}实际入口复现差异{diff}")
+                checks.append({"span": span, "fold": spec["name"], "scenario": scenario, "max_abs_diff_mw": diff})
+                cases.append({"spec": spec, "scenario": scenario, "baseline": before, "truth": truth})
+                predictions.append(pred)
+                baselines.append(before)
+                truths.append(truth)
+            if state:
+                del state
+                main_nn.clear_cache()
+        rescored = _generator1_evaluate(cases, predictions, horizons)
+        if chosen != "baseline" and not rescored["accepted"]:
+            problems.append(f"{span}精修重新评分未过门槛")
+        summary["selection"][span]["descriptive_intervals"] = {}
+        for scenario in ("normal", "all_missing", "outage_day7"):
+            indices = [i for i, c in enumerate(cases) if c["scenario"] == scenario]
+            summary["selection"][span]["descriptive_intervals"][scenario] = _availability_interval(
+                [np.repeat(predictions[i][..., :1], 2, axis=-1) for i in indices],
+                [np.repeat(baselines[i][..., :1], 2, axis=-1) for i in indices],
+                [np.repeat(truths[i][..., :1], 2, axis=-1) for i in indices])
+    summary["verification"] = {"passed": not problems, "archives": len(checks), "production_paths": checks,
+        "problems": problems, "official_test_used_for_selection": False, "independent_blind_test": False}
+    summary["frozen_recipes"] = recipes
+    (directory / C.REPORT_DIR / C.REPORT_JSON).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(summary["verification"], ensure_ascii=False, indent=2))
+    return 0 if not problems else 1
+
+
+def _train_generator1_final(training, short_bundle, long_bundle, study=None, quick=False, recipes_override=None):
     import main_nn
     import copy
-    recipes = copy.deepcopy(C.GENERATOR1_SPECIALIST)
+    recipes = copy.deepcopy(C.GENERATOR1_SPECIALIST if recipes_override is None else recipes_override)
     if study is not None:
         study = study.resolve()
         if not study.is_relative_to(C.EXPERIMENT_OUTPUT_ROOT.resolve()):
             raise ValueError("generator_1冻结专项必须来自实验目录")
         summary = json.loads((study / C.REPORT_DIR / C.REPORT_JSON).read_text(encoding="utf-8"))
-        if summary.get("status") != "SUCCESS_GENERATOR1_STUDY" or not summary.get("verification", {}).get("passed"):
+        refinement = summary.get("status") == "SUCCESS_GENERATOR1_REFINEMENT"
+        if summary.get("status") not in ("SUCCESS_GENERATOR1_STUDY", "SUCCESS_GENERATOR1_REFINEMENT") or not summary.get("verification", {}).get("passed"):
             raise ValueError("generator_1最终训练要求已核验的全量专项")
-        prior = json.loads((Path(summary["reference"]) / C.REPORT_DIR / C.REPORT_JSON).read_text(encoding="utf-8"))
-        recipes = {}
-        for span, selected in summary["selection"].items():
-            if not selected["accepted"]:
-                continue
-            result = summary["candidates"][span][selected["chosen"]]
-            recipe = {k: v for k, v in result["recipe"].items() if k not in
-                      ("training", "provenance", "inner_reference", "reload_passed", "reload_tolerance_mw", "seed_checks")}
-            if recipe["kind"] in ("availability_expert", "nested_gate"):
-                meta = json.loads((Path(summary["reference"]) / C.MODEL_DIR / span / "R2" / "A" / "meta.json").read_text(encoding="utf-8"))
-                recipe.update(expert_kind=meta["kind"], expert_features=meta["features"],
-                    expert_blend=prior["promotion"][span]["R2"]["blend"])
-            recipe.update(source_study=study.name, candidate=selected["chosen"], development=result["tests"])
-            recipes[span] = recipe
+        recipes = _generator1_refinement_recipes(summary) if refinement else _generator1_study_recipes(study, summary)
     training.require_training_data()
     end, ref = str(training.index[-1]), len(training.index) - 1
     result = {}
@@ -2924,6 +3302,41 @@ def _train_generator1_final(training, short_bundle, long_bundle, study=None, qui
         if existing and existing["recipe"] == recipe and existing["train_end"] == end:
             result[span] = {"recipe": recipe, "reused": True, "train_end": end}
             continue
+        if recipe["kind"] == "refined_nn":
+            if recipe["base_recipe"]["kind"] == "refined_nn":
+                raise ValueError("精修最终训练不允许多层嵌套")
+            temporary = copy.copy(bundle)
+            temporary.selection = copy.deepcopy(bundle.selection)
+            pair = (temporary, long_bundle) if span == "short" else (short_bundle, temporary)
+            _train_generator1_final(training, *pair, quick=quick,
+                recipes_override={span: recipe["base_recipe"]})
+            base_state = temporary.final_generator1
+            update = recipe["refinement"]
+            neural_recipe = {"kind": "nn", "nn_kind": update["nn_kind"], "config": update["config"],
+                "seeds": update["seeds"], "model_stage": update["model_stage"], "weight": 1.,
+                "missing_only": False, "candidate": recipe["candidate"], "source_study": recipe["source_study"]}
+            temporary.final_generator1 = None
+            _train_generator1_final(training, *pair, quick=quick, recipes_override={span: neural_recipe})
+            bundle.final_generator1 = {"recipe": recipe, "train_end": end,
+                "base_state": base_state, "nn": temporary.final_generator1["nn"]}
+            bundle.selection["generator1"] = {"candidate": recipe["candidate"], "source_study": recipe["source_study"]}
+            result[span] = {"recipe": recipe, "train_end": end, "base_reused": existing is not None, "D_reassessed": False}
+            continue
+        if existing and existing["train_end"] == end and existing["recipe"]["kind"] == recipe["kind"] == "nn":
+            before = dict(existing["recipe"]["config"])
+            after = dict(recipe["config"])
+            for key in ("ensemble_aggregation", "aggregation_power"):
+                before.pop(key, None)
+                after.pop(key, None)
+            if before == after and existing["recipe"]["nn_kind"] == recipe["nn_kind"]:
+                state = dict(existing)
+                state["recipe"] = recipe
+                state["nn"] = copy.copy(existing["nn"])
+                state["nn"].config = {**existing["nn"].config, **recipe["config"]}
+                bundle.final_generator1 = state
+                result[span] = {"recipe": recipe, "reused": True, "train_end": end,
+                    "refinement_operator_only": True, "D_reassessed": False}
+                continue
         tick = time.time()
         LOGGER.info("冻结generator_1最终训练 %s/%s，截止=%s", span, recipe["kind"], end)
         state = {"recipe": recipe, "train_end": end}
@@ -2932,8 +3345,9 @@ def _train_generator1_final(training, short_bundle, long_bundle, study=None, qui
                 residual="residual" in recipe["model_stage"], blocked=recipe["model_stage"].startswith("G4"), quick=quick)
         elif recipe["kind"] == "nn":
             view = training
-            for offset in range(7 * C.STEPS_PER_DAY, ref, 21 * C.STEPS_PER_DAY):
-                view = view.masked_power_gas_copy(view.index[offset], view.index[min(offset + 14 * C.STEPS_PER_DAY - 1, ref)])
+            if recipe["config"].get("power_mask_training", True):
+                for offset in range(7 * C.STEPS_PER_DAY, ref, 21 * C.STEPS_PER_DAY):
+                    view = view.masked_power_gas_copy(view.index[offset], view.index[min(offset + 14 * C.STEPS_PER_DAY - 1, ref)])
             state["nn"] = main_nn.train_nn(view, [{"name": "final", "role": "tuning", "train_end": end}],
                 recipe["nn_kind"], bundle.horizons, quick=quick, n_seeds=recipe["seeds"], cfg=recipe["config"])
         else:
@@ -3009,8 +3423,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--nn-study-run", type=Path, action="append", help="infer读取已通过ABC门槛的冻结NN专项")
     parser.add_argument("--availability-study-run", type=Path, help="infer按完整可用性专项冻结配方重训final，不重评D")
     parser.add_argument("--generator1-study-run", type=Path, help="infer按完整generator1专项冻结配方重训专项final")
-    parser.add_argument("--plan-study", help="方案开发专项：baseline、pressure、availability、observed、generator1 或 E1～E6")
+    parser.add_argument("--plan-study", help="方案开发专项：baseline、pressure、availability、observed、generator1、generator1-refine 或 E1～E6")
     parser.add_argument("--g1-stages", default="G0,G1,G2,G3,G4,G5,G6,G7", help="generator1专项阶段，逗号分隔，可续跑")
+    parser.add_argument("--g1-refine-stages", default="reuse,train,normal,seeds,combine", help="generator1-refine阶段：reuse、train、normal、seeds、combine")
     parser.add_argument("--study-reference", type=Path, help="原始运行或已生成的方案开发基线")
     parser.add_argument("--study-resume", type=Path, help="续跑已中断的资源方案专项，核验后复用已完成数组")
     args = parser.parse_args(argv)
@@ -3020,6 +3435,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.plan_study:
         if args.command != "run" or not args.experiment or args.study_reference is None:
             parser.error("--plan-study 必须搭配 run --experiment --study-reference")
+        if args.plan_study == "generator1-refine":
+            return run_generator1_refinement(args)
         return run_generator1_study(args) if args.plan_study == "generator1" else run_plan_study(args)
     if args.reuse_run and args.command != "infer":
         parser.error("--reuse-run 只用于 infer")
