@@ -121,7 +121,7 @@ def official_columns(kind: str) -> list[str]:
 
 
 def expected_result_grid(name: str, origins=None, quick: bool = False) -> pd.DatetimeIndex:
-    """优化指令仍保留目标时刻，不通过改时间戳伪装成起报点。"""
+    """优化生效时刻与长期表时间列一致，每日固定发布，不输出范围外尾部。"""
     grid = (pd.date_range(C.OFFICIAL_EVAL_START, C.OFFICIAL_EVAL_END,
                           freq=f"{C.STEP_MINUTES}min")
             if origins is None else pd.DatetimeIndex(origins))
@@ -130,7 +130,6 @@ def expected_result_grid(name: str, origins=None, quick: bool = False) -> pd.Dat
             raise ValueError("未实现的优化时间语义，禁止静默平移结果")
         if quick:
             grid = grid[:2 * C.STEPS_PER_DAY]
-        grid = grid + pd.Timedelta(minutes=C.STEP_MINUTES)
     return grid
 
 
@@ -169,6 +168,18 @@ def validate_official_frame(name: str, frame: pd.DataFrame, expected_grid=None) 
                 problems.append(f"{name} 存在非有限值")
             if (values < 0).any():
                 problems.append(f"{name} 存在负值")
+            if kind == "opt" and {"opt_generator_1", "opt_generator_all"}.issubset(numeric.columns):
+                first = numeric["opt_generator_1"].to_numpy(dtype=float)
+                total = numeric["opt_generator_all"].to_numpy(dtype=float)
+                if ((first > C.CAPACITY["generator_1"] + 1e-6).any()
+                        or (total > C.CAPACITY["generator_all"] + 1e-6).any()
+                        or (first > total + 1e-6).any()):
+                    problems.append(f"{name} 聚合负荷超容量或总负荷小于小机组负荷")
+                ramp = C.OPT_CONFIG["ramp_fraction_per_min"] * C.STEP_MINUTES
+                tolerance = C.OPT_CONFIG["power_tolerance_mw"] + 1e-6
+                if (np.abs(np.diff(first)) > C.CAPACITY["generator_1"] * ramp + tolerance).any() \
+                        or (np.abs(np.diff(total)) > C.CAPACITY["generator_all"] * ramp + tolerance).any():
+                    problems.append(f"{name} 连续指令聚合爬坡越界")
     return {"passed": not problems, "problems": problems,
             "columns": list(frame.columns), "rows": int(len(frame))}
 
@@ -340,6 +351,9 @@ def load_final_models(directory: Path):
         if item.get("generator1"):
             from main_s import load_generator1
             bundles[-1].final_generator1 = load_generator1(_artifact_path(model_root, item["generator1"]["path"]))
+        if item.get("process_expert"):
+            from main_s import load_generator1
+            bundles[-1].final_process_expert = load_generator1(_artifact_path(model_root, item["process_expert"]["path"]))
     item, artifacts = meta["resource"], meta["artifacts"]["resource"]
     from main_opt import load_resource_model
     models = {tag: load_resource_model((model_root / "resource" / "final" / filename).read_text(encoding="utf-8"))
@@ -352,6 +366,7 @@ def load_final_models(directory: Path):
         gas_caps=item["gas_caps"], final_gas_caps=item["gas_caps"],
         train_end=item["train_end"], final_train_end=item["train_end"],
         selection=selection, dispatch_selection=item["dispatch_selection"],
+        final_physical_validation=item.get("physical_validation", {}),
         resource_nn=None, final_resource_nn=neural, blocker=item.get("blocker"))
     bundles.append(resource)
     return bundles
@@ -415,6 +430,15 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
             same = (loaded["recipe"] == specialist["recipe"] and loaded["train_end"] == specialist["train_end"])
             summary[name]["generator1"] = {"path": directory.relative_to(ctx.model_dir).as_posix(), "reload_ok": same}
             summary["reload_ok"] &= same
+        process = getattr(bundle, "final_process_expert", None) if use_final else None
+        if process:
+            from main_s import save_generator1, load_generator1
+            directory = ctx.model_dir / name / "final_process_expert"
+            save_generator1(process, directory)
+            loaded = load_generator1(directory)
+            same = loaded["recipe"] == process["recipe"] and loaded["train_end"] == process["train_end"]
+            summary[name]["process_expert"] = {"path": directory.relative_to(ctx.model_dir).as_posix(), "reload_ok": same}
+            summary["reload_ok"] &= same
         if nn is not None:
             path = main_nn.save_nn(nn, ctx.model_dir / name / role)
             loaded = main_nn.load_nn(Path(path))
@@ -451,6 +475,7 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
                               if k in bundle.selection},
                 "availability": state,
                 "generator1": summary["short" if len(bundle.horizons) == 8 else "long"].get("generator1"),
+                "process_expert": summary["short" if len(bundle.horizons) == 8 else "long"].get("process_expert"),
                 "blend": bundle.blend, "feature_names": bundle.feature_names,
                 "lgb_kind": bundle.lgb_kind, "lgb_features": bundle.lgb_features,
                 "nn_weights": bundle.nn_weights,
@@ -463,6 +488,7 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
         "run": {"mode": ctx.mode, "quick": ctx.quick, "experimental": ctx.experimental},
         "output_contract": {"prediction": _grid_spec(ctx.prediction_grid),
                             "optimization": _grid_spec(ctx.optimization_grid),
+                            "optimization_coverage_basis": "same_datetime_as_long_forecast; daily_fixed_publication",
                             "window": ctx.window,
                             "optimization_time_semantics": C.OPT_CONFIG["datetime_semantics"]},
         "source": write_source_snapshot(ctx),
@@ -478,6 +504,8 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
                      "heat_rate": resource_bundle.final_heat_rate if use_final else resource_bundle.heat_rate,
                      "gas_caps": resource_bundle.final_gas_caps if use_final else resource_bundle.gas_caps,
                      "train_end": resource_bundle.final_train_end if use_final else resource_bundle.train_end,
+                     "physical_validation": (resource_bundle.final_physical_validation if use_final
+                                             else resource_bundle.physical_validation),
                      "blocker": resource_bundle.blocker},
         "optimization": opt_summary,
         "data_contract": {"target_mask": "整个评测窗口", "step_minutes": C.STEP_MINUTES,
@@ -604,8 +632,8 @@ def build_zip(ctx: RunContext, submittable: bool, config=C) -> dict:
     if (ctx.root / "opt_result.csv").is_file():
         members.append("opt_result.csv")
     paths = [(ctx.root / member, member) for member in members]
-    for name, folder in ((config.SOURCE_DIR, ctx.source_dir), (config.MODEL_DIR, ctx.model_dir)):
-        paths.extend((path, f"{name}/{path.relative_to(folder).as_posix()}")
+    for folder_name, folder in ((config.SOURCE_DIR, ctx.source_dir), (config.MODEL_DIR, ctx.model_dir)):
+        paths.extend((path, f"{folder_name}/{path.relative_to(folder).as_posix()}")
                      for path in sorted(folder.rglob("*")) if path.is_file() and path.name != ".gitignore")
     with ZipFile(temp_path, "w", ZIP_DEFLATED) as packed:
         for path, member in C.progress(paths, desc="生成压缩包", unit="文件"):

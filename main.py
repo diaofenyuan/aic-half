@@ -320,8 +320,10 @@ def run_infer(quick: bool = False, experimental: bool = False,
             summary["reused_models_from"] = str(reuse_run.resolve())
             summary["validation_scope"] = "复用已有最终模型；神经网络按A/B/C冻结晋级，未评估D"
             stages.update(3)
+            main_opt.refresh_physical_validation(resource_bundle, training, use_final=True)
         if C.GENERATOR1_SPECIALIST:
             summary["generator1"] = _train_generator1_final(training, short_bundle, long_bundle, quick=quick)
+        summary["long_process_expert"] = main_l.train_process_expert(training, long_bundle, quick=quick)
         LOGGER.info("训练完成: short=%s/%s long=%s/%s heat_rate_ok=%s",
                     short_bundle.kind, short_bundle.features,
                     long_bundle.kind, long_bundle.features,
@@ -340,14 +342,15 @@ def run_infer(quick: bool = False, experimental: bool = False,
                     prediction_report["short"]["columns"],
                     prediction_report["long"]["columns"])
 
-        resource_forecast = main_opt.forecast_resources(
-            resource_bundle, masked, origins, use_final=True)
+        # 每日规划器只在提前发布时刻预测96步资源，不再构造日内刷新提交指令。
+        resource_forecast = None
         stages.update(1)
         stages.set_description("推理 · 调度优化")
         optimization = main_opt.optimize(resource_forecast, masked, origins,
                                          long_pred, resource_bundle, quick=quick,
                                          use_final=True)
-        optimization.setdefault("summary", {})["submission_physical_check"] = main_opt.physical_submission_check(optimization)
+        optimization.setdefault("summary", {})["physical_validation"] = resource_bundle.final_physical_validation
+        optimization["summary"]["submission_physical_check"] = main_opt.physical_submission_check(optimization)
         optimization_report = output.write_optimization(ctx, optimization.get("schedule"))
         stages.update(1)
         stages.set_description("推理 · 模型与结果归档")
@@ -512,7 +515,8 @@ def run_full(quick: bool = False, experimental: bool = False) -> int:
         stages.set_description("回测 · 调度优化")
         optimization = main_opt.optimize(resource_forecast, masked, origins,
                                          long_pred, resource_bundle, quick=quick)
-        optimization.setdefault("summary", {})["submission_physical_check"] = main_opt.physical_submission_check(optimization)
+        optimization.setdefault("summary", {})["physical_validation"] = resource_bundle.physical_validation
+        optimization["summary"]["submission_physical_check"] = main_opt.physical_submission_check(optimization)
         optimization_report = output.write_optimization(ctx, optimization.get("schedule"))
         stages.update(1)
         stages.set_description("回测 · 模型与结果归档")
@@ -1028,4 +1032,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # Windows 重定向输出可能默认 GBK；统一编码，避免 m³ 等单位使已完成运行报错。
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     sys.exit(main())

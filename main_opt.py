@@ -2,8 +2,8 @@
 
 边界说明：
 - 高炉气柜只有 2 号柜数据可用，焦炉/转炉没有独立柜位，不虚构库存。
-- 热值/效率没有官方数值，只由历史 ``generator_all`` 与三气种耗气做正系数回归，
-  标记为 inferred；正式提交前必须按官方数据字典复核。
+- 官方提供参考热值，密度与效率未完整确定；合法训练期气电综合回归保留 inferred，
+  不用质量比热值直接乘体积流量，也不把原始列缩放升级为官方常数。
 - 已进入正式半决赛；输出字段已核对赛题，代理资源调度仍保留模拟标记。
 """
 from __future__ import annotations
@@ -49,6 +49,8 @@ class ResourceBundle:
     dispatch_selection: dict = field(default_factory=dict)
     resource_nn: dict | None = None
     final_resource_nn: dict | None = None
+    physical_validation: dict = field(default_factory=dict)
+    final_physical_validation: dict = field(default_factory=dict)
 
 
 def physical_submission_check(optimization: dict) -> dict:
@@ -59,6 +61,8 @@ def physical_submission_check(optimization: dict) -> dict:
         "net_resource_boundary": summary.get("resource_mode") == "net_surplus_after_priority_users",
         "plan_constraints": summary.get("plan_validation_passed") is True,
         "physical_feasibility": summary.get("physical_feasibility_certified") is True,
+        "daily_publication": (summary.get("dispatch_mode") == "daily_fixed"
+                              and summary.get("intraday_refresh") is False),
         "datetime_semantics": (C.OPT_CONFIG["datetime_semantics_confirmed"] is True
                                and str(summary.get("time_semantics", "")).startswith(
                                    C.OPT_CONFIG["datetime_semantics"])),
@@ -67,8 +71,9 @@ def physical_submission_check(optimization: dict) -> dict:
         "net_resource_boundary": "可用气仍为历史耗气代理包络，未核验扣除优先生产用户后的净资源边界",
         "plan_constraints": "优化计划约束核验未通过",
         "physical_feasibility": "真实气网物理可行性尚未核验",
-        "datetime_semantics": "优化 datetime 官方时间语义尚未确认",
-        "gas_to_power": "热值、效率与气电换算缺少核验依据",
+        "daily_publication": "优化结果未按官方要求每日固定发布",
+        "datetime_semantics": "优化 datetime 未按官方指令生效时刻生成",
+        "gas_to_power": "训练期气电经验映射缺少通过的验证记录",
         "holder_mapping": "气柜列、容量与实际库存映射缺少核验依据",
         "converter_units": "转炉煤气单位与换算缺少核验依据",
         "priority_user_supply": "优先生产用户全时段供气约束缺少核验依据",
@@ -77,9 +82,222 @@ def physical_submission_check(optimization: dict) -> dict:
         item = evidence.get(name, {})
         checks[name] = (isinstance(item, dict) and item.get("passed") is True
                         and isinstance(item.get("evidence"), str) and bool(item["evidence"].strip()))
+        if isinstance(item, dict) and item.get("reason"):
+            descriptions[name] = item["reason"]
+    if evidence.get("official_constraints"):
+        checks["official_constraints"] = evidence["official_constraints"].get("passed") is True
+        descriptions["official_constraints"] = "当前配置与赛题已明确的硬约束不一致"
     blocked = [name for name, passed in checks.items() if not passed]
     return {"passed": not blocked, "checks": checks, "blocked_items": blocked,
+            "evidence_basis": {name: evidence.get(name, {}).get("basis") for name in checks},
             "problems": [descriptions[name] for name in blocked]}
+
+
+def _physical_stats(values):
+    values = np.asarray(values, dtype=float)
+    finite = values[np.isfinite(values)]
+    return {"rows": len(values), "valid_rows": len(finite),
+        "valid_fraction": float(len(finite) / max(len(values), 1)),
+        "min": float(finite.min()) if len(finite) else None,
+        "median": float(np.median(finite)) if len(finite) else None,
+        "max": float(finite.max()) if len(finite) else None}
+
+
+def physical_gas_ledger(prepared, end_pos):
+    """已知用户扣减账本；混气站进气扣一次，未知项不补零，不冒充完整净余气。"""
+    prepared.require_training_data()
+    if not 0 <= end_pos < len(prepared.index):
+        raise ValueError("物理核验截止位置无效")
+    frame = prepared.frame.iloc[:end_pos + 1]
+
+    def values(columns):
+        block = frame.reindex(columns=list(columns)).replace([np.inf, -np.inf], np.nan)
+        block = block.where(block >= 0.)
+        return block.sum(axis=1, min_count=len(columns))
+
+    specifications = {
+        "blast": {"generation": tuple(f"gas_blast_furnace_{i}" for i in range(1, 6)),
+            "users": tuple(f"gas_air_heater_{i}" for i in range(1, 6)) +
+                     tuple(f"gas_user_blast_furnace_user{i}" for i in range(1, 5)),
+            "mixed": "gas_into_gas_mixed_blast_furnace"},
+        "coke": {"generation": ("gas_coke_oven_1",), "users": (), "mixed": "gas_into_gas_mixed_coke"},
+        "converter": {"generation": ("gas_converter_1",),
+            "users": tuple(sorted({"gas_user_converter_user1", "gas_user_converter_user2"} |
+                {c for c in frame if c.startswith("gas_user_converter_user")})),
+            "mixed": "gas_into_gas_mixed_converter"},
+    }
+    ledger, details = pd.DataFrame(index=frame.index), {}
+    for gas, specification in specifications.items():
+        generation = values(specification["generation"])
+        if gas == "converter":
+            generation = generation * C.CONVERTER_GAS_SCALE
+        # 焦炉原始表无独立生产用户列；只扣已知混气站进气，不宣称其它用户需求为零。
+        priority = values((*specification["users"], specification["mixed"]))
+        ledger[gas] = generation - priority
+        required = (*specification["generation"], *specification["users"], specification["mixed"])
+        missing = [c for c in required if c not in frame or not np.isfinite(frame[c].to_numpy(dtype=float)).any()]
+        details[gas] = {"generation_columns": list(specification["generation"]),
+            "priority_user_columns": list(specification["users"]), "mixed_station_column": specification["mixed"],
+            "unavailable_columns": missing, "net_before_generation": _physical_stats(ledger[gas]),
+            "negative_net_rows": int((ledger[gas] < 0.).sum()),
+            "quantity_role": "remaining_after_known_deductions; not_certified_net_surplus",
+            "all_users_enumerated": False,
+            "unit_basis": "historical_inferred_scale" if gas == "converter" else "official_standard_m3h; raw_sensor_scaling_unverified"}
+    return ledger, details
+
+
+def build_physical_validation(prepared, end_pos, heat_rate):
+    prepared.require_training_data()
+    if not 0 <= end_pos < len(prepared.index):
+        raise ValueError("物理核验截止位置无效")
+    frame = prepared.frame.iloc[:end_pos + 1]
+    end = str(frame.index[-1])
+    calibration_end = heat_rate.get("calibration_end")
+    if calibration_end is not None and pd.Timestamp(calibration_end) > frame.index[-1]:
+        raise ValueError("气电标定截止晚于物理核验前缀，禁止使用未来拟合参数")
+    source = "赛题《煤气发电量预测与发电优化-3》第5页、第7页、第9—10页；data_dictionary.xlsx 数据说明"
+    evidence = {"training_end": end, "scope": "legal_training_prefix_only; no_official_test",
+        "input_semantics": "causally_preprocessed_same_timestamp_grid; no_target_imputation",
+        "data_sources": prepared.source_hashes, "test_data_used": False}
+    rules = (tuple(C.OPT_CONFIG["unit_capacity_mw"]) == (50., 50., 50., 50., 120., 120.)
+        and C.OPT_CONFIG["min_load_ratio"] == .6 and C.OPT_CONFIG["ramp_fraction_per_min"] == .01
+        and C.OPT_CONFIG["ramp_scope"] == "aggregate_generator_1_and_all"
+        and C.GAS_HOLDER["capacity_m3"] == 200000.
+        and C.GAS_HOLDER["safe_low_ratio"] == .15 and C.GAS_HOLDER["safe_high_ratio"] == .9)
+    evidence["official_constraints"] = {"passed": bool(rules), "basis": "official_task",
+        "evidence": source + "；用户补充的2026-10-26赛事统一答复：爬坡修正为1%，启停按聚合负荷检查；其余容量、负荷和安全区沿用赛题。",
+        "unified_reply": {"source": "用户补充的赛事统一答复（2026-10-25），AGENTS.md第11节",
+            "rolling_information_boundary": "known_at_or_before_origin_for_forecast_and_dispatch",
+            "annual_tariffs_known_in_advance": True, "optimization_covers_test_dates": True},
+        "latest_reply": {"source": "用户补充的赛事统一答复（2026-10-26）",
+            "datetime": "instruction_effective_time", "coverage": "align_with_long_forecast_96_steps",
+            "gas_flow_standard_unit": "m3/h", "holder_capacity_by_column_m3": C.GAS_HOLDER["capacity_by_column_m3"],
+            "ramp_fraction_per_min": .01, "startup_shutdown_scope": "aggregate_load",
+            "ramp_time_base_source": C.OPT_CONFIG["ramp_time_base_source"],
+            "coverage_interpretation": "same_datetime_as_long_forecast; one_fixed_publication_per_day",
+            "test_generator_use": "first_48_hours_initial_reference; later_empty_by_design",
+            "test_reference_boundary": "only_observed_prefix_for_operational_initialization; no_predictor_training_or_tuning",
+            "heat_reference": {"blast": 750., "converter": 1250., "coke": 4150., "unit_as_published": "J/kg",
+                "approximate_reference_only": True, "direct_m3h_to_MW_conversion": False,
+                "reason": "质量比热值不能直接乘体积流量得到MW；缺少密度及机组效率，不擅改通知单位"}}}
+
+    validation = heat_rate.get("prefix_validation", {})
+    coefficients = heat_rate.get("coefficients_mw_per_m3h", {})
+    positive = all(np.isfinite(coefficients.get(g, np.nan)) and coefficients.get(g, 0.) > 0.
+                   for g in C.RESOURCE_NAMES)
+    mapping_ok = bool(calibration_end is not None and heat_rate.get("ok") and validation.get("passed")
+        and validation.get("r2", -np.inf) >= C.HEAT_RATE["min_r2"]
+        and validation.get("wape", np.inf) <= C.HEAT_RATE["max_validation_wape"]
+        and abs(validation.get("bias_ratio", np.inf)) <= C.HEAT_RATE["max_validation_abs_bias"] and positive)
+    evidence["gas_to_power"] = {"passed": False, "basis": "training_calibrated_inferred",
+        "evidence": "合法训练前缀内非负无截距气电回归，末7天留出验证；仅核验原始耗气输入到MW的经验映射。",
+        "coefficients": coefficients, "prefix_validation": validation,
+        "calibration_end": calibration_end,
+        "official_heat_reference_provided": True, "official_efficiency_provided": False,
+        "separate_heat_and_efficiency_identifiable": False,
+        "flow_units_confirmed": True, "flow_unit_basis": "official_standard_m3_per_hour_for_generator_consumption",
+        "usable_for_empirical_conversion": mapping_ok,
+        "aggregate_mapping_passed": mapping_ok, "generator_1_mapping_passed": False,
+        "official_model_trigger": "load_deviation_correction_or_missing_load_inference",
+        "reason": ("总负荷经验映射已核验，但四台50MW机组的独立气电映射尚未通过跨期验证"
+                   if mapping_ok else "经验气电映射未通过训练内留出核验")}
+
+    holders = {}
+    for col in sorted(c for c in frame if c.startswith("gas_holder_")):
+        x = frame[col].to_numpy(dtype=float)
+        valid = np.isfinite(x)
+        capacity = C.GAS_HOLDER["capacity_by_column_m3"].get(col)
+        low = capacity * C.GAS_HOLDER["safe_low_ratio"] if capacity is not None else None
+        high = capacity * C.GAS_HOLDER["safe_high_ratio"] if capacity is not None else None
+        holders[col] = {**_physical_stats(x), "capacity_m3": capacity,
+            "safe_low_m3": low, "safe_high_m3": high, "deployed": col == C.GAS_HOLDER["column"],
+            "inside_capacity_fraction": float(np.mean((x[valid] >= 0.) & (x[valid] <= capacity)))
+            if valid.any() and capacity is not None else None,
+            "inside_official_safety_fraction": float(np.mean((x[valid] >= low) & (x[valid] <= high)))
+            if valid.any() and capacity is not None else None}
+    column = C.GAS_HOLDER["column"]
+    capacity = C.GAS_HOLDER["capacity_by_column_m3"].get(column)
+    holder_ok = (column == "gas_holder_blast_furnace_gas_holder_2" and capacity == C.GAS_HOLDER["capacity_m3"]
+        and holders.get(column, {}).get("valid_rows", 0) > 0
+        and holders[column]["inside_capacity_fraction"] == 1.
+        and 30000. <= holders[column]["median"] <= 180000.)
+    evidence["holder_mapping"] = {"passed": False, "basis": "official_independent_holder_safety_requirement",
+        "evidence": "2026-10-26赛事统一答复：1号柜30万m³，2号柜20万m³；实际部署2号柜按m³读取并复核数值范围。",
+        "column": C.GAS_HOLDER["column"], "capacity_m3": C.GAS_HOLDER["capacity_m3"],
+        "capacity_by_column_m3": C.GAS_HOLDER["capacity_by_column_m3"], "deployed_column_scale": 1.,
+        "columns": holders, "deployed_column_mapping_passed": bool(holder_ok),
+        "all_holder_safety_verified": False,
+        "reason": ("2号柜映射已核验；1号柜单位与状态不可用，无法证明两座独立气柜均满足安全区间"
+                   if holder_ok else "实际部署气柜的容量、量级或数值范围核验未通过"),
+        "holder_1_scale_verified": False,
+        "holder_1_deployed": False}
+
+    _, ledger = physical_gas_ledger(prepared, end_pos)
+    evidence["priority_user_supply"] = {"passed": False, "basis": "official_priority_rule_and_training_ledger",
+        "evidence": source + "：先保生产，煤气发生量扣生产用户及混气站进气；混气站上游扣减不重复追加下游混气用户。",
+        "accounting_implemented": True, "gas_ledger": ledger,
+        "forecast_or_dispatch_replaced": False,
+        "reason": "官方允许依据历史推测未观测用户；当前净资源候选尚未通过完整调度晋级，正式模型仍为耗气代理"}
+
+    # 已知用量只构成所需发生量的下界，未知用户和放散使比例不能唯一确定量纲。
+    known_users = [c for c in frame if c.startswith("gas_user_converter_user")
+                   and np.isfinite(frame[c].to_numpy(dtype=float)).any()]
+    required = [*known_users, "gas_into_gas_mixed_converter", "d_use_converter"]
+    required_flow = frame.reindex(columns=required).where(lambda x: x >= 0.).sum(axis=1, min_count=len(required))
+    raw = frame.get("gas_converter_1", pd.Series(np.nan, index=frame.index))
+    ratio = required_flow / raw.where(raw > 0.)
+    valid = ratio.notna()
+    evidence["converter_units"] = {"passed": False, "basis": "historical_inferred_not_unique",
+        "evidence": "2026-10-26赛事统一答复已明确标准m³/h；原始转炉发生量与已知用量仍不闭合，历史倍率不等于官方单位换算。",
+        "standard_unit_confirmed": True, "standard_unit": "m3/h", "raw_converter_scale_verified": False,
+        "inferred_scale": C.CONVERTER_GAS_SCALE, "known_consumption_scale_lower_bound": _physical_stats(ratio),
+        "inferred_scale_below_known_demand_fraction": float((ratio[valid] > C.CONVERTER_GAS_SCALE).mean())
+        if valid.any() else None,
+        "reason": "标准m³/h已明确，但converter_1原始量级归一仍缺可闭合证据；7043.5保持历史推算标记"}
+    evidence["datetime_semantics"] = {"passed": bool(C.OPT_CONFIG["datetime_semantics_confirmed"]),
+        "basis": "official_reply", "evidence": "2026-10-26最新统一答复：优化时间列与长期预测一致，每天提交一次，日内不滚动刷新。",
+        "prediction_origin_and_tail_confirmed": True, "optimization": C.OPT_CONFIG["datetime_semantics"],
+        "reason": None if C.OPT_CONFIG["datetime_semantics_confirmed"] else "未启用官方指令生效时刻口径"}
+    evidence["economic_scoring"] = {"passed": False, "basis": "partially_documented",
+        "evidence": source + "：相对收益提升=(优化效益-基准效益)/基准效益；替代外购电收益需计放散惩罚。",
+        "benefit_formula_confirmed": True, "release_penalty_coefficient_confirmed": False,
+        "historical_release_observed": False, "research_penalty_is_official": False,
+        "reason": "未提供官方放散罚金系数与真实历史放散，不能报告官方净收益提升"}
+    return evidence
+
+
+def refresh_physical_validation(bundle: ResourceBundle, prepared: PreparedData,
+                                use_final: bool = False) -> dict:
+    """补齐旧模型核验记录，复核只读训练前缀，不替换归档模型的实际系数。"""
+    prepared.require_training_data()
+    end = bundle.final_train_end if use_final else bundle.train_end
+    positions = prepared.index.get_indexer([pd.Timestamp(end)])
+    if positions[0] < 1:
+        raise ValueError("实际资源模型的训练截止点不在合法训练网格")
+    pos = int(positions[0])
+    deployed = bundle.final_heat_rate if use_final else bundle.heat_rate
+    heat = dict(deployed)
+    mismatch = False
+    if "calibration_end" not in heat or "bias_ratio" not in heat.get("prefix_validation", {}):
+        audited = estimate_heat_rate(prepared, pos)
+        # 旧归档缺少诊断时，只在参数一致的情况下关联新的前缀复核，禁止悄悄换系数。
+        mismatch = not all(np.isclose(deployed.get("coefficients_mw_per_m3h", {}).get(g, np.nan),
+            audited.get("coefficients_mw_per_m3h", {}).get(g, np.nan), rtol=1e-9, atol=1e-12)
+            for g in C.RESOURCE_NAMES)
+        if not mismatch:
+            heat = audited
+        else:
+            heat.setdefault("calibration_end", str(prepared.index[pos]))
+    validation = build_physical_validation(prepared, pos, heat)
+    if mismatch:
+        validation["gas_to_power"].update(passed=False, usable_for_empirical_conversion=False,
+            reason="归档气电系数与当前训练前缀复核不同，未借用新参数的验证结论")
+    validation["deployed_coefficients_unchanged"] = True
+    if use_final:
+        bundle.final_physical_validation = validation
+    else:
+        bundle.physical_validation = validation
+    return validation
 
 
 def _resource_base(prepared: PreparedData) -> pd.DataFrame:
@@ -244,6 +462,8 @@ def _adjust_available_resources(forecast: np.ndarray, prepared: PreparedData,
 
 def estimate_heat_rate(prepared: PreparedData, end_pos: int) -> dict:
     prepared.require_training_data()
+    if not 0 < end_pos < len(prepared.index):
+        raise ValueError("气电标定截止位置无效")
     frame = prepared.frame.iloc[:end_pos]
     y = prepared.labels["generator_all"].iloc[:end_pos].to_numpy(dtype=float)
     X = frame[["d_use_blast", "d_use_coke", "d_use_converter"]].to_numpy(dtype=float)
@@ -260,22 +480,27 @@ def estimate_heat_rate(prepared: PreparedData, end_pos: int) -> dict:
     split = max(0, len(y) - 7 * C.STEPS_PER_DAY)
     fit_valid, hold_valid = valid.copy(), valid.copy()
     fit_valid[split:], hold_valid[:split] = False, False
-    validation = {"scope": "last_7_days_within_training_prefix", "rows": int(hold_valid.sum())}
+    validation = {"scope": "last_7_days_within_training_prefix", "rows": int(hold_valid.sum()),
+                  "start": str(prepared.index[split]), "end": str(prepared.index[end_pos - 1]),
+                  "fit_end": str(prepared.index[split - 1]) if split else None}
     if fit_valid.sum() >= 1000 and hold_valid.sum() >= 96:
         prefix_model = LinearRegression(positive=True, fit_intercept=False).fit(X[fit_valid], y[fit_valid])
         hold_pred, hold_y = prefix_model.predict(X[hold_valid]), y[hold_valid]
         hold_r2 = 1 - np.sum((hold_pred - hold_y) ** 2) / max(np.sum((hold_y - hold_y.mean()) ** 2), 1e-9)
         validation.update(r2=float(hold_r2),
                           wape=float(np.abs(hold_pred - hold_y).sum() / max(hold_y.sum(), 1e-9)),
+                          bias_ratio=float((hold_pred - hold_y).sum() / max(hold_y.sum(), 1e-9)),
                           passed=bool(hold_r2 >= C.HEAT_RATE["min_r2"]))
         ok = ok and validation["passed"]
     else:
         validation["passed"] = False
         ok = False
     return {"ok": ok, "coefficients_mw_per_m3h": coef, "r2": r2,
+            "calibration_end": str(prepared.index[end_pos - 1]),
+            "coefficient_unit_status": "empirical_MW_per_generator_m3h; raw_generation_scaling_checked_separately",
             "prefix_validation": validation,
             "valid_rows": int(valid.sum()), "method": C.HEAT_RATE["method"],
-            "note": "由历史运行标定，非官方热值/效率；正式提交前需复核"}
+            "note": "合法训练前缀标定的气电综合系数，不分别识别热值与效率；标准耗气单位为m³/h，原始发生量缩放另行核验"}
 
 
 def _gas_caps(prepared: PreparedData, end_pos: int) -> dict:
@@ -648,6 +873,8 @@ def train_resources(prepared: PreparedData, folds: list[dict],
     bundle.final_gas_caps = _gas_caps(prepared, len(prepared.index) - 1)
     bundle.train_end = str(prepared.index[ref_pos])
     bundle.final_train_end = str(prepared.index[-1])
+    refresh_physical_validation(bundle, prepared)
+    refresh_physical_validation(bundle, prepared, use_final=True)
     bundle.train_seconds = time.time() - started
     if not bundle.heat_rate.get("ok"):
         bundle.blocker = "PHYSICAL_MAPPING_UNCERTAIN"
@@ -754,6 +981,56 @@ def _holder_plan_bounds(n: int, config=C) -> tuple:
     return low, high
 
 
+def _aggregate_ramp_groups(config=C):
+    """按提交中的小机组聚合负荷和总负荷检查启停，避免单机最小负荷锁死开机。"""
+    units = np.asarray(config.OPT_CONFIG["unit_capacity_mw"], dtype=float)
+    if config.OPT_CONFIG["ramp_scope"] != "aggregate_generator_1_and_all":
+        raise ValueError("未实现的聚合爬坡口径")
+    fraction = config.OPT_CONFIG["ramp_fraction_per_min"] * config.STEP_MINUTES
+    return [(np.arange(4), float(units[:4].sum() * fraction)),
+            (np.arange(len(units)), float(units.sum() * fraction))]
+
+
+def _allocate_aggregate_power(budget: float, previous: np.ndarray, config=C,
+                              requested_power: np.ndarray | None = None):
+    """回退与事后执行共用组合分配，硬约束冲突时返回失败，不放宽爬坡。"""
+    units = np.asarray(config.OPT_CONFIG["unit_capacity_mw"], dtype=float)
+    groups = _aggregate_ramp_groups(config)
+    first_limit, total_limit = groups[0][1], groups[1][1]
+    first_previous, total_previous = float(previous[:4].sum()), float(previous.sum())
+    best = None
+    for mask in range(1 << len(units)):
+        on = np.array([(mask >> i) & 1 for i in range(len(units))], dtype=bool)
+        lower = np.where(on, units * config.OPT_CONFIG["min_load_ratio"], 0.)
+        upper = np.where(on, units, 0.)
+        first_low = max(float(lower[:4].sum()), first_previous - first_limit)
+        first_high = min(float(upper[:4].sum()), first_previous + first_limit)
+        total_low = max(first_low + float(lower[4:].sum()), total_previous - total_limit)
+        target = min(float(budget), first_high + float(upper[4:].sum()), total_previous + total_limit)
+        if first_low > first_high + 1e-8 or total_low > target + 1e-8:
+            continue
+        feasible_first_low = max(first_low, target - float(upper[4:].sum()))
+        feasible_first_high = min(first_high, target - float(lower[4:].sum()))
+        if feasible_first_high < feasible_first_low - 1e-8:
+            continue
+        # 资源充足时保持已发布聚合负荷，避免重分配造成下一步爬坡冲突。
+        wanted_first = (float(np.asarray(requested_power)[:4].sum()) if requested_power is not None
+                        else feasible_first_high)
+        first = min(max(wanted_first, feasible_first_low), feasible_first_high)
+        power = lower.copy()
+        for indices, wanted in ((range(4), first), (range(4, len(units)), target - first)):
+            remaining = wanted - float(power[list(indices)].sum())
+            for i in indices:
+                extra = min(max(remaining, 0.), upper[i] - power[i])
+                power[i] += extra
+                remaining -= extra
+        deviation = abs(first - wanted_first) if requested_power is not None else 0.
+        key = (round(target, 6), -round(deviation, 6), -int(np.count_nonzero(on != (previous > 1e-5))))
+        if best is None or key > best[0]:
+            best = (key, power)
+    return None if best is None else best[1]
+
+
 def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
                initial_power: np.ndarray, caps: np.ndarray, heat_rate: dict,
                config=C) -> dict:
@@ -818,24 +1095,22 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
             add({off_p + i * n_h + k: 1.0, off_z + i * n_h + k: -cap}, -np.inf, 0.0)
             add({off_p + i * n_h + k: -1.0,
                  off_z + i * n_h + k: config.OPT_CONFIG["min_load_ratio"] * cap}, -np.inf, 0.0)
-    # 同规格机组按编号依次开机，消除等价排列；额定爬坡在本题 15 分钟步长下不约束换位。
+    # 仅在一步可跨额定容量时消除等价排列；较紧爬坡保留与初始状态匹配的组合。
     if config.OPT_CONFIG["ramp_fraction_per_min"] * config.STEP_MINUTES >= 1.0:
         for i in (0, 1, 2, 4):
             if units[i] == units[i + 1]:
                 for k in range(n_h):
                     add({off_z + i * n_h + k: 1.0,
                          off_z + (i + 1) * n_h + k: -1.0}, 0.0, np.inf)
-    ramp = config.OPT_CONFIG["ramp_fraction_per_min"] * config.STEP_MINUTES
-    for i in range(n_u):
-        cap = units[i] * ramp
+    for group, cap in _aggregate_ramp_groups(config):
         for k in range(n_h):
-            prev = initial_power[i] if k == 0 else None
+            delta = {off_p + int(i) * n_h + k: 1.0 for i in group}
             if k > 0:
-                add({off_p + i * n_h + k: 1.0, off_p + i * n_h + k - 1: -1.0}, -np.inf, cap)
-                add({off_p + i * n_h + k - 1: 1.0, off_p + i * n_h + k: -1.0}, -np.inf, cap)
+                delta.update({off_p + int(i) * n_h + k - 1: -1.0 for i in group})
+                add(delta, -cap, cap)
             else:
-                add({off_p + i * n_h: 1.0}, -np.inf, prev + cap)
-                add({off_p + i * n_h: -1.0}, -np.inf, cap - prev)
+                prev = float(np.asarray(initial_power)[group].sum())
+                add(delta, prev - cap, prev + cap)
     for k in range(n_h):
         coeffs = {off_s + k: 1.0}
         rhs = 0.25 * float(avail[k, 0])
@@ -974,13 +1249,13 @@ def validate_day(result: dict, avail: np.ndarray, holder0: float,
     balance = holder - previous - 0.25 * (avail[:, 0] - gas[0] - vent[0])
     energy = power.sum(axis=0) - beta @ gas
     delta = np.diff(np.column_stack([initial_power, power]), axis=1)
-    ramp = units[:, None] * config.OPT_CONFIG["ramp_fraction_per_min"] * config.STEP_MINUTES
     problems = []
     if (power < -pt).any() or (power > units[:, None] + pt).any():
         problems.append("功率越界")
     if ((power > pt) & (power < units[:, None] * config.OPT_CONFIG["min_load_ratio"] - pt)).any():
         problems.append("开机功率低于最小负荷")
-    if (np.abs(delta) > ramp + pt).any():
+    if any((np.abs(delta[group].sum(axis=0)) > cap + pt).any()
+           for group, cap in _aggregate_ramp_groups(config)):
         problems.append("爬坡越界")
     if (gas < -gt).any() or (vent < -gt).any() or (gas > caps[:, None] + gt).any():
         problems.append("耗气或代理释放越界")
@@ -1021,32 +1296,15 @@ def _fallback_day(prepared: PreparedData, pos: int, avail: np.ndarray,
     power, gas, vent = np.zeros((6, len(avail))), np.zeros((3, len(avail))), np.zeros((3, len(avail)))
     holder = np.empty(len(avail))
     level = holder0
-    ramp = units * config.OPT_CONFIG["ramp_fraction_per_min"] * config.STEP_MINUTES
     for k, supply in enumerate(avail):
         available = np.minimum(supply, caps).copy()
         target_level = float(np.clip(level, lower_path[k], upper_path[k]))
         available[0] = min(available[0], max(0.0, supply[0] - (target_level - level) / 0.25))
         budget = float(beta @ available)
-        best = None
-        for mask in range(1 << len(units)):
-            on = np.asarray([(mask >> i) & 1 for i in range(len(units))], dtype=bool)
-            lower = np.where(on, np.maximum(units * config.OPT_CONFIG["min_load_ratio"], previous - ramp), 0.0)
-            upper = np.where(on, np.minimum(units, previous + ramp), 0.0)
-            if ((~on) & (previous > ramp + 1e-8)).any() or (lower > upper + 1e-8).any():
-                continue
-            target = min(budget, float(upper.sum()))
-            if float(lower.sum()) > target + 1e-8:
-                continue
-            if best is None or target > best[0] + 1e-8:
-                best = (target, lower, upper)
-        if best is None:
+        p = _allocate_aggregate_power(budget, previous, config)
+        if p is None:
             return {"status": "BLOCKED_OPT", "message": "资源不足且无合法降载组合"}
-        target, p, upper = best
-        remaining = target - float(p.sum())
-        for i in range(len(units)):
-            extra = min(remaining, upper[i] - p[i])
-            p[i] += extra
-            remaining -= extra
+        target = float(p.sum())
         gas[:, k] = available * (target / budget if budget > 0 else 0.0)
         vent[0, k] = supply[0] - gas[0, k] - (target_level - level) / 0.25
         if vent[0, k] < -config.OPT_CONFIG["gas_tolerance_m3h"]:
@@ -1079,29 +1337,10 @@ def _execute_proxy_step(request_power: np.ndarray, request_gas: np.ndarray,
     substitute = execution_mode in ("substitute", "substitute_vent")
     usable = np.minimum(available if substitute else np.minimum(request_gas, available), caps)
     budget = min(float(beta @ usable), float(np.sum(request_power)))
-    ramp = units * config.OPT_CONFIG["ramp_fraction_per_min"] * config.STEP_MINUTES
-    best = None
-    for mask in range(1 << len(units)):
-        on = np.array([(mask >> i) & 1 for i in range(len(units))], dtype=bool)
-        lower = np.where(on, np.maximum(units * config.OPT_CONFIG["min_load_ratio"], previous - ramp), 0.0)
-        upper = np.where(on, np.minimum(units, previous + ramp), 0.0)
-        target = min(budget, float(upper.sum()))
-        if (lower > upper + 1e-8).any() or lower.sum() > target + 1e-8:
-            continue
-        if ((~on) & (previous > ramp + 1e-8)).any():
-            continue
-        switches = np.count_nonzero(on != (previous > 1e-5))
-        key = (round(target, 6), -switches)
-        if best is None or key > best[0]:
-            best = (key, target, lower, upper)
-    if best is None:
+    power = _allocate_aggregate_power(budget, previous, config, requested_power=request_power)
+    if power is None:
         raise ValueError("气量不足且执行层没有满足爬坡与最小负荷的降载组合")
-    _, target, power, upper = best
-    remaining = target - power.sum()
-    for i in range(len(units)):
-        increment = min(remaining, upper[i] - power[i])
-        power[i] += increment
-        remaining -= increment
+    target = float(power.sum())
     if substitute:
         # 先保留可执行的原配比；缺气后仅利用当前已观察的其他气种补偿。
         gas = np.minimum(request_gas, usable).copy()
@@ -1171,7 +1410,8 @@ def optimize_rolling(resource_forecast: np.ndarray, prepared: PreparedData,
                      origins: pd.DatetimeIndex, resource_bundle: ResourceBundle,
                      quick: bool = False, use_final: bool = False,
                      replan_steps: int | None = None,
-                     control_options: dict | None = None) -> dict:
+                     control_options: dict | None = None,
+                     align_long_horizon: bool = False) -> dict:
     """连续柜位的代理 MPC；每小时重排 96 步，仅执行前四步。
 
     预测器只观察起报点及之前的历史包络；执行降载在目标时刻观察到资源之后发生。
@@ -1222,7 +1462,9 @@ def optimize_rolling(resource_forecast: np.ndarray, prepared: PreparedData,
     revenue, shortfall, vent_volume, realized_steps = 0., 0., 0., 0
     holder_min, holder_max = holder, holder
     started = time.time()
-    for row in C.progress(range(0, limit, steps),
+    rows = ([*range(0, limit - 1, steps), limit - 1] if align_long_horizon
+            else range(0, limit, steps))
+    for row in C.progress(rows,
                           desc=f"滚动调度 · 每 {steps * C.STEP_MINUTES} 分钟重规划",
                           unit="次"):
         origin = origins[row]
@@ -1239,13 +1481,28 @@ def optimize_rolling(resource_forecast: np.ndarray, prepared: PreparedData,
         if result.get("mip_gap") is not None:
             gaps.append(float(result["mip_gap"]))
         validations.append(result["validation"]["passed"])
-        for k in range(min(steps, limit - row)):
+        commit = (len(C.HORIZONS_L) if row == limit - 1 else min(steps, limit - 1 - row)) \
+            if align_long_horizon else min(steps, limit - row)
+        for k in range(commit):
             target = origin + pd.Timedelta(minutes=C.STEP_MINUTES * (k + 1))
             power, gas = result["power"][:, k], result["gas"][:, k]
+            if records:
+                prior_first, prior_total = records[-1][-2:]
+                limits = _aggregate_ramp_groups(cfg)
+                if (abs(float(power[:4].sum()) - prior_first) > limits[0][1] + cfg.OPT_CONFIG["power_tolerance_mw"]
+                        or abs(float(power.sum()) - prior_total) > limits[1][1] + cfg.OPT_CONFIG["power_tolerance_mw"]):
+                    return {"status": "BLOCKED_OPT", "schedule": None,
+                        "summary": {"reason": "连续发布指令与执行反馈之间发生聚合爬坡冲突",
+                                    "failed_origin": str(origin), "failed_target": str(target)}}
             records.append([target, *gas, power[:4].sum(), power.sum()])
             target_pos = int(positions[row]) + k + 1
             if target_pos < len(actual) and np.isfinite(actual[target_pos]).all():
-                executed = _execute_proxy_step(power, gas, actual[target_pos], holder, previous, caps, heat, cfg)
+                try:
+                    executed = _execute_proxy_step(power, gas, actual[target_pos], holder, previous, caps, heat, cfg)
+                except ValueError as exc:
+                    return {"status": "BLOCKED_OPT", "schedule": None,
+                        "summary": {"reason": str(exc), "failed_origin": str(origin),
+                                    "failed_target": str(target), "constraint_conflict": True}}
                 holder, previous = executed["holder"], executed["power"]
                 revenue += price[k] * previous.sum() * .25 * 1000
                 shortfall += executed["shortfall_mwh"]
@@ -1293,6 +1550,8 @@ def optimize_rolling(resource_forecast: np.ndarray, prepared: PreparedData,
         "control_options": options, "execution_gas_mode": cfg.OPT_CONFIG.get("execution_gas_mode", "clip"),
         "plan_feasible": all(validations), "plan_validation_passed": all(validations),
         "physical_feasibility_certified": False, "forecast_uses_historical_holder": False,
+        "physical_validation": (resource_bundle.final_physical_validation if use_final
+                                else resource_bundle.physical_validation),
         "replay_scope": "continuous_envelope_with_observed_resource_curtailment",
         "replay_complete": complete, "realized_steps": realized_steps, "planned_steps": len(schedule),
         "planned_revenue_cny": planned_revenue,
@@ -1309,7 +1568,7 @@ def optimize_rolling(resource_forecast: np.ndarray, prepared: PreparedData,
             "heat_rate": "training_prefix_positive_regression_inferred",
             "gas_caps": "training_prefix_quantile_inferred",
             "holder_capacity_and_safety": "official_task_200000m3_15_to_90_percent",
-            "holder_column_mapping": "inferred_not_officially_verified",
+            "holder_column_mapping": "official_reply_holder_2_200000m3",
             "converter_scale": "historical_inferred_not_official_unit",
             "vent_switch_holder_penalties": "research_assumptions_not_official_costs"},
         "revenue_improvement_ratio": (planned_revenue / historical_revenue - 1.)
@@ -1331,229 +1590,100 @@ def optimize_rolling(resource_forecast: np.ndarray, prepared: PreparedData,
         "solver_status_counts": {s: statuses.count(s) for s in set(statuses)},
         "solver_max_mip_gap": max(gaps) if gaps else None,
         "duration_seconds": time.time() - started,
-        "time_semantics": "target_time; instructions issued before target observation",
+        "time_semantics": "target_time; official_instruction_effective_time",
+        "coverage_basis": "union_of_long_forecast_targets" if align_long_horizon else "committed_replay_steps_only",
+        "official_test_gas_reference": "first_48_hours_only; later_empty_by_design; observed_at_or_before_origin",
         "note": "历史机组耗气是代理供气，执行降载发生在观察到资源之后；所有收益为模拟，不能证明真实气网可执行。"}
     return {"status": "SIMULATED_NOT_SUBMITTABLE", "submittable": False,
             "schedule": schedule, "summary": summary}
+
+
+def optimize_daily(prepared: PreparedData, origins: pd.DatetimeIndex,
+                   resource_bundle: ResourceBundle, quick: bool = False,
+                   use_final: bool = False) -> dict:
+    """每天提前一刻发布完整计划；日内观测只参与事后诊断，不刷新已发布值。"""
+    grid = pd.DatetimeIndex(origins)
+    if quick:
+        grid = grid[:2 * C.STEPS_PER_DAY]
+    if (not len(grid) or grid[0] != grid[0].normalize()
+            or len(grid) % C.STEPS_PER_DAY or grid.has_duplicates
+            or not grid.equals(pd.date_range(grid[0], periods=len(grid), freq="15min"))):
+        return {"status": "BLOCKED_OPT", "schedule": None,
+                "summary": {"reason": "每日固定发布要求完整、连续的自然日网格"}}
+    days = grid[::C.STEPS_PER_DAY]
+    issue_times = days - pd.Timedelta(minutes=C.STEP_MINUTES)
+    positions = prepared.index.get_indexer(issue_times)
+    if (positions < 0).any():
+        return {"status": "BLOCKED_OPT", "schedule": None,
+                "summary": {"reason": "缺少每日首点指令提前生成所需的历史起报点"}}
+    heat = resource_bundle.final_heat_rate if use_final else resource_bundle.heat_rate
+    caps = resource_bundle.final_gas_caps if use_final else resource_bundle.gas_caps
+    if not heat.get("ok"):
+        return {"status": "BLOCKED_OPT", "schedule": None, "summary": {"reason": "PHYSICAL_MAPPING_UNCERTAIN"}}
+    forecast = forecast_resources(resource_bundle, prepared, issue_times, use_final=use_final)
+    observed = prepared.frame[C.GAS_HOLDER["column"]].iloc[:positions[0] + 1].dropna()
+    if observed.empty:
+        return {"status": "BLOCKED_OPT", "schedule": None, "summary": {"reason": "NO_INITIAL_HOLDER"}}
+    holder0 = holder = float(observed.iloc[-1])
+    first = _last_level(prepared, "generator_1", int(positions[0]))
+    total = _last_level(prepared, "generator_all", int(positions[0]))
+    if not np.isfinite([first, total]).all():
+        return {"status": "BLOCKED_OPT", "schedule": None, "summary": {"reason": "NO_INITIAL_POWER"}}
+    previous = np.r_[[first / 4.] * 4, [max(total - first, 0.) / 2.] * 2]
+    prices, records, plans = load_prices(), [], []
+    cfg = SimpleNamespace(**vars(C))
+    cfg.OPT_CONFIG = {**C.OPT_CONFIG, "solver_time_limit_s": 5.}
+    cap_vector = np.array([caps[g] for g in C.RESOURCE_NAMES])
+    for day, issue, pos, avail in zip(days, issue_times, positions, forecast):
+        price = _price_vector(prices, day, C.STEPS_PER_DAY)
+        result = _solve_day(avail, price, holder, previous, cap_vector, heat, cfg)
+        if result["status"] not in ("OPTIMAL", "FEASIBLE_TIMEOUT"):
+            result = _fallback_day(prepared, int(pos), avail, cap_vector, heat, cfg,
+                                   holder0=holder, initial_power=previous)
+        if result["status"] not in ("OPTIMAL", "FEASIBLE_TIMEOUT", "FALLBACK_SAFE"):
+            return {"status": "BLOCKED_OPT", "schedule": None,
+                    "summary": {"reason": result.get("message", result["status"]), "failed_day": str(day)}}
+        plans.append({"day": str(day.date()), "issued_at": str(issue), "steps": C.STEPS_PER_DAY,
+                      "validation": result["validation"], "solver_status": result["status"],
+                      "initial_holder_m3": holder, "terminal_holder_m3": float(result["holder"][-1])})
+        for k in range(C.STEPS_PER_DAY):
+            power, gas = result["power"][:, k], result["gas"][:, k]
+            if records:
+                for value, prior, (_, limit) in zip((power[:4].sum(), power.sum()), records[-1][-2:], _aggregate_ramp_groups(cfg)):
+                    if abs(float(value) - prior) > limit + cfg.OPT_CONFIG["power_tolerance_mw"]:
+                        return {"status": "BLOCKED_OPT", "schedule": None,
+                                "summary": {"reason": "每日发布计划的聚合爬坡衔接冲突", "failed_day": str(day)}}
+            records.append([day + pd.Timedelta(minutes=k * C.STEP_MINUTES), *gas, power[:4].sum(), power.sum()])
+        holder, previous = float(result["holder"][-1]), result["power"][:, -1].copy()
+    schedule = pd.DataFrame(records, columns=["datetime", "opt_generator_use_blast_furnace_gas",
+        "opt_generator_use_coke_gas", "opt_generator_use_converter_gas", "opt_generator_1", "opt_generator_all"])
+    times = pd.DatetimeIndex(schedule.datetime)
+    metrics = _dispatch_metrics(times, schedule.opt_generator_all.to_numpy(), prices)
+    return {"status": "SIMULATED_NOT_SUBMITTABLE", "submittable": False, "schedule": schedule,
+        "summary": {"status": "SIMULATED_NOT_SUBMITTABLE", "resource_mode": "historical_consumption_envelope",
+            "dispatch_mode": "daily_fixed", "daily_publications": len(plans), "daily_plans": plans,
+            "plan_feasible": True, "plan_validation_passed": True, "physical_feasibility_certified": False,
+            "forecast_uses_historical_holder": False, "planned_steps": len(schedule),
+            "initial_holder_m3": holder0, "terminal_holder_m3": holder,
+            "planned_metrics": metrics, "planned_revenue_cny": metrics["generation_revenue_cny"],
+            "planned_generation_mwh": metrics["generation_mwh"],
+            "time_semantics": "target_time; daily instructions issued before the first effective timestamp",
+            "coverage_basis": "same_datetime_as_long_forecast", "intraday_refresh": False,
+            "physical_validation": (resource_bundle.final_physical_validation if use_final else resource_bundle.physical_validation),
+            "note": "每日计划固定发布；库存连续接续预测计划，不把历史柜位重置为优化后的真实状态。"}}
 
 
 def optimize(resource_forecast: np.ndarray, prepared: PreparedData,
              origins: pd.DatetimeIndex, long_pred: np.ndarray,
              resource_bundle: ResourceBundle, quick: bool = False,
              use_final: bool = False) -> dict:
-    """按冻结的点预测控制方案调度；返回明确标记的模拟结果。"""
-    mode = C.OPT_CONFIG.get("availability_mode", "point")
-    if mode != "point":
+    """按最新官方口径每天固定发布，时间列与长期预测一致。"""
+    if C.OPT_CONFIG.get("availability_mode", "point") != "point":
         raise ValueError("正式调度只支持已验证的 point 模式")
-    control = resource_bundle.dispatch_selection.get("chosen")
-    if mode == "point" and control in ("daily", "rolling_proxy"):
-        return optimize_rolling(resource_forecast, prepared, origins, resource_bundle,
-                                 quick=quick, use_final=use_final,
-                                 replan_steps=resource_bundle.dispatch_selection.get("replan_steps",
-                                     C.STEPS_PER_DAY if control == "daily" else C.OPT_CONFIG["rolling_replan_steps"]),
-                                 control_options=resource_bundle.dispatch_selection.get("control_options"))
-    heat_rate = resource_bundle.final_heat_rate if use_final else resource_bundle.heat_rate
-    gas_caps = resource_bundle.final_gas_caps if use_final else resource_bundle.gas_caps
     if resource_bundle.blocker and (not use_final or resource_bundle.blocker != "PHYSICAL_MAPPING_UNCERTAIN"):
-        return {"status": resource_bundle.blocker, "submittable": False,
-                "schedule": None, "summary": {"reason": resource_bundle.blocker}}
-    if not heat_rate.get("ok"):
-        return {"status": "BLOCKED_OPT", "submittable": False, "schedule": None,
-                "summary": {"reason": "PHYSICAL_MAPPING_UNCERTAIN",
-                            "heat_rate": heat_rate}}
-    prices = load_prices()
-    if not prices:
-        return {"status": "BLOCKED_OPT", "submittable": False, "schedule": None,
-                "summary": {"reason": "PRICE_NOT_CONFIRMED"}}
-
-    origin_positions = prepared.index.get_indexer(origins)
-    position_to_row = {prepared.index[int(p)]: i for i, p in enumerate(origin_positions)}
-    days = sorted(set(origins.normalize()))
-    if quick:
-        days = days[:2]
-    actual_series = resource_series(prepared).to_numpy(dtype=float)
-    caps = np.asarray([gas_caps.get(gas, np.nan)
-                       for gas in C.RESOURCE_NAMES], dtype=float)
-    if not np.isfinite(caps).all():
-        return {"status": "BLOCKED_OPT", "submittable": False, "schedule": None,
-                "summary": {"reason": "MISSING_PREFIX_GAS_CAPS"}}
-    low = C.GAS_HOLDER["capacity_m3"] * C.GAS_HOLDER["safe_low_ratio"]
-    high = C.GAS_HOLDER["capacity_m3"] * C.GAS_HOLDER["safe_high_ratio"]
-
-    plans = {}
-    records = []
-    statuses = []
-    for day in C.progress(days, desc="逐日调度 · point", unit="天"):
-        day_origin = pd.Timestamp(day)
-        if day_origin not in position_to_row:
-            continue
-        row = position_to_row[day_origin]
-        pos = int(origin_positions[row])
-        point = resource_forecast[row] * np.array(
-            [C.OPT_CONFIG["gas_safety"][g] for g in C.RESOURCE_NAMES])
-        avail = np.maximum(point, 0.0)
-
-        target_start = day_origin + pd.Timedelta(minutes=C.STEP_MINUTES)
-        price = _price_vector(prices, target_start, len(C.HORIZONS_L))
-        last_g1 = _last_level(prepared, "generator_1", pos)
-        last_all = _last_level(prepared, "generator_all", pos)
-        if not np.isfinite(last_g1):
-            last_g1 = 0.6 * C.CAPACITY["generator_1"]
-        if not np.isfinite(last_all):
-            last_all = 0.6 * C.CAPACITY["generator_all"]
-        holder_series = prepared.frame[C.GAS_HOLDER["column"]]
-        holder_value = holder_series.iloc[pos]
-        if not np.isfinite(holder_value):
-            valid_holder = holder_series.iloc[:pos + 1].dropna()
-            holder_value = (float(valid_holder.iloc[-1]) if len(valid_holder)
-                            else C.GAS_HOLDER["capacity_m3"] * 0.5)
-        initial = np.array([last_g1 / 4.0] * 4 + [max(last_all - last_g1, 0.0) / 2.0] * 2)
-        result = _solve_day(avail, price, float(holder_value),
-                            initial, caps, heat_rate)
-        if result["status"] not in ("OPTIMAL", "FEASIBLE_TIMEOUT"):
-            result = _fallback_day(prepared, pos, avail, caps, heat_rate,
-                                   holder0=float(holder_value), initial_power=initial)
-        if result["status"] not in ("OPTIMAL", "FEASIBLE_TIMEOUT", "FALLBACK_SAFE"):
-            return {"status": "BLOCKED_OPT", "submittable": False, "schedule": None,
-                    "summary": {"reason": result.get("message"), "failed_day": str(day)}}
-        statuses.append(result["status"])
-        times = pd.date_range(target_start, periods=len(C.HORIZONS_L),
-                              freq=f"{C.STEP_MINUTES}min")
-        power = result["power"]
-        gas = result["gas"]
-        frame = pd.DataFrame({
-            "datetime": times,
-            "opt_generator_use_blast_furnace_gas": gas[0],
-            "opt_generator_use_coke_gas": gas[1],
-            "opt_generator_use_converter_gas": gas[2],
-            "opt_generator_1": np.maximum(power[:4].sum(axis=0), 0.0),
-            "opt_generator_all": np.maximum(power.sum(axis=0), 0.0),
-        })
-        plans[day_origin] = frame
-
-        positions = prepared.index.get_indexer(times)
-        # 官方窗口末端目标时刻会越出已发布网格；越界不参与回算，只保留可对齐步。
-        aligned = positions >= 0
-        actual = np.full((len(times), len(C.RESOURCE_NAMES)), np.nan)
-        actual[aligned] = actual_series[positions[aligned]]
-        excess = np.where(np.isfinite(actual), np.maximum(gas.T - actual, 0.0), 0.0)
-        total_power = power.sum(axis=0)
-        planned_revenue = float(np.nansum(price * total_power * 0.25 * 1000.0))
-        label_col = prepared.labels["generator_all"]
-        actual_total = label_col.reindex(times).to_numpy(dtype=float)
-        real_revenue = float(np.nansum(price * actual_total * 0.25 * 1000.0))
-        mean_price = float(np.mean(price)) if len(price) else 0.0
-        weighted_ratio = (float(np.sum(price * total_power)
-                                / max(mean_price * np.sum(total_power), 1e-9))
-                          if mean_price > 0 else None)
-
-        holder = float(holder_value)
-        low_violations = 0
-        overflow = 0.0
-        holder_min, holder_max = holder, holder
-        for k in range(len(times)):
-            gas_b = gas[0, k]
-            vent_b = result["vent"][0, k]
-            if not np.isfinite(actual[k, 0]):
-                break  # 未发布的未来气量不能当作零供气继续回算库存。
-            flow = actual[k, 0]
-            holder += 0.25 * (flow - gas_b - vent_b)
-            if holder > high:
-                overflow += holder - high
-                holder = high
-            elif holder < low:
-                low_violations += 1
-            holder_min = min(holder_min, holder)
-            holder_max = max(holder_max, holder)
-        planned_holder = np.asarray(result["holder"], dtype=float)
-        if np.isfinite(planned_holder).any():
-            plan_violations = int(np.sum((planned_holder < low - 1e-6)
-                                         | (planned_holder > high + 1e-6)))
-            plan_min = float(np.nanmin(planned_holder))
-            plan_max = float(np.nanmax(planned_holder))
-        else:
-            plan_violations = -1
-            plan_min = plan_max = float("nan")
-        above_by_gas = {gas: int(np.sum(excess[:, gi] > 1.0))
-                        for gi, gas in enumerate(C.RESOURCE_NAMES)}
-        records.append({
-            "plan_validation": result["validation"],
-            "baseline_complete": bool(np.isfinite(actual_total).all()),
-            "resource_replay_complete": bool(np.isfinite(actual).all()),
-            "day": str(day.date()), "status": result["status"],
-            "vent_m3": float(np.nansum(result["vent"]) * 0.25),
-            "max_above_baseline_m3h": float(np.nanmax(excess)),
-            "realized_above_baseline_cells": int(np.sum(excess > 1.0)),
-            "realized_above_baseline_by_gas": above_by_gas,
-            "plan_holder_violation_steps": plan_violations,
-            "plan_holder_min_m3": plan_min,
-            "plan_holder_max_m3": plan_max,
-            "realized_holder_low_steps": int(low_violations),
-            "realized_holder_overflow_m3": float(overflow),
-            "realized_holder_min_m3": float(holder_min),
-            "realized_holder_max_m3": float(holder_max),
-            "planned_generation_mwh": float(np.sum(total_power) * 0.25),
-            "baseline_generation_mwh": float(np.nansum(actual_total) * 0.25),
-            "planned_revenue_cny": planned_revenue,
-            "baseline_revenue_cny": real_revenue,
-            "price_weighted_load_ratio": weighted_ratio,
-        })
-
-    if not plans:
-        return {"status": "BLOCKED_OPT", "submittable": False, "schedule": None,
-                "summary": {"reason": "NO_ORIGINS"}}
-    schedule = pd.concat(plans.values()).sort_values("datetime").reset_index(drop=True)
-    total_revenue = float(sum(r["planned_revenue_cny"] for r in records))
-    baseline_revenue = float(sum(r["baseline_revenue_cny"] for r in records))
-    summary = {
-        "status": "SIMULATED_NOT_SUBMITTABLE",
-        "days": len(records),
-        "solver_status_counts": {s: statuses.count(s) for s in set(statuses)},
-        "vent_m3": float(sum(r["vent_m3"] for r in records)),
-        "above_baseline_cells": int(sum(r["realized_above_baseline_cells"]
-                                          for r in records)),
-        "above_baseline_by_gas": {
-            gas: int(sum(r["realized_above_baseline_by_gas"][gas] for r in records))
-            for gas in C.RESOURCE_NAMES},
-        "max_gas_excess_m3h": float(max(r["max_above_baseline_m3h"] for r in records)),
-        "plan_feasible": bool(all(r["plan_holder_violation_steps"] == 0 for r in records)),
-        "plan_holder_violation_steps": int(sum(max(r["plan_holder_violation_steps"], 0)
-                                                for r in records)),
-        "plan_holder_min_m3": float(min(r["plan_holder_min_m3"] for r in records)),
-        "plan_holder_max_m3": float(max(r["plan_holder_max_m3"] for r in records)),
-        "realized_holder_low_steps": int(sum(r["realized_holder_low_steps"]
-                                              for r in records)),
-        "realized_holder_overflow_m3": float(sum(r["realized_holder_overflow_m3"]
-                                                  for r in records)),
-        "realized_holder_min_m3": float(min(r["realized_holder_min_m3"] for r in records)),
-        "realized_holder_max_m3": float(max(r["realized_holder_max_m3"] for r in records)),
-        "planned_generation_mwh": float(sum(r["planned_generation_mwh"] for r in records)),
-        "baseline_generation_mwh": float(sum(r["baseline_generation_mwh"] for r in records)),
-        "planned_revenue_cny": total_revenue,
-        "baseline_revenue_cny": baseline_revenue,
-        "revenue_improvement_ratio": (float((total_revenue - baseline_revenue)
-                                            / baseline_revenue)
-                                      if baseline_revenue > 0 and all(r["baseline_complete"] for r in records) else None),
-        "revenue_basis": "planned_vs_historical_not_realized_profit",
-        "replay_scope": "historical_consumption_envelope_proxy",
-        "physical_feasibility_certified": False,
-        "plan_validation_passed": all(r["plan_validation"]["passed"] for r in records),
-        "price_weighted_load_ratio": (
-            float(np.mean([r["price_weighted_load_ratio"] for r in records
-                           if r["price_weighted_load_ratio"] is not None]))
-            if any(r["price_weighted_load_ratio"] is not None for r in records) else None),
-        "heat_rate": heat_rate,
-        "gas_caps": gas_caps,
-        "resource_mode": "historical_consumption_envelope",
-        "quick_partial_schedule": bool(quick),
-        "holder": {k: C.GAS_HOLDER[k] for k in ("capacity_m3", "safe_low_ratio",
-                                                "safe_high_ratio")},
-        "template_confirmed": bool(C.OPT_CONFIG["template_confirmed"]),
-        "availability_mode": mode,
-        "time_semantics": "target_time t+15min ... t+1440min",
-        "note": "优化输出字段已核对赛题，完整物理口径仍待核验；调度为代理资源包络下的模拟计划；"
-                "计划收益与包络回放仅作代理诊断，非真实可执行净收益；未计放散罚金官方系数。",
-        "daily": records,
-    }
-    return {"status": "SIMULATED_NOT_SUBMITTABLE", "submittable": False,
-            "schedule": schedule, "summary": summary}
+        return {"status": resource_bundle.blocker, "submittable": False, "schedule": None,
+                "summary": {"reason": resource_bundle.blocker}}
+    resource_bundle.dispatch_selection = {"chosen": "daily_fixed", "replan_steps": C.STEPS_PER_DAY,
+        "scope": "official_daily_publication_requirement_20261026", "intraday_refresh": False,
+        "issue_lead_steps": 1, "coverage_basis": "same_datetime_as_long_forecast"}
+    return optimize_daily(prepared, origins, resource_bundle, quick=quick, use_final=use_final)

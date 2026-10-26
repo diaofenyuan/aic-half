@@ -148,16 +148,20 @@ CLEANING = {
     "rolling_min_periods": 24,
 }
 # 数据字典明确：高炉煤气柜容量为 20 万和 30 万 m³。1 号柜有效样本不足且出现
-# 1e30 哨兵，不能作为库存状态；优化只使用 2 号柜并保守限制在 15%~90%。
+# 1e30 哨兵；赛事统一答复已明确 1 号柜 30 万、2 号柜 20 万，当前仅部署 2 号柜。
 GAS_HOLDER = {
     "column": "gas_holder_blast_furnace_gas_holder_2",
     "capacity_m3": 200000.0,
     "safe_low_ratio": 0.15,
     "safe_high_ratio": 0.90,
+    "capacity_by_column_m3": {"gas_holder_blast_furnace_gas_holder_1": 300000.0,
+                              "gas_holder_blast_furnace_gas_holder_2": 200000.0},
     "note": "1号柜数据不可用；焦炉/转炉无独立柜位字段，优化中不虚构库存。",
 }
-# 数据字典未给热值；仅用三维线性回归从历史发电机出力标定，属于 inferred。
+# 官方参考热值尚缺体积换算和效率；保留合法训练期三气种综合标定，属于 inferred。
 HEAT_RATE = {"method": "nnls_like_positive_regression", "min_r2": 0.60,
+             # 仅约束经验气电关系的核验，不作为官方热值、效率或预测选模门槛。
+             "max_validation_wape": 0.10, "max_validation_abs_bias": 0.05,
              "source": "load.csv 历史 generator_all 与三气种发电耗气"}
 
 # 燃料水平画像的近似能量权重（LHV 相对比例），只用于 profile_fuel 的缩放，
@@ -379,14 +383,27 @@ GENERATOR1_SPECIALIST = {'short': {'kind': 'refined_nn',
 # 资源预测与发电优化
 # ---------------------------------------------------------------------------
 RESOURCE_NAMES = ("blast", "coke", "converter")
+# 三种子完整A/B/C缺测验证通过；仅保留实际晋级的长期分组融合配方。
+LONG_PROCESS_EXPERT = {
+    "kind": "global", "features": "gas_no_power_at_t", "decay_days": 60., "seeds": 3,
+    "weights": {"generator_1": {"short": 0., "medium": .05, "long": .025},
+                "generator_all": {"short": .025, "medium": .05, "long": .025}},
+    "source_study": "20261026_daily_dispatch",
+    "development": {"first48h_mean_gain_pp": .06636071799830034,
+                    "all_missing_mean_gain_pp": .08206551000267363,
+                    "seed_mean_gains_pp": [.06855592458056492, .06736435239111198, .06277616233677463],
+                    "scope": "complete_A_B_C_21days; no_D_or_test_reselection"},
+}
 # converter_1 的量纲与其它流量不一致；用历史“用户+混气+发电耗气 / converter_1”
-# 的中位数反推比例。该值明确标记为 inferred，正式数据字典确认后必须复核。
+# 的中位数反推比例。标准 m³/h 已明确，但原始量级归一未闭合，此值仍为 inferred。
 CONVERTER_GAS_SCALE = 7043.5
 OPT_CONFIG = {
     "unit_capacity_mw": (50.0, 50.0, 50.0, 50.0, 120.0, 120.0),
     "unit_groups": (("generator_1", 4), ("generator_all", 6)),
     "min_load_ratio": 0.60,
-    "ramp_fraction_per_min": 0.10,
+    "ramp_fraction_per_min": 0.01,
+    "ramp_scope": "aggregate_generator_1_and_all",
+    "ramp_time_base_source": "original_task_per_minute; latest_reply_revises_percentage_only",
     "availability_safety": 0.80,   # 预测余气打折，抵消未建模用户与计量误差
     "availability_mode": "point",
     "gas_safety": {"blast": 1.0, "coke": 1.0, "converter": 1.0},
@@ -428,9 +445,12 @@ OPT_CONFIG = {
     "max_daily_milp": 31,
     # 已核对本地赛题 PDF 第十三节（三）的五个 opt_ 字段；物理可行性另行核验。
     "template_confirmed": True,
-    # 当前表为指令目标时刻；官方未明确时间口径前不得自动判为可提交。
+    # 2026-10-26 统一答复：datetime 为调度指令生效时刻，与长期预测目标时刻对齐。
     "datetime_semantics": "target_time",
-    "datetime_semantics_confirmed": False,
+    "datetime_semantics_confirmed": True,
+    # 最新答复要求时间列与长期表一致，首点由前一刻起报生成，日内计划不刷新。
+    "publication_mode": "daily_fixed",
+    "publication_lead_steps": 1,
     "price_file": "first_train/price.xlsx",
     "price_unit": "CNY_per_kWh",
 }

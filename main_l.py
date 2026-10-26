@@ -51,6 +51,7 @@ class LongBundle:
     final_train_end: str | None = None
     final_availability: dict | None = None
     final_generator1: dict | None = None
+    final_process_expert: dict | None = None
 
 
 def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -> LongBundle:
@@ -317,4 +318,63 @@ def predict_long(bundle: LongBundle, prepared: PreparedData,
                         C.HORIZONS_L, C.LONG_GROUPS)
     from main_s import apply_generator1_specialist
     result = apply_availability_fallback(bundle, prepared, positions, result, use_final)
-    return apply_generator1_specialist(bundle, prepared, positions, result, use_final)
+    result = apply_generator1_specialist(bundle, prepared, positions, result, use_final)
+    return apply_process_expert(bundle, prepared, positions, result, use_final)
+
+
+def train_process_expert(prepared: PreparedData, bundle: LongBundle, quick: bool = False) -> dict:
+    """冻结配方只重训合法前缀，不重新选权重或查看确认窗口。"""
+    import copy
+    prepared.require_training_data()
+    recipe = copy.deepcopy(C.LONG_PROCESS_EXPERT)
+    end, ref = str(prepared.index[-1]), len(prepared.index) - 1
+    existing = bundle.final_process_expert
+    if existing and existing["recipe"] == recipe and existing["train_end"] == end:
+        return {"reused": True, "train_end": end, "recipe": recipe}
+    positions = np.arange(C.PROFILE_DAYS * C.STEPS_PER_DAY, ref - max(C.HORIZONS_L) + 1,
+                          C.QUICK_TRAIN_STRIDE if quick else C.TRAIN_STRIDE_LONG)
+    experts, started = [], time.time()
+    old_decay = C.DECAY_DAYS
+    try:
+        C.DECAY_DAYS = recipe["decay_days"]
+        for seed in range(recipe["seeds"]):
+            logging.getLogger("aic-half").info("长期过程专家最终训练 seed=%d，截止=%s", 20261021 + seed, end)
+            models, names = _train_models(prepared, build_base_features(prepared, True), positions, C.HORIZONS_L,
+                recipe["kind"], recipe["features"], C.LGBM_TREES_QUICK if quick else C.LGBM_TREES_LONG,
+                ref, params_override={"seed": 20261021 + seed})
+            experts.append({"models": models, "feature_names": names})
+    finally:
+        C.DECAY_DAYS = old_decay
+    bundle.final_process_expert = {"recipe": recipe, "experts": experts, "train_end": end,
+        "max_training_target": str(prepared.index[positions[-1] + max(C.HORIZONS_L)])}
+    bundle.scores["process_expert_development"] = recipe["development"]
+    bundle.scores["base_scores_exclude_process_expert"] = True
+    return {"reused": False, "train_end": end, "recipe": recipe, "seconds": time.time() - started}
+
+
+def apply_process_expert(bundle: LongBundle, prepared: PreparedData, positions: np.ndarray,
+                         prediction: np.ndarray, use_final: bool) -> np.ndarray:
+    state = bundle.final_process_expert if use_final else None
+    if not state:
+        return prediction
+    if pd.Timestamp(state["train_end"]) >= prepared.index[positions.min()]:
+        raise ValueError("长期过程专家的训练截止进入推理窗口")
+    current = prepared.frame[["d_use_blast", "d_use_coke", "d_use_converter"]].to_numpy(dtype=float)[positions]
+    active = ~np.isfinite(current).all(axis=1)
+    if not active.any():
+        return prediction
+    selected, recipe = positions[active], state["recipe"]
+    base = build_base_features(prepared, True)
+    estimates = [enforce_physics(_predict_models(prepared, base, selected, C.HORIZONS_L,
+                  recipe["kind"], recipe["features"], expert["models"], expert["feature_names"]))
+                 for expert in state["experts"]]
+    expert = enforce_physics(np.mean(estimates, axis=0))
+    weights = np.zeros((len(C.HORIZONS_L), 2))
+    for target, name in enumerate(C.TARGETS):
+        for group, low, high in C.LONG_GROUPS:
+            weights[low - 1:high, target] = recipe["weights"][name][group]
+    if not np.isfinite(weights).all() or (weights < 0).any() or (weights > 1).any():
+        raise ValueError("长期过程专家权重不合法")
+    result = prediction.copy()
+    result[active] = enforce_physics(prediction[active] + weights[None] * (expert - prediction[active]))
+    return result

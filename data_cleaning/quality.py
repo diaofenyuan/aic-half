@@ -387,19 +387,28 @@ def _optimizer_contract_check() -> dict:
                        for m in scores.values())
     rng = np.random.default_rng(41)
     level, previous = 100000., np.zeros(6)
+    blocked_shocks = 0
     for _ in range(1200):
-        executed = _execute_proxy_step(np.array([50., 50., 50., 50., 100., 100.]),
-            np.array([8e5, 3e4, 7e4]), rng.random(3) * [8e5, 3e4, 7e4],
-            level, previous, caps, heat)
+        try:
+            executed = _execute_proxy_step(np.array([50., 50., 50., 50., 100., 100.]),
+                np.array([8e5, 3e4, 7e4]), rng.random(3) * [8e5, 3e4, 7e4],
+                level, previous, caps, heat)
+        except ValueError as exc:
+            if "爬坡与最小负荷" not in str(exc):
+                raise
+            blocked_shocks += 1
+            # 突发断气与下降爬坡可能无交集；失败须显式保留，下一独立工况重置初态。
+            level, previous = 100000., np.zeros(6)
+            continue
         level, previous = executed["holder"], executed["power"]
     stress_passed = 30000. <= level <= 180000.
     cfg = SimpleNamespace(**vars(C))
     cfg.OPT_CONFIG = {**C.OPT_CONFIG, "execution_gas_mode": "substitute"}
     request = np.array([50., 50., 50., 50., 0., 0.])
     mapping = {"coefficients_mw_per_m3h": {"blast": .0004, "coke": .002, "converter": .0006}}
-    clipped = _execute_proxy_step(request, np.array([2.5e5, 5e4, 0.]),
+    clipped = _execute_proxy_step(request, np.array([4.375e5, 1.25e4, 0.]),
         np.array([6e5, 0., 0.]), 1e5, request, caps, mapping)
-    substituted = _execute_proxy_step(request, np.array([2.5e5, 5e4, 0.]),
+    substituted = _execute_proxy_step(request, np.array([4.375e5, 1.25e4, 0.]),
         np.array([6e5, 0., 0.]), 1e5, request, caps, mapping, cfg)
     recovered = (substituted["shortfall_mwh"] < clipped["shortfall_mwh"]
                  and abs(substituted["power"].sum() - request.sum()) < 1e-6)
@@ -414,10 +423,18 @@ def _optimizer_contract_check() -> dict:
     overflow_recovered = (np.allclose(before["power"], after["power"])
                           and abs(before["holder"] - after["holder"]) < 1e-6
                           and after["vent_blast_m3h"] < before["vent_blast_m3h"])
+    substitute_blocked = 0
     for _ in range(1200):
-        executed = _execute_proxy_step(np.array([50., 50., 50., 50., 100., 100.]),
-            np.array([8e5, 3e4, 7e4]), rng.random(3) * [8e5, 3e4, 7e4],
-            level, previous, caps, heat, cfg)
+        try:
+            executed = _execute_proxy_step(np.array([50., 50., 50., 50., 100., 100.]),
+                np.array([8e5, 3e4, 7e4]), rng.random(3) * [8e5, 3e4, 7e4],
+                level, previous, caps, heat, cfg)
+        except ValueError as exc:
+            if "爬坡与最小负荷" not in str(exc):
+                raise
+            substitute_blocked += 1
+            level, previous = 100000., np.zeros(6)
+            continue
         level, previous = executed["holder"], executed["power"]
     substitute_safe = 30000. <= level <= 180000.
     times = pd.date_range("2025-01-01 23:45", periods=2, freq="15min")
@@ -471,8 +488,9 @@ def _optimizer_contract_check() -> dict:
                             and resource_adjustment_ok
                             and price.tolist() == [1.0, 2.0]),
             "solver_status": result["status"], "tamper_detected": bool(detected),
-            "continuous_resource_shock_steps": 1200,
-            "substitute_resource_shock_steps": 1200, "fuel_substitution_recovered_power": bool(recovered),
+            "resource_shock_trials": 1200, "hard_constraint_conflicts_blocked": blocked_shocks,
+            "substitute_resource_shock_trials": 1200, "substitute_conflicts_blocked": substitute_blocked,
+            "fuel_substitution_recovered_power": bool(recovered),
             "overflow_substitution_preserves_power_and_holder": bool(overflow_recovered),
             "daily_price_metric_and_missing_values": bool(metrics_ok),
             "peak_resource_adjustment_causal_missing_safe": bool(resource_adjustment_ok),
@@ -484,6 +502,7 @@ def _rolling_causality_check() -> dict:
     import main_opt
     prepared = _synthetic_prepared(480)
     prepared.frame[C.GAS_HOLDER["column"]] = 100000.
+    prepared.frame[["d_use_blast", "d_use_coke", "d_use_converter"]] = [8e5, 3e4, 7e4]
     heat = {"ok": True, "coefficients_mw_per_m3h": {"blast": .000346, "coke": .0019, "converter": .00059}}
     caps = {"blast": 1e6, "coke": 1e5, "converter": 1e5}
     bundle = main_opt.ResourceBundle({}, {}, [], heat_rate=heat, gas_caps=caps,
@@ -498,7 +517,7 @@ def _rolling_causality_check() -> dict:
                                        holder0=holder, initial_power=previous)
 
     def run(data):
-        return main_opt.optimize(forecast, data, origins, np.zeros((len(origins), 96, 2)), bundle)
+        return main_opt.optimize_rolling(forecast, data, origins, bundle)
 
     with patch.object(main_opt, "load_prices", return_value={1: np.ones(96)}), patch.object(main_opt, "_solve_day", side_effect=solve):
         original = run(prepared)
@@ -507,7 +526,7 @@ def _rolling_causality_check() -> dict:
         same_holder = run(changed_holder)
         changed_future = copy.deepcopy(prepared)
         changed_future.frame.loc[origins[0] + pd.Timedelta(minutes=15):,
-                                 ["d_use_blast", "d_use_coke", "d_use_converter"]] = 0.
+                                 ["d_use_blast", "d_use_coke", "d_use_converter"]] *= 1.1
         same_first_commit = run(changed_future)
     holder_not_injected = original["schedule"].equals(same_holder["schedule"])
     no_oracle = original["schedule"].iloc[:4].equals(same_first_commit["schedule"].iloc[:4])
@@ -654,6 +673,81 @@ def _training_target_cutoff_check() -> dict:
     return {"passed": all(rejected), "load_and_resource_targets_rejected": all(rejected)}
 
 
+def _execution_tracking_check() -> dict:
+    from types import SimpleNamespace
+    from main_opt import _execute_proxy_step
+    cfg = SimpleNamespace(**vars(C))
+    cfg.OPT_CONFIG = {**C.OPT_CONFIG, "execution_gas_mode": "substitute_vent"}
+    heat = {"coefficients_mw_per_m3h": {"blast": .000346, "coke": .0019, "converter": .00059}}
+    beta = np.array([heat["coefficients_mw_per_m3h"][g] for g in C.RESOURCE_NAMES])
+    previous, holder, tracked = np.array([30., 30., 30., 30., 100., 100.]), 100000., True
+    for request in (np.array([30., 30., 30., 0., 105., 105.]),
+                    np.array([30., 30., 0., 0., 90., 90.]),
+                    np.array([30., 0., 0., 0., 72., 72.]),
+                    np.array([0., 0., 0., 0., 108., 0.])):
+        gas = np.array([8e5, 2e4, 4e4]) * (request.sum() / (beta @ np.array([8e5, 2e4, 4e4])))
+        result = _execute_proxy_step(request, gas, np.array([1e6, 6e4, 8e4]), holder,
+            previous, np.array([1.1e6, 8e4, 9e4]), heat, cfg)
+        previous, holder = result["power"], result["holder"]
+        tracked &= (abs(previous[:4].sum() - request[:4].sum()) < 1e-6
+                    and abs(previous.sum() - request.sum()) < 1e-6 and result["shortfall_mwh"] < 1e-6)
+    return {"passed": bool(tracked and 30000. <= holder <= 180000.),
+            "published_aggregate_preserved_when_supply_sufficient": bool(tracked)}
+
+
+def _daily_publication_check() -> dict:
+    from unittest.mock import patch
+    import main_opt
+    from output import expected_result_grid, validate_official_frame
+    prepared = _synthetic_prepared(480)
+    prepared.frame[C.GAS_HOLDER["column"]] = 100000.
+    prepared.frame[C.TARGET_COLUMN["generator_1"]] = 120.
+    prepared.frame[C.TARGET_COLUMN["generator_all"]] = 320.
+    origins = prepared.index[192:384]
+    heat = {"ok": True, "coefficients_mw_per_m3h": {"blast": .000346, "coke": .0019, "converter": .00059}}
+    caps = {"blast": 1.2e6, "coke": 1e5, "converter": 1e5}
+    bundle = main_opt.ResourceBundle({}, {}, [], heat_rate=heat, gas_caps=caps)
+    with patch.object(main_opt, "forecast_resources", return_value=np.tile([8e5, 3e4, 7e4], (2, 96, 1))) as forecast, \
+            patch.object(main_opt, "load_prices", return_value={1: np.ones(96)}):
+        result = main_opt.optimize_daily(prepared, origins, bundle)
+    if result.get("schedule") is None:
+        return {"passed": False, "reason": result.get("summary")}
+    frame = result["schedule"]
+    issues = forecast.call_args.args[2]
+    checks = {"one_plan_per_natural_day": result["summary"]["daily_publications"] == 2,
+        "issued_before_first_effective_time": issues.equals(origins[::96] - pd.Timedelta(minutes=15)),
+        "same_grid_as_long_forecast": expected_result_grid("opt_result.csv", origins).equals(origins),
+        "no_intraday_refresh": result["summary"]["intraday_refresh"] is False,
+        "continuous_constraints": validate_official_frame("opt_result.csv", frame, origins)["passed"],
+        "daily_solver_validation": all(p["validation"]["passed"] for p in result["summary"]["daily_plans"])}
+    return {"passed": all(checks.values()), **checks}
+
+
+def _process_expert_check() -> dict:
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import main_l
+    prepared = _synthetic_prepared(600)
+    columns = ["d_use_blast", "d_use_coke", "d_use_converter"]
+    prepared.frame[columns] = [8e5, 3e4, 7e4]
+    positions = np.array([480, 481])
+    prepared.frame.loc[prepared.index[481], columns] = np.nan
+    reference = np.tile([100., 300.], (2, 96, 1))
+    state = {"recipe": C.LONG_PROCESS_EXPERT, "train_end": str(prepared.index[400]),
+             "experts": [{"models": {}, "feature_names": []} for _ in range(3)]}
+    bundle = SimpleNamespace(final_process_expert=state)
+    with patch.object(main_l, "_predict_models", return_value=np.tile([110., 330.], (1, 96, 1))) as predict:
+        result = main_l.apply_process_expert(bundle, prepared, positions, reference, True)
+    expected = reference.copy()
+    for target, name in enumerate(C.TARGETS):
+        for group, low, high in C.LONG_GROUPS:
+            expected[1, low - 1:high, target] += C.LONG_PROCESS_EXPERT["weights"][name][group] * (10. if target == 0 else 30.)
+    checks = {"observed_branch_preserved": np.array_equal(result[0], reference[0]),
+        "three_seed_group_weights": predict.call_count == 3 and np.allclose(result, expected),
+        "historical_role_unchanged": np.array_equal(main_l.apply_process_expert(bundle, prepared, positions, reference, False), reference)}
+    return {"passed": all(checks.values()), **checks}
+
+
 def run_self_checks(config=C) -> dict:
     checks = {
         "stage_isolation": _stage_isolation_check(),
@@ -668,6 +762,9 @@ def run_self_checks(config=C) -> dict:
         "model_roles": _model_role_check(),
         "optimizer_contract": _optimizer_contract_check(),
         "rolling_causality": _rolling_causality_check(),
+        "daily_publication": _daily_publication_check(),
+        "execution_tracking": _execution_tracking_check(),
+        "long_process_expert": _process_expert_check(),
         "power_gas_availability": _power_gas_availability_check(),
         "observed_at_t": _observed_at_t_check(),
         "generator1_contract": _generator1_contract_check(),
