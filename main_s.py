@@ -714,6 +714,34 @@ def train_short(prepared: PreparedData, folds: list[dict], quick: bool = False) 
             C.AVAILABILITY_FALLBACK.get("short"), quick))
 
 
+def train_final_load(prepared: PreparedData, span: str, bundle_type, quick: bool = False):
+    """只拟合已冻结部署配方；短长任务各自建模，不读取开发或确认折分数。"""
+    import copy
+    prepared.require_training_data()
+    started = time.time()
+    recipe = copy.deepcopy(C.FROZEN_LOAD_RECIPES[span])
+    horizons = C.HORIZONS_S if span == "short" else C.HORIZONS_L
+    ref = len(prepared.index) - 1
+    end = str(prepared.index[ref])
+    stride = C.QUICK_TRAIN_STRIDE if quick else (C.TRAIN_STRIDE_SHORT if span == "short" else C.TRAIN_STRIDE_LONG)
+    positions = np.arange(C.PROFILE_DAYS * C.STEPS_PER_DAY, ref - max(horizons) + 1, stride)
+    if not len(positions):
+        raise ValueError("最终训练前缀不足以构造合法目标")
+    rounds = C.LGBM_TREES_QUICK if quick else (C.LGBM_TREES_SHORT if span == "short" else C.LGBM_TREES_LONG)
+    models, names = _train_models(prepared, build_base_features(prepared, include_targets=True),
+        positions, horizons, recipe["lgb_kind"], recipe["lgb_features"],
+        rounds, ref)
+    neural = main_nn.train_nn(prepared, [{"name": "final", "role": "tuning", "train_end": end}],
+        kind=C.NN_CONFIG["kind_" + span], horizons=horizons, quick=quick, n_seeds=int(C.NN_CONFIG["n_seeds"]))
+    return bundle_type(**recipe, horizons=horizons, models={}, final_models=models, feature_names=names,
+        final_nn_bundle=neural, final_availability=train_availability_fallback(
+            prepared, horizons, C.AVAILABILITY_FALLBACK[span], quick),
+        selection={"chosen": copy.deepcopy(recipe), "selection_scope": "frozen_recipe_no_search"},
+        scores={"scope": "no_new_validation; historical_scores_not_recomputed"},
+        train_rows=len(positions) * len(horizons), train_seconds=time.time() - started,
+        train_end=end, final_train_end=end)
+
+
 def train_availability_fallback(prepared: PreparedData, horizons: tuple[int, ...],
                                 recipe: dict | None, quick: bool = False) -> dict | None:
     """只按已冻结配方重训最终缺测分支，不重新访问开发折或确认折。"""

@@ -154,11 +154,19 @@ def validate_publication_contract(meta: dict, grid) -> dict:
             visible = effective.intersection(grid)
             if plan.get("steps") != C.STEPS_PER_DAY or plan.get("published_steps") != len(visible):
                 problems.append("每日窗口长度或首尾提交范围不一致")
+            if (not len(visible) or plan.get("effective_start") != str(effective[0])
+                    or plan.get("effective_end") != str(effective[-1])
+                    or plan.get("published_start") != str(visible[0])
+                    or plan.get("published_end") != str(visible[-1])):
+                problems.append("每日计划的生效边界与实际发布时间不一致")
+            if plan.get("validation", {}).get("passed") is not True:
+                problems.append("每日计划缺少通过的约束核验")
         resource = meta["resource"]
         ends = [resource["train_end"], resource.get("heat_rate", {}).get("calibration_end")]
         recorded = summary.get("resource_publication_check", {})
         ends.extend(recorded.get("training_ends", {}).values())
-        if (not len(expected) or not recorded.get("passed")
+        if (not len(expected) or not recorded.get("passed") or recorded.get("first_issue") != str(expected[0])
+                or resource.get("train_end") is None or resource.get("heat_rate", {}).get("calibration_end") is None
                 or any(pd.isna(pd.Timestamp(v)) or pd.Timestamp(v) > expected[0] for v in ends if v is not None)):
             problems.append("资源权重或标定参数晚于首份计划发布时刻")
     except (KeyError, TypeError, ValueError) as exc:

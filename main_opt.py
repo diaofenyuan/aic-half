@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import copy
 import re
 import time
 import logging
@@ -601,251 +602,6 @@ def score_resources(forecast: np.ndarray, truth: np.ndarray) -> dict:
     return metrics
 
 
-def _select_dispatch(controls: list[dict], candidates: dict) -> dict:
-    """以完整同窗回放晋级，收益改善不能以增加降载或代理释放换取。"""
-    ranking = []
-    for name, (steps, options) in candidates.items():
-        gains, releases, passed = [], [], bool(controls)
-        for item in controls:
-            baseline, trial = item["comparison"]["daily"], item["comparison"][name]
-            before, after = (x.get("proxy_inventory_adjusted_revenue_cny") for x in (baseline, trial))
-            valid = (baseline.get("plan_validation_passed") and baseline.get("replay_complete")
-                     and trial.get("plan_validation_passed") and trial.get("replay_complete")
-                     and before is not None and before > 0 and after is not None)
-            if not valid:
-                passed = False
-                continue
-            gains.append(after / before - 1.)
-            releases.append(trial["proxy_blast_vent_m3"])
-            passed = (passed
-                and trial["proxy_curtailed_generation_mwh"] <= baseline["proxy_curtailed_generation_mwh"] + 1e-5
-                and trial["proxy_blast_vent_m3"] <= baseline["proxy_blast_vent_m3"] + 1.
-                and (trial["price_weighted_load_ratio"] or 0.) >= (baseline["price_weighted_load_ratio"] or 0.) - .001)
-        accepted = (name != "daily" and passed and len(gains) == len(controls)
-                    and np.mean(gains) >= .002 and min(gains) >= -.01)
-        ranking.append({"candidate": name, "accepted": bool(accepted),
-                        "mean_gain_ratio": float(np.mean(gains)) if gains else None,
-                        "worst_gain_ratio": float(min(gains)) if gains else None,
-                        "mean_proxy_blast_release_m3": float(np.mean(releases)) if releases else None})
-    accepted = [row for row in ranking if row["accepted"]]
-    # 收益数值等价时优先少释放的方案，不靠未确认的罚金权重打破平局。
-    winner = max(accepted, key=lambda row: (round(row["mean_gain_ratio"], 8),
-                 -row["mean_proxy_blast_release_m3"]))["candidate"] if accepted else "daily"
-    steps, options = candidates[winner]
-    return {"chosen": "daily" if steps == C.STEPS_PER_DAY else "rolling_proxy",
-            "candidate": winner, "replan_steps": steps, "control_options": options,
-            "scope": "first_48h_per_tuning_fold_only", "oof": controls, "ranking": ranking,
-            "promotion": "mean>=0.2%, every_fold>=-1%, no_fold_curtailment_or_release_increase, E_drop<=0.001"}
-
-
-def _resource_oof(prepared: PreparedData, folds: list[dict], quick: bool, num_round: int) -> dict:
-    """只在 A/B/C 前缀样本外选择逐气种损失函数，确认窗口不参加选择。"""
-    results = {"regression_l1": [], "regression_l2": []}
-    caches = []
-    for fold in C.progress([f for f in folds if f["role"] == "tuning"],
-                            desc="资源开发验证", unit="折"):
-        masked = prepared.masked_copy(fold["start"], pd.Timestamp(fold["start"]) + pd.Timedelta(days=fold["days"]))
-        positions, eval_positions, ref = _resource_positions(masked, fold, quick)
-        truth = resource_series(masked).to_numpy()[eval_positions[:, None] + np.asarray(C.HORIZONS_L)]
-        cached = {"fold": fold["name"], "prepared": masked,
-                  "origins": masked.index[eval_positions], "predictions": {}, "ref": ref,
-                  "truth": truth}
-        baseline_models = None
-        for objective in C.progress(results, desc=f"资源折 {fold['name']} 损失函数", unit="候选"):
-            logging.getLogger("aic-half").info("资源开发折 %s: %s", fold["name"], objective)
-            models, names = _fit_resource_models(masked, positions, num_round, ref,
-                                                objectives={g: objective for g in C.RESOURCE_NAMES})
-            bundle = ResourceBundle(models, {}, names)
-            pred = forecast_resources(bundle, masked, masked.index[eval_positions])
-            cached["predictions"][objective] = pred
-            results[objective].append({"fold": fold["name"], "metrics": score_resources(pred, truth)})
-            if objective == "regression_l1":
-                baseline_models = models
-        head_positions = _resource_head_positions(ref, quick)
-        head_models, head_names = _fit_resource_models(masked, head_positions, num_round, ref,
-            objectives={g: "regression_l1" for g in C.RESOURCE_NAMES}, horizons=C.HORIZONS_S)
-        if head_names != names:
-            raise ValueError("短资源头与长期资源特征顺序不一致")
-        pool = {**baseline_models, **{gas + "__head": model for gas, model in head_models.items()}}
-        head_prediction = forecast_resources(ResourceBundle(pool, {}, names), masked, masked.index[eval_positions])
-        cached["head_prediction"] = head_prediction[:, :len(C.HORIZONS_S)]
-        cached["head_metrics"] = score_resources(head_prediction, truth)
-        cached["head_max_training_target"] = str(masked.index[head_positions[-1] + max(C.HORIZONS_S)])
-        caches.append(cached)
-    chosen = {}
-    for gas in C.RESOURCE_NAMES:
-        baseline = [r["metrics"][gas]["wape"] for r in results["regression_l1"]]
-        alternative = [r["metrics"][gas]["wape"] for r in results["regression_l2"]]
-        valid = all(v is not None for v in baseline + alternative)
-        promote = (valid and np.mean(alternative) < np.mean(baseline)
-                   and all(a <= b + .02 for a, b in zip(alternative, baseline)))
-        chosen[gas] = "regression_l2" if promote else "regression_l1"
-    head_gases = []
-    for gas in C.RESOURCE_NAMES:
-        baseline = [r["metrics"][gas]["groups"]["short"]["wape"] for r in results[chosen[gas]]]
-        head = [item["head_metrics"][gas]["groups"]["short"]["wape"] for item in caches]
-        if (all(v is not None for v in baseline + head)
-                and np.mean(head) <= np.mean(baseline) - .005
-                and all(a <= b + .02 for a, b in zip(head, baseline))):
-            head_gases.append(gas)
-    controls = []
-    candidates = {"daily": (C.STEPS_PER_DAY, {}),
-                  "hour_clip": (C.OPT_CONFIG["rolling_replan_steps"], {}),
-                  "hour_substitute": (C.OPT_CONFIG["rolling_replan_steps"],
-                                      {"execution_gas_mode": "substitute"}),
-                  "hour_substitute_vent": (C.OPT_CONFIG["rolling_replan_steps"],
-                                           {"execution_gas_mode": "substitute_vent"})}
-    if head_gases:
-        candidates["head_hour_substitute_vent"] = (C.OPT_CONFIG["rolling_replan_steps"],
-                                                   {"execution_gas_mode": "substitute_vent"})
-        candidates["head_half_hour_substitute_vent"] = (C.OPT_CONFIG["rolling_replan_steps"],
-                                                        {"execution_gas_mode": "substitute_vent"})
-        candidates["head_half_peak_persist15_substitute_vent"] = (1,
-                                                        {"execution_gas_mode": "substitute_vent"})
-        candidates["head_half_peak_nn15_substitute_vent"] = (1,
-                                                        {"execution_gas_mode": "substitute_vent"})
-        candidates["head_half_peak_nn03_15_substitute_vent"] = (1,
-                                                        {"execution_gas_mode": "substitute_vent"})
-    head_weights = {"head_hour_substitute_vent": 1., "head_half_hour_substitute_vent": .5,
-                    "head_half_peak_persist15_substitute_vent": .5,
-                    "head_half_peak_nn15_substitute_vent": .5,
-                    "head_half_peak_nn03_15_substitute_vent": .5}
-    adjustments = {"head_half_peak_persist15_substitute_vent": {
-        "method": "positive_persistence_peak", "threshold_ratio": .03, "weight": .5},
-        "head_half_peak_nn15_substitute_vent": {
-        "method": "positive_nn_peak", "threshold_ratio": .05, "weight": 1.},
-        "head_half_peak_nn03_15_substitute_vent": {
-        "method": "positive_nn_peak", "threshold_ratio": .03, "weight": .5}}
-    adjustment_metrics = {name: [] for name in adjustments}
-    nn_training = []
-    for item in C.progress(caches, desc="调度策略初筛", unit="折"):
-        data, ref = item["prepared"], item["ref"]
-        heat, caps = estimate_heat_rate(data, ref), _gas_caps(data, ref)
-        frozen = ResourceBundle({}, {}, [], heat_rate=heat, gas_caps=caps)
-        if head_gases and heat.get("ok"):
-            import main_nn
-            base = _resource_base(data)
-            pack = main_nn.train_resource_nn(base, resource_series(data), ref, heat, load_prices(),
-                                         quick)
-            item["nn_forecast"] = main_nn.predict_resource_nn(pack, base, resource_series(data),
-                                                               data.index.get_indexer(item["origins"]))
-            nn_training.append({"fold": item["fold"], **{k: pack[k] for k in
-                ("kind", "epochs", "inner_error", "train_end", "inner_train_end", "max_training_target", "seed")}})
-        forecast = np.stack([item["predictions"][chosen[g]][:, :, gi]
-                             for gi, g in enumerate(C.RESOURCE_NAMES)], axis=2)
-        head_forecast = forecast.copy()
-        for gi, gas in enumerate(C.RESOURCE_NAMES):
-            if gas in head_gases:
-                head_forecast[:, :len(C.HORIZONS_S), gi] = item["head_prediction"][:, :, gi]
-        item["selected_forecast"], item["head_forecast"] = forecast, head_forecast
-        comparisons = {}
-        for name, (interval, options) in C.progress(candidates.items(),
-                                                   desc=f"调度折 {item['fold']} 候选", unit="策略"):
-            weight = head_weights.get(name, 0.)
-            trial = (forecast * (1. - weight) + head_forecast * weight) if weight else forecast
-            if name in adjustments:
-                before = score_resources(trial, item["truth"])
-                trial = _adjust_available_resources(trial, data, item["origins"], heat, adjustments[name],
-                    expert=item.get("nn_forecast"))
-                after = score_resources(trial, item["truth"])
-                adjustment_metrics[name].append({"fold": item["fold"],
-                    "before_short_wape": {g: before[g]["groups"]["short"]["wape"] for g in C.RESOURCE_NAMES},
-                    "after_short_wape": {g: after[g]["groups"]["short"]["wape"] for g in C.RESOURCE_NAMES}})
-            replay = optimize_rolling(trial,
-                                      data, item["origins"], frozen,
-                                      quick=True, replan_steps=interval, control_options=options)
-            comparisons[name] = replay["summary"]
-        controls.append({"fold": item["fold"], "comparison": comparisons})
-    adjustment_allowed = {}
-    for name, rows in adjustment_metrics.items():
-        before = [r["before_short_wape"][g] for r in rows for g in C.RESOURCE_NAMES]
-        after = [r["after_short_wape"][g] for r in rows for g in C.RESOURCE_NAMES]
-        valid = bool(rows) and all(v is not None for v in before + after)
-        adjustment_allowed[name] = bool(valid and np.mean(after) < np.mean(before)
-            and all(a <= b + .02 for a, b in zip(after, before)))
-    candidates = {name: spec for name, spec in candidates.items()
-                  if name not in adjustments or adjustment_allowed[name]}
-    dispatch = _select_dispatch(controls, candidates)
-    confirmation = {}
-    if not quick and head_gases:
-        # 48小时只做初筛；资源头必须在完整开发折上避免增加已部署策略的降载。
-        screen_ranking = dispatch["ranking"]
-        raw_candidates = {name: spec for name, spec in candidates.items() if name not in head_weights}
-        base_dispatch = _select_dispatch(controls, raw_candidates)
-        screened = {row["candidate"] for row in dispatch["ranking"] if row["accepted"]}
-        eligible = [name for name in head_weights if name in screened]
-        full_controls = []
-        base_name = base_dispatch["candidate"]
-        references = (["head_half_hour_substitute_vent"]
-                      if any(name in adjustments for name in eligible) else [])
-        for item in C.progress(caches if eligible else [], desc="调度全窗口核验", unit="折"):
-            comparisons = {}
-            for name in C.progress(dict.fromkeys(["daily", base_name, *references, *eligible]),
-                                    desc=f"调度折 {item['fold']} 全窗口候选", unit="策略"):
-                interval, options = candidates[name]
-                weight = head_weights.get(name, 0.)
-                forecast = item["selected_forecast"]
-                trial = (forecast * (1. - weight) + item["head_forecast"] * weight) if weight else forecast
-                heat = estimate_heat_rate(item["prepared"], item["ref"])
-                if name in adjustments:
-                    trial = _adjust_available_resources(trial, item["prepared"], item["origins"],
-                                                        heat, adjustments[name], expert=item.get("nn_forecast"))
-                replay = optimize_rolling(trial, item["prepared"], item["origins"],
-                    ResourceBundle({}, {}, [], heat_rate=heat,
-                                   gas_caps=_gas_caps(item["prepared"], item["ref"])),
-                    replan_steps=interval, control_options=options)
-                comparisons[name] = replay["summary"]
-            full_controls.append({"fold": item["fold"], "comparison": comparisons})
-        full_candidates = {name: candidates[name] for name in dict.fromkeys(["daily", base_name, *references, *eligible])}
-        checked = _select_dispatch(full_controls, full_candidates)
-        accepted = []
-        for row in checked["ranking"]:
-            name = row["candidate"]
-            if name not in eligible or not row["accepted"]:
-                continue
-            gains, safe = [], True
-            for item in full_controls:
-                baseline, trial = item["comparison"][base_name], item["comparison"][name]
-                gains.append(trial["proxy_inventory_adjusted_revenue_cny"] /
-                             baseline["proxy_inventory_adjusted_revenue_cny"] - 1.)
-                safe &= trial["proxy_curtailed_generation_mwh"] <= baseline["proxy_curtailed_generation_mwh"] + 1e-5
-            if name in adjustments:
-                # 新修正还必须胜过已经选定的八步50%小时控制，不能增加其降载。
-                previous_gains = []
-                for item in full_controls:
-                    previous = item["comparison"]["head_half_hour_substitute_vent"]
-                    trial = item["comparison"][name]
-                    previous_gains.append(trial["proxy_inventory_adjusted_revenue_cny"] /
-                                          previous["proxy_inventory_adjusted_revenue_cny"] - 1.)
-                    safe &= trial["proxy_curtailed_generation_mwh"] <= previous["proxy_curtailed_generation_mwh"] + 1e-5
-                safe &= np.mean(previous_gains) >= .002 and min(previous_gains) >= -.01
-                row["gain_vs_previous_head_control"] = previous_gains
-            row["gain_vs_existing_control"] = gains
-            row["head_gate_passed"] = bool(safe and np.mean(gains) >= .002 and min(gains) >= -.01)
-            if row["head_gate_passed"]:
-                accepted.append(row)
-        dispatch = base_dispatch
-        if accepted:
-            winner = max(accepted, key=lambda row: row["mean_gain_ratio"])["candidate"]
-            dispatch = {**dispatch, "candidate": winner, "chosen": "rolling_proxy",
-                        "replan_steps": candidates[winner][0], "control_options": candidates[winner][1]}
-        dispatch["scope"] = "first_48h_screen_then_full_development_head_gate"
-        dispatch["ranking"] = screen_ranking
-        confirmation = {"scope": "complete_development_folds_only; no_D_reselection",
-                        "oof": full_controls, "ranking": checked["ranking"]}
-    head_selection = {"gases": head_gases if dispatch["candidate"].startswith("head_") else [],
-        "candidate_gases": head_gases, "horizons": list(C.HORIZONS_S),
-        "weight": head_weights.get(dispatch["candidate"], 0.), "confirmation": confirmation,
-        "method": "independent_L1_8_steps; short_WAPE_screen_then_joint_dispatch_gate",
-        "oof": [{"fold": item["fold"], "metrics": item["head_metrics"],
-                 "max_training_target": item["head_max_training_target"]} for item in caches]}
-    return {"objectives": chosen, "oof": results, "selection_scope": "tuning_folds_only",
-            "metric": "all_finite_wape_including_zero", "max_fold_wape_drop": .02,
-            "dispatch_selection": dispatch, "head_selection": head_selection,
-            "availability_adjustment": adjustments.get(dispatch["candidate"], {}),
-            "availability_adjustment_selection": {"allowed": adjustment_allowed, "oof": adjustment_metrics,
-                                                   "nn_training": nn_training}}
-
 
 def _resource_head_positions(ref_pos: int, quick: bool) -> np.ndarray:
     stride = C.QUICK_TRAIN_STRIDE if quick else C.TRAIN_STRIDE_LONG
@@ -868,7 +624,7 @@ def train_resources(prepared: PreparedData, folds: list[dict],
         raise ValueError("资源确认折缺少首份每日计划的发布时刻")
     positions = positions[positions + max(C.HORIZONS_L) <= ref_pos]
     num_round = C.LGBM_TREES_QUICK if quick else C.LGBM_TREES_LONG
-    selection = _resource_oof(prepared, folds, quick, num_round)
+    selection = copy.deepcopy(C.FROZEN_RESOURCE_RECIPE)
     logging.getLogger("aic-half").info("资源头=%s，融合权重=%s，控制候选=%s",
         selection["head_selection"]["gases"], selection["head_selection"]["weight"],
         selection["dispatch_selection"]["candidate"])
@@ -920,6 +676,44 @@ def train_resources(prepared: PreparedData, folds: list[dict],
         bundle.blocker = "PHYSICAL_MAPPING_UNCERTAIN"
     if C.GAS_HOLDER["column"] not in prepared.frame.columns:
         bundle.blocker = "MISSING_GAS_HOLDER_MAPPING"
+    return bundle
+
+
+def train_final_resources(prepared: PreparedData, quick: bool = False) -> ResourceBundle:
+    """只按已部署配方重训首份每日计划之前的资源模型，不重新选择小时控制策略。"""
+    import main_nn
+    prepared.require_training_data()
+    started = time.time()
+    recipe = copy.deepcopy(C.FROZEN_RESOURCE_RECIPE)
+    recipe["dispatch_selection"]["publication_time"] = C.OPT_CONFIG["publication_time"]
+    ref = len(prepared.index) - 1
+    positions = np.arange(C.PROFILE_DAYS * C.STEPS_PER_DAY, ref - max(C.HORIZONS_L) + 1,
+                         C.QUICK_TRAIN_STRIDE if quick else C.TRAIN_STRIDE_LONG)
+    if not len(positions):
+        raise ValueError("资源最终训练前缀不足")
+    rounds = C.LGBM_TREES_QUICK if quick else C.LGBM_TREES_LONG
+    models, names = _fit_resource_models(prepared, positions, rounds, ref, objectives=recipe["objectives"])
+    gases = tuple(recipe["head_selection"]["gases"])
+    if gases:
+        heads, head_names = _fit_resource_models(prepared, _resource_head_positions(ref, quick), rounds, ref,
+            objectives={g: recipe["objectives"][g] for g in gases}, horizons=C.HORIZONS_S, gases=gases)
+        if names != head_names:
+            raise ValueError("资源长短头特征顺序不一致")
+        models.update({gas + "__head": model for gas, model in heads.items()})
+    heat = estimate_heat_rate(prepared, ref)
+    neural = None
+    if heat.get("ok") and recipe["availability_adjustment"].get("method") == "positive_nn_peak":
+        neural = main_nn.train_resource_nn(_resource_base(prepared), resource_series(prepared),
+                                          ref, heat, load_prices(), quick)
+    bundle = ResourceBundle({}, models, names, final_heat_rate=heat, heat_rate=heat,
+        final_gas_caps=_gas_caps(prepared, ref), selection=recipe,
+        dispatch_selection=recipe["dispatch_selection"], final_resource_nn=neural,
+        train_end=str(prepared.index[ref]), final_train_end=str(prepared.index[ref]),
+        train_rows=len(positions) * len(C.HORIZONS_L), train_seconds=time.time() - started,
+        metrics={"scope": "frozen_recipe_no_D_reassessment"})
+    refresh_physical_validation(bundle, prepared, use_final=True)
+    if not heat.get("ok"):
+        bundle.blocker = "PHYSICAL_MAPPING_UNCERTAIN"
     return bundle
 
 

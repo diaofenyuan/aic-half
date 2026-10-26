@@ -1,6 +1,6 @@
 """半决赛唯一日常入口：python main.py
 
-默认 infer 在历史验证和冻结训练后，对正式半决赛测试窗口生成预测与优化结果；
+默认 infer 按已冻结配方重训，对正式半决赛测试窗口生成预测与优化结果；
 run 保留历史 21 天时序回测。测试标签为空，不计算测试集本地分数；
 当次结果能否提交由窗口、运行范围和优化核验共同判定。
 """
@@ -284,7 +284,7 @@ def run_infer(quick: bool = False, experimental: bool = False,
     summary = {"run_id": ctx.run_id, "status": "FAILED", "mode": "INFER",
                "competition_stage": "SEMIFINAL",
                "experimental": bool(quick or experimental), "output_root": str(ctx.root),
-               "quick": bool(quick), "validation_scope": "A/B开发验证" if quick else "历史开发验证，D已被多次查看", "errors": []}
+               "quick": bool(quick), "validation_scope": "冻结配方重训；不重新选参或评估D", "errors": []}
     stages = C.progress(total=8, desc="推理 · 数据准备", unit="阶段", leave=True)
     try:
         scan = scan_sources()
@@ -308,15 +308,14 @@ def run_infer(quick: bool = False, experimental: bool = False,
                     C.OPT_CONFIG["publication_time"], resource_training.index[-1], first_issue)
         stages.update(1)
         if reuse_run is None:
-            folds = build_folds(training, quick=quick)
             stages.set_description("推理 · 短期训练")
-            short_bundle = main_s.train_short(training, folds, quick=quick)
+            short_bundle = main_s.train_final_load(training, "short", main_s.ShortBundle, quick=quick)
             stages.update(1)
             stages.set_description("推理 · 长期训练")
-            long_bundle = main_l.train_long(training, folds, quick=quick)
+            long_bundle = main_s.train_final_load(training, "long", main_l.LongBundle, quick=quick)
             stages.update(1)
             stages.set_description("推理 · 资源训练")
-            resource_bundle = main_opt.train_resources(resource_training, folds, quick=quick)
+            resource_bundle = main_opt.train_final_resources(resource_training, quick=quick)
             stages.update(1)
         else:
             stages.set_description("推理 · 复用模型与冻结 NN")

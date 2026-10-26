@@ -717,6 +717,17 @@ def _daily_publication_check() -> dict:
         return {"passed": False, "reason": result.get("summary")}
     frame = result["schedule"]
     issues = forecast.call_args.args[2]
+    import output
+    import copy
+    metadata = {"output_contract": {"optimization_publication_time": "07:00"}, "optimization": result["summary"],
+                "resource": {"train_end": bundle.train_end, "heat_rate": {"calibration_end": bundle.train_end}}}
+    publication_ok = output.validate_publication_contract(metadata, origins)["passed"]
+    changed = copy.deepcopy(metadata)
+    changed["optimization"]["daily_plans"][0]["effective_start"] = "2025-01-02 06:00:00"
+    changed_rejected = not output.validate_publication_contract(changed, origins)["passed"]
+    missing = copy.deepcopy(metadata)
+    missing["resource"]["heat_rate"] = {}
+    missing_rejected = not output.validate_publication_contract(missing, origins)["passed"]
     full_grid = pd.date_range(C.OFFICIAL_EVAL_START, C.OFFICIAL_EVAL_END, freq="15min")
     full_issues = main_opt.daily_publication_times(full_grid, publication_time="07:00")
     bundle.train_end = "2025-01-02 07:15"
@@ -732,6 +743,9 @@ def _daily_publication_check() -> dict:
         "edge_window_counts": [p["published_steps"] for p in result["summary"]["daily_plans"]] == [29, 96, 67],
         "late_training_rejected_before_forecast": late["status"] == "BLOCKED_OPT" and not late_forecast.called,
         "late_resource_nn_rejected": not late_nn["passed"],
+        "archive_publication_contract": publication_ok,
+        "archive_effective_time_tamper_rejected": changed_rejected,
+        "archive_missing_calibration_cutoff_rejected": missing_rejected,
         "same_grid_as_long_forecast": expected_result_grid("opt_result.csv", origins).equals(origins),
         "no_intraday_refresh": result["summary"]["intraday_refresh"] is False,
         "continuous_constraints": validate_official_frame("opt_result.csv", frame, origins)["passed"],
@@ -764,10 +778,57 @@ def _process_expert_check() -> dict:
     return {"passed": all(checks.values()), **checks}
 
 
+def _frozen_final_training_check() -> dict:
+    """用训练调用探针核验正式入口的冻结配方和目标截止，不实际拟合全量模型。"""
+    from unittest.mock import patch
+    import copy
+    import main_s
+    import main_l
+    import main_nn
+    import main_opt
+    prepared = _synthetic_prepared(40 * C.STEPS_PER_DAY)
+    calls = []
+
+    def fit(data, base, positions, horizons, kind, features, rounds, ref):
+        calls.append((int(positions[-1] + max(horizons)), ref))
+        return {"probe": object()}, ["probe"]
+
+    original = copy.deepcopy(C.FROZEN_LOAD_RECIPES)
+    with patch.object(main_s, "_train_models", side_effect=fit), \
+            patch.object(main_s, "train_availability_fallback", return_value=None), \
+            patch.object(main_nn, "train_nn", return_value=None) as neural:
+        short = main_s.train_final_load(prepared, "short", main_s.ShortBundle, quick=True)
+        long = main_s.train_final_load(prepared, "long", main_l.LongBundle, quick=True)
+    resource_calls = []
+
+    def resource_fit(data, positions, rounds, ref, objectives=None, horizons=C.HORIZONS_L, gases=C.RESOURCE_NAMES):
+        resource_calls.append((int(positions[-1] + max(horizons)), ref))
+        return {gas: object() for gas in gases}, ["probe"]
+
+    heat = {"ok": True, "coefficients_mw_per_m3h": {"blast": .0003, "coke": .002, "converter": .0006}}
+    with patch.object(main_opt, "_fit_resource_models", side_effect=resource_fit), \
+            patch.object(main_opt, "estimate_heat_rate", return_value=heat), \
+            patch.object(main_opt, "_gas_caps", return_value={g: 1e6 for g in C.RESOURCE_NAMES}), \
+            patch.object(main_opt, "refresh_physical_validation", return_value={}), \
+            patch.object(main_opt, "_resource_base", return_value=pd.DataFrame(index=prepared.index)), \
+            patch.object(main_opt, "load_prices", return_value={}), \
+            patch.object(main_nn, "train_resource_nn", return_value={"train_end": str(prepared.index[-1])}):
+        resource = main_opt.train_final_resources(prepared, quick=True)
+    checks = {"independent_short_long_horizons": short.horizons == C.HORIZONS_S and long.horizons == C.HORIZONS_L,
+              "load_target_cutoff": all(target <= cutoff for target, cutoff in calls),
+              "resource_target_cutoff": all(target <= cutoff for target, cutoff in resource_calls),
+              "one_final_cutoff_no_D": all(len(call.args[1]) == 1 and call.args[1][0]["name"] == "final" for call in neural.call_args_list),
+              "configuration_not_mutated": C.FROZEN_LOAD_RECIPES == original,
+              "resource_daily_publication": resource.dispatch_selection["chosen"] == "daily_fixed",
+              "no_new_validation_score": short.scores.get("scope", "").startswith("no_new_validation")}
+    return {"passed": all(checks.values()), **checks}
+
+
 def run_self_checks(config=C) -> dict:
     checks = {
         "stage_isolation": _stage_isolation_check(),
         "training_target_cutoff": _training_target_cutoff_check(),
+        "frozen_final_training": _frozen_final_training_check(),
         "future_perturbation": _future_perturbation_check(),
         "prefix_consistency": _prefix_consistency_check(),
         "zero_preservation": _zero_preservation_check(),

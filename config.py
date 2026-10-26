@@ -383,6 +383,23 @@ GENERATOR1_SPECIALIST = {'short': {'kind': 'refined_nn',
 # 资源预测与发电优化
 # ---------------------------------------------------------------------------
 RESOURCE_NAMES = ("blast", "coke", "converter")
+# 配方来自已部署归档；正式推理只重训这些分量，不再重做候选搜索或D折评分。
+FROZEN_LOAD_RECIPES = {
+    "short": {"kind": "nn_lgb_ens", "features": "hybrid", "lgb_kind": "direct", "lgb_features": "gas",
+        "blend": {"generator_1": {"head": 1., "tail": 1.}, "generator_all": {"head": 1., "tail": 1.}},
+        "nn_weights": {"generator_1": {"head": .75, "tail": .75}, "generator_all": {"head": .25, "tail": .25}}},
+    "long": {"kind": "nn_lgb_ens", "features": "hybrid", "lgb_kind": "global", "lgb_features": "gas",
+        "blend": {"generator_1": {"short": 1., "medium": 1., "long": 1.}, "generator_all": {"short": .9, "medium": .9, "long": .5}},
+        "nn_weights": {"generator_1": {"short": 0., "medium": 0., "long": 0.}, "generator_all": {"short": .75, "medium": 1., "long": .75}}}}
+FROZEN_RESOURCE_RECIPE = {
+    "objectives": {g: "regression_l1" for g in RESOURCE_NAMES},
+    "head_selection": {"gases": list(RESOURCE_NAMES), "weight": .5, "horizons": list(HORIZONS_S),
+                       "method": "retained_independent_8_step_heads"},
+    "availability_adjustment": {"method": "positive_nn_peak", "threshold_ratio": .05, "weight": 1.},
+    "dispatch_selection": {"chosen": "daily_fixed", "candidate": "retained_recipe", "replan_steps": 96,
+        "publication_time": "07:00", "intraday_refresh": False},
+    "selection_scope": "frozen_retained_recipe; no_new_hourly_policy_selection",
+    "source": "outputs/20261026_154721_infer; recipes_only_not_late_weights"}
 # 三种子完整A/B/C缺测验证通过；仅保留实际晋级的长期分组融合配方。
 LONG_PROCESS_EXPERT = {
     "kind": "global", "features": "gas_no_power_at_t", "decay_days": 60., "seeds": 3,
