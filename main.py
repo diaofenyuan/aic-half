@@ -135,17 +135,46 @@ def run_verify(directory: Path | None = None) -> int:
         directory = candidates[-1]
     directory = Path(directory)
     problems = []
-    for name in ("s_result.csv", "l_result.csv", "opt_result.csv"):
-        path = directory / name
-        if not path.is_file():
-            if name != "opt_result.csv":
-                problems.append(f"缺少 {name}")
-            continue
-        frame = pd.read_csv(path)
-        check = output.validate_official_frame(name, frame)
-        problems.extend(check["problems"])
-        if frame.empty:
-            problems.append(f"{name} 为空")
+    try:
+        meta_path = directory / C.MODEL_DIR / "model_meta.json"
+        report_path = directory / C.REPORT_DIR / C.REPORT_JSON
+        meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
+        report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.is_file() else {}
+        contract = meta.get("output_contract", {})
+        quick = bool(meta.get("run", {}).get("quick", report.get("quick", False)))
+        window = contract.get("window", report.get("window"))
+        spec = contract.get("prediction")
+        if window == "half_test" or (not contract and not report and meta.get("role") == "final"):
+            origins = output.expected_result_grid("s_result.csv")
+        else:
+            span = ([spec["start"], spec["end"]] if spec else
+                    report.get("origin_range", report.get("data", {}).get("eval_range")))
+            if not span:
+                raise ValueError("缺少可验证的输出时间契约")
+            origins = pd.date_range(span[0], span[1], freq=f"{C.STEP_MINUTES}min")
+        if meta.get("schema_version", 1) >= 2:
+            if spec != output._grid_spec(origins):
+                problems.append("模型元数据中的预测覆盖契约不一致")
+            opt_spec = contract.get("optimization")
+            if (directory / "opt_result.csv").is_file():
+                if opt_spec != output._grid_spec(output.expected_result_grid("opt_result.csv", origins, quick)):
+                    problems.append("模型元数据中的优化覆盖契约不一致")
+                if contract.get("optimization_time_semantics") != C.OPT_CONFIG["datetime_semantics"]:
+                    problems.append("优化时间语义与当前实现不一致")
+            elif opt_spec is not None:
+                problems.append("缺少元数据中声明的优化结果")
+        coverage = output.validate_result_files(directory, origins, quick)
+        problems.extend(coverage["problems"])
+    except (ValueError, KeyError, TypeError, OSError) as exc:
+        print(json.dumps({"directory": str(directory), "passed": False,
+                          "problems": [str(exc)]}, ensure_ascii=False, indent=2))
+        return 1
+    physical = main_opt.physical_submission_check({"summary": meta.get("optimization", {})})
+    declared_submittable = report.get("submittable", report.get("output", {}).get("submittable", False))
+    if declared_submittable and (quick or meta.get("run", {}).get("experimental") or window != "half_test"):
+        problems.append("运行范围不是完整正式 half_test，不能声明可提交")
+    if declared_submittable and not physical["passed"]:
+        problems.append("运行摘要声称可提交，但完整物理核验未通过")
     zip_paths = [directory / name for name in {C.MOCK_ZIP_NAME, C.FORMAL_ZIP_NAME}
                  if (directory / name).is_file()]
     if not zip_paths:
@@ -159,13 +188,21 @@ def run_verify(directory: Path | None = None) -> int:
                     problems.append("ZIP CRC 检查失败")
                 if f"{C.SOURCE_DIR}/main_nn.py" not in packed.namelist():
                     problems.append("ZIP 源码缺少 main_nn.py")
+                if meta_path.is_file() and packed.read(f"{C.MODEL_DIR}/model_meta.json") != meta_path.read_bytes():
+                    problems.append("ZIP 模型元数据与磁盘不一致")
+                import hashlib
+                for relative, digest in meta.get("source", {}).get("sha256", {}).items():
+                    if hashlib.sha256(packed.read(f"{C.SOURCE_DIR}/{relative}")).hexdigest() != digest:
+                        problems.append(f"ZIP 源码与启动快照不一致: {relative}")
                 for name in ("s_result.csv", "l_result.csv", "opt_result.csv"):
                     if (directory / name).is_file() and packed.read(name) != (directory / name).read_bytes():
                         problems.append(f"ZIP 内 {name} 与磁盘不一致")
         except Exception as exc:
             problems.append(f"ZIP 读取失败: {exc}")
     print(json.dumps({"directory": str(directory), "passed": not problems,
-                      "problems": problems}, ensure_ascii=False, indent=2))
+                      "problems": problems, "coverage": coverage,
+                      "submittable": bool(declared_submittable and physical["passed"] and not problems),
+                      "submission_blockers": physical["problems"]}, ensure_ascii=False, indent=2))
     return 0 if not problems else 1
 
 
@@ -198,7 +235,8 @@ def _inference_window(prepared) -> tuple[pd.DatetimeIndex, str]:
 
 
 def _inference_submission_check(window: str, optimization: dict, *,
-                                quick: bool, experimental: bool) -> dict:
+                                quick: bool, experimental: bool,
+                                coverage: dict | None = None, source: dict | None = None) -> dict:
     """正式参赛阶段与当次产物是否通过提交核验分别记录，避免沿用预开发总开关。"""
     problems = []
     if window != "half_test":
@@ -207,27 +245,37 @@ def _inference_submission_check(window: str, optimization: dict, *,
         problems.append("quick 仅用于开发验证，调度未覆盖完整评测窗口")
     if experimental:
         problems.append("本次为开发实验，未归档为选定正式运行")
+    if not coverage or not coverage.get("passed"):
+        problems.append("缺少完整结果覆盖核验或核验未通过")
+    if not source or source.get("freeze_stage") != "run_start" or not source.get("consistency_passed"):
+        problems.append("缺少启动源码一致性核验或源码已变化")
     if not C.OPT_CONFIG["template_confirmed"]:
         problems.append("优化输出字段尚未核对官方要求")
     if optimization.get("schedule") is None:
         problems.append("缺少有效 opt_result.csv 调度结果")
+    else:
+        check = output.validate_official_frame("opt_result.csv", optimization["schedule"],
+            output.expected_result_grid("opt_result.csv", quick=quick))
+        problems.extend(check["problems"])
     opt_summary = optimization.get("summary", {})
     if not opt_summary.get("plan_validation_passed"):
         problems.append("优化计划约束核验未通过")
+    physical = main_opt.physical_submission_check(optimization)
+    problems.extend(physical["problems"])
     if not optimization.get("submittable", False):
         if optimization.get("status") == "SIMULATED_NOT_SUBMITTABLE":
             problems.append("发电优化仍为代理资源模拟计划，尚未通过正式物理约束核验")
         else:
             problems.append("优化提交核验未通过：" + str(
                 opt_summary.get("reason") or optimization.get("status") or "未返回核验状态"))
-    return {"passed": not problems, "problems": problems}
+    return {"passed": not problems, "problems": list(dict.fromkeys(problems)), "physical": physical}
 
 
 def run_infer(quick: bool = False, experimental: bool = False,
               reuse_run: Path | None = None) -> int:
     """冻结模型后执行正式半决赛测试推理，并单独核验当次结果的提交条件。"""
     started = time.time()
-    ctx = output.begin_run(C, mode="infer", experimental=quick or experimental)
+    ctx = output.begin_run(C, mode="infer", experimental=quick or experimental, quick=quick)
     _setup_logger(ctx.log_path)
     LOGGER.info("推理运行目录: %s", ctx.root)
     summary = {"run_id": ctx.run_id, "status": "FAILED", "mode": "INFER",
@@ -245,6 +293,7 @@ def run_infer(quick: bool = False, experimental: bool = False,
             raise ValueError("源数据在读取后被修改")
 
         origins, window = _inference_window(prepared)
+        ctx.window = window
         # 训练重新读取独立白名单，测试期过程量也不能用于资源拟合或物理标定。
         training = prepare_data(C).prefix_copy(min(
             pd.Timestamp(C.TRAIN_END), origins[0] - pd.Timedelta(minutes=C.STEP_MINUTES)))
@@ -298,6 +347,7 @@ def run_infer(quick: bool = False, experimental: bool = False,
         optimization = main_opt.optimize(resource_forecast, masked, origins,
                                          long_pred, resource_bundle, quick=quick,
                                          use_final=True)
+        optimization.setdefault("summary", {})["submission_physical_check"] = main_opt.physical_submission_check(optimization)
         optimization_report = output.write_optimization(ctx, optimization.get("schedule"))
         stages.update(1)
         stages.set_description("推理 · 模型与结果归档")
@@ -309,7 +359,10 @@ def run_infer(quick: bool = False, experimental: bool = False,
             ctx, short_bundle, long_bundle, resource_bundle, use_final=True)
         source_report = output.write_source_snapshot(ctx, C)
         submission_check = _inference_submission_check(
-            window, optimization, quick=quick, experimental=experimental)
+            window, optimization, quick=quick, experimental=experimental,
+            coverage=output.validate_result_files(ctx.root, None if window == "half_test" else origins,
+                                                  quick, require_optimization=True),
+            source=source_report)
         submittable = submission_check["passed"]
         zip_report = output.build_zip(ctx, submittable=submittable, config=C)
         stages.update(1)
@@ -398,7 +451,7 @@ def run_infer(quick: bool = False, experimental: bool = False,
 
 def run_full(quick: bool = False, experimental: bool = False) -> int:
     started = time.time()
-    ctx = output.begin_run(C, mode="backtest", experimental=quick or experimental)
+    ctx = output.begin_run(C, mode="backtest", experimental=quick or experimental, quick=quick)
     _setup_logger(ctx.log_path)
     LOGGER.info("运行目录: %s", ctx.root)
     summary = {"run_id": ctx.run_id, "status": "FAILED", "mode": "BACKTEST",
@@ -459,6 +512,7 @@ def run_full(quick: bool = False, experimental: bool = False) -> int:
         stages.set_description("回测 · 调度优化")
         optimization = main_opt.optimize(resource_forecast, masked, origins,
                                          long_pred, resource_bundle, quick=quick)
+        optimization.setdefault("summary", {})["submission_physical_check"] = main_opt.physical_submission_check(optimization)
         optimization_report = output.write_optimization(ctx, optimization.get("schedule"))
         stages.update(1)
         stages.set_description("回测 · 模型与结果归档")
@@ -596,7 +650,7 @@ def _train_generator1_final(training, short_bundle, long_bundle, quick=False, re
             state["recipe"] = recipe
             state.pop("calibration", None)
             if recipe.get("calibration"):
-                state["calibration"] = _train_final_calibration(training, short_bundle, long_bundle, span, recipe)
+                state["calibration"] = _train_final_calibration(training, short_bundle, long_bundle, span, recipe, quick=quick)
             bundle.final_generator1 = state
             bundle.selection["generator1"] = {"candidate": recipe["candidate"], "source_study": recipe["source_study"]}
             result[span] = {"recipe": recipe, "train_end": end, "neural_components_reused": True,
@@ -620,7 +674,7 @@ def _train_generator1_final(training, short_bundle, long_bundle, quick=False, re
             bundle.final_generator1 = {"recipe": recipe, "train_end": end,
                 "base_state": base_state, "nn": temporary.final_generator1["nn"]}
             if recipe.get("calibration"):
-                bundle.final_generator1["calibration"] = _train_final_calibration(training, short_bundle, long_bundle, span, recipe)
+                bundle.final_generator1["calibration"] = _train_final_calibration(training, short_bundle, long_bundle, span, recipe, quick=quick)
             bundle.selection["generator1"] = {"candidate": recipe["candidate"], "source_study": recipe["source_study"]}
             result[span] = {"recipe": recipe, "train_end": end, "base_reused": existing is not None, "D_reassessed": False}
             continue
@@ -686,11 +740,11 @@ def _train_generator1_final(training, short_bundle, long_bundle, quick=False, re
 
 
 
-def _train_final_calibration(training, short_bundle, long_bundle, span, recipe):
+def _train_final_calibration(training, short_bundle, long_bundle, span, recipe, quick=False):
     import copy
     if span != "short":
         raise ValueError("正式阶段校准只启用已晋级的短期配方")
-    ctx = output.begin_run(C, mode="final_calibration_" + span, experimental=True)
+    ctx = output.begin_run(C, mode="final_calibration_" + span, experimental=True, quick=quick)
     output.write_source_snapshot(ctx, C)
     ctx.log_path.write_text("最终阶段权重表训练；完整训练日志同时写入主推理日志。\n", encoding="utf-8")
     templates = {"short": short_bundle, "long": long_bundle}
@@ -698,7 +752,7 @@ def _train_final_calibration(training, short_bundle, long_bundle, span, recipe):
         raise ValueError("最终校准要求同截止点的完整融合主模型")
     base_recipe = copy.deepcopy(recipe)
     base_recipe.pop("calibration", None)
-    summary = {"run_id": ctx.run_id, "status": "RUNNING", "submittable": False,
+    summary = {"run_id": ctx.run_id, "status": "RUNNING", "submittable": False, "quick": bool(quick),
         "data_sources": training.source_hashes, "base_recipes": {span: base_recipe},
         "mode": "final_calibration_fit_only; no_validation_reselection", "inner_provenance": []}
     end = str(training.index[-1])
@@ -707,7 +761,7 @@ def _train_final_calibration(training, short_bundle, long_bundle, span, recipe):
     started = time.time()
     try:
         _fit_calibration_prefixes(ctx, summary, training, [outer], templates, spans=(span,),
-            offsets=tuple(options["final_offsets_days"]), days=options["final_window_days"])
+            offsets=tuple(options["final_offsets_days"]), days=options["final_window_days"], quick=quick)
         data = _calibration_training_rows(ctx, training, outer, span,
             offsets=tuple(options["final_offsets_days"]), days=options["final_window_days"])
         pack = _fit_transition_calibrator(ctx.model_dir / "calibration", data, options["family"], outer)
@@ -716,6 +770,7 @@ def _train_final_calibration(training, short_bundle, long_bundle, span, recipe):
         maximum = max(p["max_target"] for p in pack["provenance"])
         if pd.Timestamp(maximum) > training.index[-1]:
             raise ValueError("最终阶段校准使用了训练截止之后的标签")
+        output.write_source_snapshot(ctx, C)
         summary.update(status="SUCCESS_FINAL_CALIBRATION", calibration=calibration,
             max_supervision_target=maximum, official_test_used=False, parameters_reselected=False)
         ctx.log_path.write_text("最终权重表已完成；只拟合冻结规则，不重新选参。\n最大监督目标=" + maximum + "\n", encoding="utf-8")
@@ -745,14 +800,15 @@ def _load_calibration_bundle(directory, span):
     return bundle
 
 
-def _fit_calibration_bundle(directory, prepared, spec, span, templates, specialist_recipes):
+def _fit_calibration_bundle(directory, prepared, spec, span, templates, specialist_recipes, quick=False):
     import copy
     import shutil
     import main_nn
     if not (directory / "complete.json").exists():
         for path in directory.parent.glob("*/complete.json"):
             record = json.loads(path.read_text(encoding="utf-8"))
-            if record["train_end"] == spec["train_end"] and record["specialist_recipe"] == specialist_recipes[span]:
+            if (record["train_end"] == spec["train_end"] and record["specialist_recipe"] == specialist_recipes[span]
+                    and bool(record.get("quick", False)) == bool(quick)):
                 directory.mkdir(parents=True, exist_ok=True)
                 for component in ("primary", "availability", "specialist"):
                     shutil.copytree(path.parent / component, directory / component, dirs_exist_ok=True)
@@ -761,29 +817,32 @@ def _fit_calibration_bundle(directory, prepared, spec, span, templates, speciali
                 break
     if (directory / "complete.json").exists():
         record = json.loads((directory / "complete.json").read_text(encoding="utf-8"))
-        if record["train_end"] != spec["train_end"] or record["specialist_recipe"] != specialist_recipes[span]:
+        if (record["train_end"] != spec["train_end"] or record["specialist_recipe"] != specialist_recipes[span]
+                or bool(record.get("quick", False)) != bool(quick)):
             raise ValueError("内层完整组合的冻结配方或截止点不一致")
         return _load_calibration_bundle(directory, span)
     training = prepared.prefix_copy(spec["train_end"])
     training.require_training_data()
     ref, end = len(training.index) - 1, str(training.index[-1])
-    cls, horizons, stride = main_s.ShortBundle, C.HORIZONS_S, C.TRAIN_STRIDE_SHORT
+    cls, horizons = main_s.ShortBundle, C.HORIZONS_S
+    stride = C.QUICK_TRAIN_STRIDE if quick else C.TRAIN_STRIDE_SHORT
     template = templates[span]
     recipe = {k: copy.deepcopy(getattr(template, k)) for k in
               ("kind", "features", "blend", "lgb_kind", "lgb_features", "nn_weights")}
     LOGGER.info("完整组合内层训练 %s/%s，标签截止=%s", span, spec["name"], end)
     positions = np.arange(C.PROFILE_DAYS * C.STEPS_PER_DAY, ref - max(horizons) + 1, stride)
     models, names = main_s._train_models(training, main_s.build_base_features(training, True),
-        positions, horizons, recipe["lgb_kind"], recipe["lgb_features"], C.LGBM_TREES_LONG, ref)
+        positions, horizons, recipe["lgb_kind"], recipe["lgb_features"],
+        C.LGBM_TREES_QUICK if quick else C.LGBM_TREES_LONG, ref)
     neural = main_nn.train_nn(training, [{**spec, "role": "tuning"}], template.final_nn_bundle.kind,
-        horizons, n_seeds=len(template.final_nn_bundle.seed_states), cfg=template.final_nn_bundle.config)
+        horizons, quick=quick, n_seeds=len(template.final_nn_bundle.seed_states), cfg=template.final_nn_bundle.config)
     bundle = cls(**recipe, horizons=horizons, models={}, final_models=models,
         feature_names=names, final_nn_bundle=neural, train_end=end, final_train_end=end)
     fallback = {k: copy.deepcopy(v) for k, v in template.final_availability.items()
                 if k not in ("models", "retained_state", "feature_names", "train_end", "role")}
-    bundle.final_availability = main_s.train_availability_fallback(training, horizons, fallback)
+    bundle.final_availability = main_s.train_availability_fallback(training, horizons, fallback, quick=quick)
     _train_generator1_final(training, bundle if span == "short" else None,
-        bundle if span == "long" else None, recipes_override={span: specialist_recipes[span]})
+        bundle if span == "long" else None, quick=quick, recipes_override={span: specialist_recipes[span]})
     main_s.save_generator1({"recipe": recipe, "train_end": end, "feature_names": names,
         "models": models, "nn": neural}, directory / "primary")
     def transport(item):
@@ -794,7 +853,8 @@ def _fit_calibration_bundle(directory, prepared, spec, span, templates, speciali
     main_s.save_generator1(transport(bundle.final_availability), directory / "availability")
     main_s.save_generator1(bundle.final_generator1, directory / "specialist")
     record = {"train_end": end, "max_training_target": str(training.index[positions[-1] + max(horizons)]),
-              "specialist_recipe": specialist_recipes[span], "all_components_retrained_on_prefix": True}
+              "specialist_recipe": specialist_recipes[span], "quick": bool(quick),
+              "all_components_retrained_on_prefix": True}
     (directory / "complete.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
     return bundle
 
@@ -894,7 +954,7 @@ def _fit_transition_calibrator(directory, data, family, outer):
     return pack
 
 
-def _fit_calibration_prefixes(ctx, summary, prepared, specs, templates, spans=("short",), offsets=(63, 35), days=21):
+def _fit_calibration_prefixes(ctx, summary, prepared, specs, templates, spans=("short",), offsets=(63, 35), days=21, quick=False):
     import main_nn
     for outer in specs:
         for offset in offsets:
@@ -904,10 +964,13 @@ def _fit_calibration_prefixes(ctx, summary, prepared, specs, templates, spans=("
             for span in spans:
                 directory = ctx.model_dir / "inner_load" / span / spec["name"]
                 horizons = C.HORIZONS_S
-                if all((directory / f"{scenario}.npz").exists() for scenario in ("normal", "all_missing", "outage_day7")):
+                complete = directory / "complete.json"
+                same_budget = (complete.exists() and bool(json.loads(complete.read_text(encoding="utf-8"))
+                                                         .get("quick", False)) == bool(quick))
+                if same_budget and all((directory / f"{scenario}.npz").exists() for scenario in ("normal", "all_missing", "outage_day7")):
                     LOGGER.info("复用完整内层预测 %s/%s", span, spec["name"])
                     continue
-                bundle = _fit_calibration_bundle(directory, prepared, spec, span, templates, summary["base_recipes"])
+                bundle = _fit_calibration_bundle(directory, prepared, spec, span, templates, summary["base_recipes"], quick=quick)
                 loaded = _load_calibration_bundle(directory, span)
                 audits = []
                 for scenario, view, positions in _calibration_cases(prepared, spec):

@@ -428,6 +428,9 @@ OPT_CONFIG = {
     "max_daily_milp": 31,
     # 已核对本地赛题 PDF 第十三节（三）的五个 opt_ 字段；物理可行性另行核验。
     "template_confirmed": True,
+    # 当前表为指令目标时刻；官方未明确时间口径前不得自动判为可提交。
+    "datetime_semantics": "target_time",
+    "datetime_semantics_confirmed": False,
     "price_file": "first_train/price.xlsx",
     "price_unit": "CNY_per_kWh",
 }

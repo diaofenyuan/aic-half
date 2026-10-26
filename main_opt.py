@@ -51,6 +51,37 @@ class ResourceBundle:
     final_resource_nn: dict | None = None
 
 
+def physical_submission_check(optimization: dict) -> dict:
+    """代理计划校验与真实物理核验分开，单个成功标记不能替代约束证据。"""
+    summary = optimization.get("summary", {})
+    evidence = summary.get("physical_validation", {})
+    checks = {
+        "net_resource_boundary": summary.get("resource_mode") == "net_surplus_after_priority_users",
+        "plan_constraints": summary.get("plan_validation_passed") is True,
+        "physical_feasibility": summary.get("physical_feasibility_certified") is True,
+        "datetime_semantics": (C.OPT_CONFIG["datetime_semantics_confirmed"] is True
+                               and str(summary.get("time_semantics", "")).startswith(
+                                   C.OPT_CONFIG["datetime_semantics"])),
+    }
+    descriptions = {
+        "net_resource_boundary": "可用气仍为历史耗气代理包络，未核验扣除优先生产用户后的净资源边界",
+        "plan_constraints": "优化计划约束核验未通过",
+        "physical_feasibility": "真实气网物理可行性尚未核验",
+        "datetime_semantics": "优化 datetime 官方时间语义尚未确认",
+        "gas_to_power": "热值、效率与气电换算缺少核验依据",
+        "holder_mapping": "气柜列、容量与实际库存映射缺少核验依据",
+        "converter_units": "转炉煤气单位与换算缺少核验依据",
+        "priority_user_supply": "优先生产用户全时段供气约束缺少核验依据",
+    }
+    for name in ("gas_to_power", "holder_mapping", "converter_units", "priority_user_supply"):
+        item = evidence.get(name, {})
+        checks[name] = (isinstance(item, dict) and item.get("passed") is True
+                        and isinstance(item.get("evidence"), str) and bool(item["evidence"].strip()))
+    blocked = [name for name, passed in checks.items() if not passed]
+    return {"passed": not blocked, "checks": checks, "blocked_items": blocked,
+            "problems": [descriptions[name] for name in blocked]}
+
+
 def _resource_base(prepared: PreparedData) -> pd.DataFrame:
     base = build_base_features(prepared, include_targets=False)
     # 包络观测视为外生代理输入；柜位属于控制状态，不能把历史调度柜位注入反事实控制。

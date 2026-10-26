@@ -4,9 +4,9 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
-import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -26,13 +26,21 @@ class RunContext:
     report_dir: Path
     log_path: Path
     mode: str
+    quick: bool = False
+    experimental: bool = False
+    window: str | None = None
+    prediction_grid: pd.DatetimeIndex | None = None
+    optimization_grid: pd.DatetimeIndex | None = None
+    source_report: dict = field(default_factory=dict)
+    source_root: Path | None = None
 
 
 def _run_id(mode: str) -> str:
     return f"{pd.Timestamp.now():%Y%m%d_%H%M%S}_{mode.lower()}"
 
 
-def begin_run(config=C, mode: str = "backtest", experimental: bool = False) -> RunContext:
+def begin_run(config=C, mode: str = "backtest", experimental: bool = False,
+              quick: bool = False) -> RunContext:
     run_id = _run_id(mode)
     # 实验复用完整归档链路，但整个目录必须隔离，避免干扰选定运行结果。
     base = config.EXPERIMENT_OUTPUT_ROOT if experimental else config.OUTPUT_ROOT
@@ -41,11 +49,15 @@ def begin_run(config=C, mode: str = "backtest", experimental: bool = False) -> R
               if experimental else root / config.SOURCE_DIR)
     models = root / config.MODEL_DIR
     report = root / config.REPORT_DIR
-    for path in (root, source, models, report):
+    root.mkdir(parents=True, exist_ok=False)
+    for path in (source, models, report):
         path.mkdir(parents=True, exist_ok=True)
-    return RunContext(run_id=run_id, root=root, source_dir=source,
-                      model_dir=models, report_dir=report,
-                      log_path=report / config.REPORT_LOG, mode=mode)
+    ctx = RunContext(run_id=run_id, root=root, source_dir=source,
+                     model_dir=models, report_dir=report,
+                     log_path=report / config.REPORT_LOG, mode=mode,
+                     quick=quick, experimental=experimental)
+    write_source_snapshot(ctx, config)
+    return ctx
 
 
 def _short_columns() -> list[str]:
@@ -108,27 +120,55 @@ def official_columns(kind: str) -> list[str]:
     raise ValueError(f"未知提交类型: {kind}")
 
 
-def validate_official_frame(name: str, frame: pd.DataFrame) -> dict:
+def expected_result_grid(name: str, origins=None, quick: bool = False) -> pd.DatetimeIndex:
+    """优化指令仍保留目标时刻，不通过改时间戳伪装成起报点。"""
+    grid = (pd.date_range(C.OFFICIAL_EVAL_START, C.OFFICIAL_EVAL_END,
+                          freq=f"{C.STEP_MINUTES}min")
+            if origins is None else pd.DatetimeIndex(origins))
+    if name == "opt_result.csv":
+        if C.OPT_CONFIG["datetime_semantics"] != "target_time":
+            raise ValueError("未实现的优化时间语义，禁止静默平移结果")
+        if quick:
+            grid = grid[:2 * C.STEPS_PER_DAY]
+        grid = grid + pd.Timedelta(minutes=C.STEP_MINUTES)
+    return grid
+
+
+def validate_official_frame(name: str, frame: pd.DataFrame, expected_grid=None) -> dict:
     """按赛题字段契约校验预测/优化宽表，问题不静默放过。"""
     kind = {"s_result.csv": "s", "l_result.csv": "l",
             "opt_result.csv": "opt"}[name]
     expected = official_columns(kind)
     problems = []
+    if frame.empty:
+        problems.append(f"{name} 为空")
     if list(frame.columns) != expected:
         problems.append(f"{name} 列名与官方契约不一致")
     if "datetime" in frame.columns:
         times = pd.to_datetime(frame["datetime"], errors="coerce")
         if times.isna().any():
             problems.append(f"{name} datetime 无法解析")
-        elif times.duplicated().any():
-            problems.append(f"{name} datetime 重复")
+        else:
+            times = pd.DatetimeIndex(times)
+            if times.has_duplicates:
+                problems.append(f"{name} datetime 重复")
+            if not times.is_monotonic_increasing:
+                problems.append(f"{name} datetime 非递增")
+            grid = expected_result_grid(name) if expected_grid is None else pd.DatetimeIndex(expected_grid)
+            if not times.equals(grid):
+                problems.append(f"{name} 时间覆盖不一致：应有{len(grid)}行，实际{len(times)}行，"
+                                f"缺失{len(grid.difference(times))}个，多出{len(times.difference(grid))}个时间点")
     numeric = frame.drop(columns=["datetime"], errors="ignore")
     if len(numeric.columns):
-        values = numeric.to_numpy(dtype=float)
-        if not np.isfinite(values).all():
-            problems.append(f"{name} 存在非有限值")
-        if (values < 0).any():
-            problems.append(f"{name} 存在负值")
+        try:
+            values = numeric.to_numpy(dtype=float)
+        except (ValueError, TypeError):
+            problems.append(f"{name} 存在非数值字段")
+        else:
+            if not np.isfinite(values).all():
+                problems.append(f"{name} 存在非有限值")
+            if (values < 0).any():
+                problems.append(f"{name} 存在负值")
     return {"passed": not problems, "problems": problems,
             "columns": list(frame.columns), "rows": int(len(frame))}
 
@@ -136,6 +176,13 @@ def validate_official_frame(name: str, frame: pd.DataFrame) -> dict:
 def write_predictions(ctx: RunContext, grid: pd.DatetimeIndex,
                       short_pred: np.ndarray, long_pred: np.ndarray) -> dict:
     grid = pd.DatetimeIndex(grid)
+    if grid.empty or grid.has_duplicates or not grid.is_monotonic_increasing:
+        raise ValueError("预测起报网格为空、重复或非递增")
+    if len(grid) > 1 and not np.all(np.diff(grid.asi8) == pd.Timedelta(minutes=C.STEP_MINUTES).value):
+        raise ValueError("预测起报网格缺失时间点或不是15分钟连续网格")
+    if ctx.window == "half_test" and not grid.equals(expected_result_grid("s_result.csv")):
+        raise ValueError("预测起报网格未覆盖完整 half_test")
+    ctx.prediction_grid = grid
     short_check = validate_cube(short_pred, len(C.HORIZONS_S), len(grid))
     long_check = validate_cube(long_pred, len(C.HORIZONS_L), len(grid))
     if not short_check["valid"] or not long_check["valid"]:
@@ -145,7 +192,7 @@ def write_predictions(ctx: RunContext, grid: pd.DatetimeIndex,
     long = _cube_to_frame(long_pred, grid, C.HORIZONS_L)[_long_columns()]
     # 官方契约校验放在落盘前，列名错位不能靠事后读回才发现。
     for name, frame in (("s_result.csv", short), ("l_result.csv", long)):
-        check = validate_official_frame(name, frame)
+        check = validate_official_frame(name, frame, grid)
         if not check["passed"]:
             raise ValueError(f"{name} 未通过官方契约: " + "; ".join(check["problems"]))
     short.to_csv(ctx.root / "s_result.csv", index=False, encoding="utf-8", float_format="%.6f")
@@ -154,15 +201,9 @@ def write_predictions(ctx: RunContext, grid: pd.DatetimeIndex,
     for name, frame, columns, check in (("s_result.csv", short, _short_columns(), short_check),
                                         ("l_result.csv", long, _long_columns(), long_check)):
         reread = pd.read_csv(ctx.root / name, encoding="utf-8")
-        if list(reread.columns) != columns:
-            raise ValueError(f"{name} 落盘后列不一致")
-        if len(reread) != len(grid):
-            raise ValueError(f"{name} 行数与起报点不一致")
-        times = pd.to_datetime(reread["datetime"], errors="coerce")
-        if times.isna().any() or not times.is_monotonic_increasing or times.duplicated().any():
-            raise ValueError(f"{name} datetime 非法、非递增或重复")
-        if not np.isfinite(reread[columns[1:]].to_numpy(dtype=float)).all():
-            raise ValueError(f"{name} 落盘后存在非有限值")
+        reread_check = validate_official_frame(name, reread, grid)
+        if not reread_check["passed"]:
+            raise ValueError("; ".join(reread_check["problems"]))
         check["rows"] = int(len(reread))
         check["columns"] = len(columns)
     return {"short": short_check, "long": long_check, "origins": int(len(grid)),
@@ -176,7 +217,7 @@ def write_optimization(ctx: RunContext, schedule: pd.DataFrame | None) -> dict:
     required = ["datetime", "opt_generator_use_blast_furnace_gas",
                 "opt_generator_use_coke_gas", "opt_generator_use_converter_gas",
                 "opt_generator_1", "opt_generator_all"]
-    if list(frame.columns)[:len(required)] != required:
+    if list(frame.columns) != required:
         raise ValueError("opt_result 列不符合当前模拟契约")
     frame = frame[required]
     frame["datetime"] = pd.to_datetime(frame["datetime"]).dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -191,21 +232,64 @@ def write_optimization(ctx: RunContext, schedule: pd.DataFrame | None) -> dict:
         raise ValueError("opt_generator_all 超容量")
     if (allp + 1e-6 < g1).any():
         raise ValueError("opt_generator_all 小于 opt_generator_1")
-    check = validate_official_frame("opt_result.csv", frame)
+    if ctx.prediction_grid is None:
+        raise ValueError("优化归档缺少本次预测起报网格")
+    grid = expected_result_grid("opt_result.csv", ctx.prediction_grid, ctx.quick)
+    check = validate_official_frame("opt_result.csv", frame, grid)
     if not check["passed"]:
         raise ValueError("opt_result 未通过官方契约: " + "; ".join(check["problems"]))
     frame.to_csv(ctx.root / "opt_result.csv", index=False, encoding="utf-8",
                  float_format="%.6f")
     reread = pd.read_csv(ctx.root / "opt_result.csv", encoding="utf-8")
+    check = validate_official_frame("opt_result.csv", reread, grid)
+    if not check["passed"]:
+        raise ValueError("; ".join(check["problems"]))
+    ctx.optimization_grid = grid
     return {"written": True, "rows": int(len(reread)), "columns": list(reread.columns),
             "generator_1_range": [float(g1.min()), float(g1.max())],
-            "generator_all_range": [float(allp.min()), float(allp.max())]}
+            "generator_all_range": [float(allp.min()), float(allp.max())],
+            "time_semantics": C.OPT_CONFIG["datetime_semantics"],
+            "start": str(grid[0]), "end": str(grid[-1]), "partial": bool(ctx.quick)}
 
 
 def _model_tag(key) -> str:
     if isinstance(key, tuple):
         return "__".join(str(part) for part in key)
     return str(key)
+
+
+def _grid_spec(grid) -> dict | None:
+    if grid is None or len(grid) == 0:
+        return None
+    return {"start": str(grid[0]), "end": str(grid[-1]), "rows": len(grid),
+            "step_minutes": C.STEP_MINUTES}
+
+
+def validate_result_files(directory: Path, origins=None, quick: bool = False,
+                          require_optimization: bool = False) -> dict:
+    problems, checks = [], {}
+    for name in ("s_result.csv", "l_result.csv", "opt_result.csv"):
+        path = directory / name
+        if not path.is_file():
+            if name != "opt_result.csv" or require_optimization:
+                problems.append(f"缺少 {name}")
+            continue
+        try:
+            frame = pd.read_csv(path)
+            check = validate_official_frame(name, frame, expected_result_grid(name, origins, quick))
+            checks[name] = check
+            problems.extend(check["problems"])
+        except (ValueError, TypeError, OSError) as exc:
+            problems.append(f"{name} 无法校验: {exc}")
+    return {"passed": not problems, "problems": problems, "files": checks}
+
+
+def _artifact_path(root: Path, relative: str) -> Path:
+    # Windows 归档路径也必须能在赛事 Linux 环境中重载。
+    path = (root / str(relative).replace("\\", "/")).resolve()
+    if not path.is_relative_to(root.resolve()):
+        raise ValueError("模型文件路径超出归档目录")
+    return path
 
 
 def load_final_models(directory: Path):
@@ -216,11 +300,8 @@ def load_final_models(directory: Path):
     from main_opt import ResourceBundle
 
     directory = directory.resolve()
-    if not directory.is_relative_to(C.ROOT.resolve()):
-        raise ValueError("只允许复用本项目的本地运行模型")
     model_root = directory / C.MODEL_DIR
     meta = json.loads((model_root / "model_meta.json").read_text(encoding="utf-8"))
-    report = json.loads((directory / C.REPORT_DIR / C.REPORT_JSON).read_text(encoding="utf-8"))
     if meta["role"] != "final":
         raise ValueError("推理只能复用 final 角色，禁止把确认模型冒充最终模型")
     bundles = []
@@ -233,12 +314,14 @@ def load_final_models(directory: Path):
                 target, part = tag.rsplit("__", 1)
                 key = (target, int(part) if part.isdigit() else part)
             models[key] = lgb.Booster(model_str=(model_root / name / "final" / filename).read_text(encoding="utf-8"))
-        neural = main_nn.load_nn(model_root / artifacts["nn"]["path"]) if "nn" in artifacts else None
+        neural = main_nn.load_nn(_artifact_path(model_root, artifacts["nn"]["path"])) if "nn" in artifacts else None
         bundles.append(cls(kind=item["kind"], features=item["features"], horizons=horizons,
             blend=item["blend"], models={}, final_models=models, feature_names=item["feature_names"],
             nn_bundle=None, final_nn_bundle=neural, lgb_kind=item.get("lgb_kind"),
             nn_weights=item.get("nn_weights", {}),
-            lgb_features=item.get("lgb_features"), selection=report[name]["selection"], scores=item["scores"],
+            lgb_features=item.get("lgb_features"),
+            selection=item.get("selection", {"chosen": {"kind": item["kind"], "features": item["features"]}}),
+            scores=item["scores"],
             train_end=item["train_end"], final_train_end=item["train_end"]))
         if item.get("availability"):
             state = dict(item["availability"])
@@ -256,42 +339,40 @@ def load_final_models(directory: Path):
             bundles[-1].final_availability = state
         if item.get("generator1"):
             from main_s import load_generator1
-            bundles[-1].final_generator1 = load_generator1(model_root / item["generator1"]["path"])
+            bundles[-1].final_generator1 = load_generator1(_artifact_path(model_root, item["generator1"]["path"]))
     item, artifacts = meta["resource"], meta["artifacts"]["resource"]
     from main_opt import load_resource_model
     models = {tag: load_resource_model((model_root / "resource" / "final" / filename).read_text(encoding="utf-8"))
               for tag, filename in artifacts["final"]["files"].items()}
-    neural = main_nn.load_resource_nn(model_root / artifacts["nn"]["path"]) if "nn" in artifacts else None
+    neural = main_nn.load_resource_nn(_artifact_path(model_root, artifacts["nn"]["path"])) if "nn" in artifacts else None
+    selection = {**item["selection"], "head_selection": item.get("head_selection", {})}
     resource = ResourceBundle(models={}, final_models=models,
         feature_names=next(iter(models.values())).feature_name(),
         metrics=item["metrics"], heat_rate=item["heat_rate"], final_heat_rate=item["heat_rate"],
         gas_caps=item["gas_caps"], final_gas_caps=item["gas_caps"],
         train_end=item["train_end"], final_train_end=item["train_end"],
-        selection=report["resource_selection"], dispatch_selection=item["dispatch_selection"],
+        selection=selection, dispatch_selection=item["dispatch_selection"],
         resource_nn=None, final_resource_nn=neural, blocker=item.get("blocker"))
     bundles.append(resource)
     return bundles
 
 
 def _save_boosters(directory: Path, prefix: str, models: dict,
-                   feature_names: list[str], temp_dir: Path) -> dict:
+                    feature_names: list[str]) -> dict:
     directory.mkdir(parents=True, exist_ok=True)
-    temp_dir.mkdir(parents=True, exist_ok=True)
     index = {}
     reload_ok = True
     probe = np.zeros((3, len(feature_names)), dtype=np.float32)
     for key, booster in C.progress(models.items(), desc=f"保存 {prefix} 模型", unit="模型"):
         tag = _model_tag(key)
         file_name = f"{prefix}_{tag}.txt"
-        temp_path = temp_dir / file_name
-        booster.save_model(str(temp_path))
-        # LightGBM 的 C++ 层在 Windows 下无法直接读写中文路径；
-        # 先写 ASCII 临时目录，再用 Python 文件系统移动并以 model_str 复载。
+        path = directory / file_name
+        # 由 Python 写入模型文本，独立解压到中文目录后也不依赖 C++ 文件路径支持。
+        path.write_text(booster.model_to_string(), encoding="utf-8")
         from main_opt import load_resource_model
-        loaded = load_resource_model(temp_path.read_text(encoding="utf-8"))
+        loaded = load_resource_model(path.read_text(encoding="utf-8"))
         same = np.allclose(booster.predict(probe), loaded.predict(probe), rtol=1e-6, atol=1e-6)
         reload_ok &= bool(same)
-        shutil.move(str(temp_path), str(directory / file_name))
         index[tag] = file_name
     return {"files": index, "reload_ok": bool(reload_ok)}
 
@@ -303,26 +384,25 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
 
     role = "final" if use_final else "confirm"
     summary = {"role": role, "short": {}, "long": {}, "resource": {}, "reload_ok": True}
-    temp_dir = ctx.root / "_model_tmp"
     for name, bundle in (("short", short_bundle), ("long", long_bundle),
                          ("resource", resource_bundle)):
         models = bundle.final_models if use_final else bundle.models
         prefix = "resource" if name == "resource" else f"{bundle.kind}_{bundle.features}"
         if models:
             info = _save_boosters(ctx.model_dir / name / role, prefix, models,
-                                  bundle.feature_names, temp_dir)
+                                   bundle.feature_names)
             summary[name][role] = info
             summary["reload_ok"] &= info["reload_ok"]
         availability = getattr(bundle, "final_availability", None) if use_final else None
         if availability:
             info = _save_boosters(ctx.model_dir / name / "final_availability", "availability",
-                availability["models"], availability["feature_names"], temp_dir)
+                availability["models"], availability["feature_names"])
             summary[name]["availability"] = info
             summary["reload_ok"] &= info["reload_ok"]
             if availability.get("retained_state"):
                 retained = availability["retained_state"]
                 retained_info = _save_boosters(ctx.model_dir / name / "final_availability" / "retained",
-                    "availability", retained["models"], retained["feature_names"], temp_dir)
+                    "availability", retained["models"], retained["feature_names"])
                 info["retained"] = retained_info
                 summary["reload_ok"] &= retained_info["reload_ok"]
         nn = getattr(bundle, "final_nn_bundle" if use_final else "nn_bundle", None)
@@ -333,7 +413,7 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
             save_generator1(specialist, directory)
             loaded = load_generator1(directory)
             same = (loaded["recipe"] == specialist["recipe"] and loaded["train_end"] == specialist["train_end"])
-            summary[name]["generator1"] = {"path": str(directory.relative_to(ctx.model_dir)), "reload_ok": same}
+            summary[name]["generator1"] = {"path": directory.relative_to(ctx.model_dir).as_posix(), "reload_ok": same}
             summary["reload_ok"] &= same
         if nn is not None:
             path = main_nn.save_nn(nn, ctx.model_dir / name / role)
@@ -342,7 +422,7 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
                     and np.array_equal(loaded.feat_mean, nn.feat_mean)
                     and all(np.array_equal(loaded.state_dict[k].numpy(), v.numpy())
                             for k, v in nn.state_dict.items()))
-            summary[name]["nn"] = {"path": str(Path(path).relative_to(ctx.model_dir)), "kind": nn.kind, "reload_ok": bool(same)}
+            summary[name]["nn"] = {"path": Path(path).relative_to(ctx.model_dir).as_posix(), "kind": nn.kind, "reload_ok": bool(same)}
             summary["reload_ok"] &= bool(same)
         if name == "resource":
             resource_nn = bundle.final_resource_nn if use_final else bundle.resource_nn
@@ -353,14 +433,10 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
                     and all(np.array_equal(loaded[k], resource_nn[k]) for k in ("center", "scale", "gas_scale"))
                     and all(np.array_equal(loaded["state_dict"][k].numpy(), value.cpu().numpy())
                             for k, value in resource_nn["state_dict"].items()))
-                summary[name]["nn"] = {"path": str(path.relative_to(ctx.model_dir)),
+                summary[name]["nn"] = {"path": path.relative_to(ctx.model_dir).as_posix(),
                     "kind": resource_nn["kind"], "train_end": resource_nn["train_end"],
                     "max_training_target": resource_nn["max_training_target"], "reload_ok": bool(same)}
                 summary["reload_ok"] &= bool(same)
-    if temp_dir.exists():
-        if not temp_dir.resolve().is_relative_to(ctx.root.resolve()):
-            raise ValueError("临时模型目录超出当次运行路径")
-        shutil.rmtree(temp_dir)
     if not summary["reload_ok"]:
         raise ValueError("实际模型保存后重载不一致")
 
@@ -371,6 +447,8 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
         if state and state.get("retained_state"):
             state["retained_state"] = {k: v for k, v in state["retained_state"].items() if k != "models"}
         return {"kind": bundle.kind, "features": bundle.features,
+                "selection": {k: bundle.selection[k] for k in ("chosen", "generator1")
+                              if k in bundle.selection},
                 "availability": state,
                 "generator1": summary["short" if len(bundle.horizons) == 8 else "long"].get("generator1"),
                 "blend": bundle.blend, "feature_names": bundle.feature_names,
@@ -381,7 +459,13 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
                              (bundle.final_train_end if use_final else bundle.train_end)}
 
     meta = {
-        "role": role, "artifacts": summary,
+        "schema_version": 2, "role": role, "artifacts": summary,
+        "run": {"mode": ctx.mode, "quick": ctx.quick, "experimental": ctx.experimental},
+        "output_contract": {"prediction": _grid_spec(ctx.prediction_grid),
+                            "optimization": _grid_spec(ctx.optimization_grid),
+                            "window": ctx.window,
+                            "optimization_time_semantics": C.OPT_CONFIG["datetime_semantics"]},
+        "source": write_source_snapshot(ctx),
         "short": forecast_meta(short_bundle), "long": forecast_meta(long_bundle),
         "resource": {"metrics": resource_bundle.metrics,
                      "selection": {k: resource_bundle.selection.get(k)
@@ -452,29 +536,67 @@ def write_calibration(ctx: RunContext, short_bundle, long_bundle,
             "long_features": len(long_bundle.feature_names)}
 
 
-def write_source_snapshot(ctx: RunContext, config=C) -> dict:
+def _source_files(root: Path) -> dict[str, Path]:
     files = ["main.py", "main_s.py", "main_l.py", "main_nn.py", "main_opt.py", "config.py", "output.py",
-             "requirements.txt", "README.md"]
-    # 仓库保留 Git 忽略规则；提交源码快照不携带，并清理旧快照的遗留文件。
+             "requirements.txt", "README.md", "data_cleaning/__init__.py",
+             "data_cleaning/pipeline.py", "data_cleaning/quality.py"]
+    files.extend(path.relative_to(root).as_posix() for path in (root / "data_cleaning").glob("*.py"))
+    return {name: root / name for name in sorted(set(files))}
+
+
+def write_source_snapshot(ctx: RunContext, config=C) -> dict:
+    """首调冻结启动源码；后续仅核验，禁止用运行末尾的新代码覆盖快照。"""
+    if ctx.source_report:
+        files = _source_files(ctx.source_root)
+        expected = ctx.source_report["sha256"]
+        changed = sorted(set(files) ^ set(expected))
+        for name, digest in expected.items():
+            source, snapshot = files.get(name), ctx.source_dir / name
+            if (source is None or not source.is_file() or not snapshot.is_file()
+                    or hashlib.sha256(source.read_bytes()).hexdigest() != digest
+                    or hashlib.sha256(snapshot.read_bytes()).hexdigest() != digest):
+                changed.append(name)
+        ctx.source_report["consistency_passed"] = not changed
+        if changed:
+            ctx.source_report["changed_files"] = sorted(set(changed))
+            raise ValueError("运行源码或冻结快照已变化，拒绝归档: " + "; ".join(sorted(set(changed))))
+        return ctx.source_report
+    ctx.source_root = config.ROOT.resolve()
+    files = _source_files(ctx.source_root)
+    missing = [name for name, path in files.items() if not path.is_file()]
+    if missing:
+        raise ValueError("缺少必要源码: " + "; ".join(missing))
+    contents = {name: path.read_bytes() for name, path in files.items()}
+    ctx.source_dir.mkdir(parents=True, exist_ok=True)
     (ctx.source_dir / ".gitignore").unlink(missing_ok=True)
-    copied = []
-    for name in C.progress(files, desc="归档源码", unit="文件"):
-        source = config.ROOT / name
-        if source.is_file():
-            target = ctx.source_dir / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
-            copied.append(name)
-    cleaning = config.ROOT / "data_cleaning"
-    for path in sorted(cleaning.glob("*.py")):
-        target = ctx.source_dir / "data_cleaning" / path.name
+    for name, content in C.progress(contents.items(), desc="冻结启动源码", unit="文件"):
+        target = ctx.source_dir / name
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, target)
-        copied.append(f"data_cleaning/{path.name}")
-    return {"files": copied, "count": len(copied), "directory": str(ctx.source_dir)}
+        target.write_bytes(content)
+    ctx.source_report = {"files": list(contents), "count": len(contents), "directory": str(ctx.source_dir),
+        "frozen_at": pd.Timestamp.now().isoformat(timespec="seconds"), "freeze_stage": "run_start",
+        "sha256": {name: hashlib.sha256(content).hexdigest() for name, content in contents.items()}}
+    return write_source_snapshot(ctx, config)
 
 
 def build_zip(ctx: RunContext, submittable: bool, config=C) -> dict:
+    source = write_source_snapshot(ctx, config)
+    if ctx.prediction_grid is None:
+        raise ValueError("缺少当次输出时间契约，拒绝打包")
+    origins = None if ctx.window == "half_test" else ctx.prediction_grid
+    coverage = validate_result_files(ctx.root, origins, ctx.quick,
+                                    require_optimization=submittable)
+    if not coverage["passed"]:
+        raise ValueError("结果覆盖校验失败: " + "; ".join(coverage["problems"]))
+    if submittable:
+        from main_opt import physical_submission_check
+        meta = json.loads((ctx.model_dir / "model_meta.json").read_text(encoding="utf-8"))
+        physical = physical_submission_check({"summary": meta["optimization"]})
+        if (ctx.mode != "infer" or ctx.window != "half_test" or ctx.quick or ctx.experimental
+                or not ctx.prediction_grid.equals(expected_result_grid("s_result.csv"))):
+            raise ValueError("非完整正式测试运行，拒绝标记为可提交")
+        if not physical["passed"]:
+            raise ValueError("正式物理核验未通过: " + "; ".join(physical["problems"]))
     name = config.FORMAL_ZIP_NAME if submittable else config.MOCK_ZIP_NAME
     final_path = ctx.root / name
     temp_path = ctx.root / (name + ".tmp")
@@ -498,12 +620,18 @@ def build_zip(ctx: RunContext, submittable: bool, config=C) -> dict:
                 raise ValueError(f"ZIP 缺少 {member}")
             if packed.read(member) != (ctx.root / member).read_bytes():
                 raise ValueError(f"ZIP 内 {member} 与磁盘不一致")
+        for relative, digest in source["sha256"].items():
+            if hashlib.sha256(packed.read(f"{config.SOURCE_DIR}/{relative}")).hexdigest() != digest:
+                raise ValueError(f"ZIP 源码与启动快照不一致: {relative}")
+    write_source_snapshot(ctx, config)
     temp_path.replace(final_path)
     return {"name": name, "path": str(final_path), "members": len(names),
-            "root_csv": members, "crc_ok": True, "submittable": bool(submittable)}
+            "root_csv": members, "crc_ok": True, "submittable": bool(submittable),
+            "coverage": coverage, "source_consistency_passed": True}
 
 
 def write_report(ctx: RunContext, summary: dict) -> Path:
+    summary.setdefault("source", ctx.source_report)
     path = ctx.report_dir / C.REPORT_JSON
     path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, default=str) + "\n",
                     encoding="utf-8")
