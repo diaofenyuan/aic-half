@@ -337,9 +337,10 @@ def train_process_expert(prepared: PreparedData, bundle: LongBundle, quick: bool
     old_decay = C.DECAY_DAYS
     try:
         C.DECAY_DAYS = recipe["decay_days"]
+        base = build_base_features(prepared, True)
         for seed in range(recipe["seeds"]):
             logging.getLogger("aic-half").info("长期过程专家最终训练 seed=%d，截止=%s", 20261021 + seed, end)
-            models, names = _train_models(prepared, build_base_features(prepared, True), positions, C.HORIZONS_L,
+            models, names = _train_models(prepared, base, positions, C.HORIZONS_L,
                 recipe["kind"], recipe["features"], C.LGBM_TREES_QUICK if quick else C.LGBM_TREES_LONG,
                 ref, params_override={"seed": 20261021 + seed})
             experts.append({"models": models, "feature_names": names})

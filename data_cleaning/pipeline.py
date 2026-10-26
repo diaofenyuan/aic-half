@@ -38,6 +38,25 @@ class PreparedData:
     mask_end: pd.Timestamp | None = None
     source_hashes: dict = field(default_factory=dict)
     stage_ranges: dict = field(default_factory=dict)
+    # 与模型宽表分开保存，避免新增质量字段改变已冻结模型的特征列序。
+    provenance: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+    def observed_values(self, columns) -> pd.DataFrame:
+        """物理核验只读取合法原始观测；补值及来源未知的值不能充当实测量。"""
+        block = self.frame.reindex(columns=list(columns))
+        observed = self.provenance.reindex(index=self.index, columns=list(columns)).eq(1)
+        return block.where(observed)
+
+    def observation_quality(self, columns) -> dict[str, pd.DataFrame]:
+        """按起报点提供观测来源和陈旧程度；首次观测前的年龄保持未知。"""
+        state = self.provenance.reindex(index=self.index, columns=list(columns)).fillna(0)
+        observed = state.eq(1)
+        positions = np.arange(len(self.index))[:, None]
+        last = np.maximum.accumulate(np.where(observed, positions, -1), axis=0)
+        age = pd.DataFrame(np.where(last >= 0, positions-last, np.nan), index=self.index, columns=state.columns)
+        return {"observed": observed, "imputed": state.eq(2), "missing": state.eq(0),
+                "no_observed_history": pd.DataFrame(last < 0, index=self.index, columns=state.columns),
+                "age_steps": age}
 
     def require_training_data(self) -> None:
         """训练入口二次拦截，避免调用方误传本地评测对象或其前缀副本。"""
@@ -55,6 +74,10 @@ class PreparedData:
         frame.loc[(frame.index >= start) & (frame.index <= end), present] = np.nan
         obj = copy.copy(self)
         obj.frame = frame
+        if not self.provenance.empty:
+            obj.provenance = self.provenance.copy()
+            obj.provenance.loc[(frame.index >= start) & (frame.index <= end), present] = 0
+            obj.quality = {**self.quality, "preprocessing": _preprocessing_summary(obj.frame, obj.provenance)}
         obj.mask_start = start
         obj.mask_end = end
         return obj
@@ -68,8 +91,11 @@ class PreparedData:
         obj.index = self.index[:stop]
         obj.frame = self.frame.iloc[:stop].copy()
         obj.labels = self.labels.iloc[:stop].copy()
+        obj.provenance = self.provenance.iloc[:stop].copy()
         obj.quality = {**self.quality, "rows": stop,
                        "time_range": [str(obj.index[0]), str(obj.index[-1])]}
+        if not obj.provenance.empty:
+            obj.quality["preprocessing"] = _preprocessing_summary(obj.frame, obj.provenance)
         return obj
 
     def masked_power_gas_copy(self, start=None, end=None) -> "PreparedData":
@@ -86,6 +112,11 @@ class PreparedData:
         obj.frame.loc[rows, columns] = np.nan
         if "d_use_valid_fraction" in obj.frame:
             obj.frame.loc[rows, "d_use_valid_fraction"] = 0.
+        if not self.provenance.empty:
+            obj.provenance = self.provenance.copy()
+            raw_columns = [c for c in obj.provenance if c.startswith("load_generator_use_")]
+            obj.provenance.loc[rows, raw_columns] = 0
+            obj.quality = {**self.quality, "preprocessing": _preprocessing_summary(obj.frame, obj.provenance)}
         return obj
 
 
@@ -135,6 +166,8 @@ def scan_sources(config=C, include_inference: bool = True) -> dict:
             continue
         for table in C.progress(config.TABLES, desc=f"扫描 {stage['name']}", unit="表"):
             files = _find_table_files(stage_dir, table, config)
+            if not files:
+                report["problems"].append(f"{stage['name']}: 缺少 {table} 表")
             table_info = {"files": [], "rows": 0, "columns": [], "time_range": None,
                           "target_valid": {}, "duplicates": 0, "missing_ratio": {}}
             for path in files:
@@ -192,7 +225,7 @@ def _standardize_table(raw: pd.DataFrame, name: str, conflicts: list[str]) -> pd
     bad_time = int(frame["datetime"].isna().sum())
     if bad_time:
         conflicts.append(f"{name}: 无效时间戳 {bad_time}")
-    frame = frame[frame["datetime"].notna()].set_index("datetime").sort_index()
+    frame = frame[frame["datetime"].notna()].set_index("datetime").sort_index(kind="stable")
     for col in frame.columns:
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
     if frame.index.duplicated().any():
@@ -205,6 +238,9 @@ def _standardize_table(raw: pd.DataFrame, name: str, conflicts: list[str]) -> pd
 
 
 def _apply_sentinel_rules(frame: pd.DataFrame, quality: dict) -> None:
+    nonfinite = np.isinf(frame.to_numpy(dtype=float)).sum(axis=0)
+    quality["nonfinite_to_missing"] = {c: int(n) for c, n in zip(frame.columns, nonfinite) if n}
+    frame.replace([np.inf, -np.inf], np.nan, inplace=True)
     counts = {}
     for col, rule in C.CLEANING["sentinel_rules"].items():
         if col not in frame.columns:
@@ -228,11 +264,12 @@ def _apply_sentinel_rules(frame: pd.DataFrame, quality: dict) -> None:
     quality["sentinel_or_negative"] = counts
 
 
-def _causal_fill(frame: pd.DataFrame, quality: dict) -> None:
-    """仅对连续供气/用气字段做单边填补；发生量和目标列绝不填补。"""
+def _causal_fill(frame: pd.DataFrame, quality: dict) -> pd.DataFrame:
+    """连续用气仅填有限短缺口；来源码为0缺测、1合法观测、2前向补值。"""
     limit = int(C.CLEANING["ffill_limit"])
-    window = int(C.CLEANING["rolling_median_steps"])
-    min_periods = int(C.CLEANING["rolling_min_periods"])
+    if limit < 1:
+        raise ValueError("因果填补上限必须为正整数")
+    provenance = frame.notna().astype(np.uint8)
     counts = {}
     for col in C.CLEANING["causal_fill_columns"]:
         if col not in frame.columns:
@@ -241,18 +278,102 @@ def _causal_fill(frame: pd.DataFrame, quality: dict) -> None:
         missing = values.isna()
         if not missing.any():
             continue
-        trailing = values.rolling(window, min_periods=min_periods).median().shift(1)
-        filled = values.ffill(limit=limit).fillna(trailing)
-        counts[col] = int((missing & filled.notna()).sum())
+        # 不再用历史中位数延长填补，避免把数小时前的状态伪装成新观测。
+        filled = values.ffill(limit=limit)
+        imputed = missing & filled.notna()
+        counts[col] = int(imputed.sum())
+        provenance.loc[imputed, col] = 2
         frame[col] = filled
     quality["causal_imputed"] = counts
+    return provenance
+
+
+def _preprocessing_summary(frame: pd.DataFrame, provenance: pd.DataFrame) -> dict:
+    columns = {}
+    for col in provenance:
+        state = provenance[col]
+        observed = state.eq(1)
+        positions = np.arange(len(state))
+        last = np.maximum.accumulate(np.where(observed, positions, -1))
+        imputed = state.eq(2).to_numpy()
+        missing = state.eq(0).to_numpy()
+        age = positions - last
+        first = np.flatnonzero(observed)
+        columns[col] = {"observed": int(observed.sum()), "imputed": int(imputed.sum()),
+            "missing": int(state.eq(0).sum()),
+            "max_imputation_age_steps": int(age[imputed].max()) if imputed.any() else 0,
+            "no_history_missing_rows": int((missing & (last < 0)).sum()),
+            "long_gap_missing_rows": int((missing & (last >= 0) & (age > C.CLEANING["ffill_limit"])).sum()),
+            "first_observed": str(state.index[first[0]]) if len(first) else None,
+            "last_observed": str(state.index[first[-1]]) if len(first) else None}
+    aggregates = {}
+    groups = {"gen_blast": [f"gas_blast_furnace_{i}" for i in range(1, 6)],
+              "air_heater": [f"gas_air_heater_{i}" for i in range(1, 6)],
+              "blast_user": [f"gas_user_blast_furnace_user{i}" for i in range(1, 5)],
+              "converter_user": [f"gas_user_converter_user{i}" for i in range(1, 3)]}
+    for name, required in groups.items():
+        observed = provenance.reindex(columns=required).eq(1).sum(axis=1)
+        usable = frame.reindex(columns=required).notna().sum(axis=1)
+        aggregates[name] = {"required_columns": required,
+            "observed_complete_rows": int(observed.eq(len(required)).sum()),
+            "observed_partial_rows": int(((observed > 0) & (observed < len(required))).sum()),
+            "observed_missing_rows": int(observed.eq(0).sum()),
+            "complete_after_imputation_rows": int(usable.eq(len(required)).sum()),
+            "value_semantics": "available_component_sum; not_certified_physical_total"}
+    return {"version": 2, "provenance_codes": {"0": "missing_or_invalid", "1": "observed", "2": "causal_ffill"},
+            "columns": columns, "aggregates": aggregates,
+            "physical_values": "observed_values returns raw observations only; unknown users remain unknown"}
 
 
 def _sum_columns(frame: pd.DataFrame, columns: list[str]) -> pd.Series:
+    """预测使用可用组成项合计，必须结合覆盖率；物理账本不得当作完整总量。"""
     present = [c for c in columns if c in frame.columns]
     if not present:
         return pd.Series(np.nan, index=frame.index)
     return frame[present].sum(axis=1, min_count=1)
+
+
+def short_process_view(prepared: PreparedData, recipe: dict) -> tuple[PreparedData, np.ndarray]:
+    """短期模型的因果输入恢复视图；估计只进入派生预测量，不改原值和实测覆盖率。"""
+    inactive = np.zeros(len(prepared.index), dtype=bool)
+    if not recipe:
+        return prepared, inactive
+    if recipe.get("method") != "median_recent_observed" or recipe.get("activation") != "all_power_gases_observed":
+        raise ValueError("未知的短期输入恢复配方")
+    column = recipe["column"]
+    if column != "gas_blast_furnace_3":
+        raise ValueError("短期恢复仅核验过3号高炉，不自动推广到其它传感器")
+    if column not in prepared.frame or prepared.provenance.empty:
+        return prepared, inactive
+    history, minimum, samples, age_limit, influence = (int(recipe[key]) for key in
+        ("history_steps", "min_observed", "median_samples", "max_age_steps", "influence_steps"))
+    if min(history, minimum, samples, age_limit, influence) <= 0 or minimum < samples:
+        raise ValueError("短期输入恢复窗口配置无效")
+    raw = prepared.observed_values([column])[column]
+    observed = raw.dropna()
+    if len(observed) < minimum:
+        return prepared, inactive
+    median = observed.rolling(samples, min_periods=samples).median().reindex(prepared.index).ffill()
+    # 年龄从真实观测计算，估计值不能给后续缺口续命。
+    age = prepared.observation_quality([column])["age_steps"][column]
+    count = raw.notna().rolling(history, min_periods=1).sum().shift(1)
+    others = [f"gas_blast_furnace_{i}" for i in (1, 2, 4, 5)]
+    complete_peers = prepared.observed_values(others).notna().all(axis=1)
+    recover = raw.isna() & (count >= minimum) & (age <= age_limit) & median.notna() & complete_peers
+    if not recover.any():
+        return prepared, inactive
+    current_gas = prepared.frame[["d_use_blast", "d_use_coke", "d_use_converter"]].notna().all(axis=1)
+    active = (recover.rolling(influence, min_periods=1).max().astype(bool) & current_gas).to_numpy()
+    if not active.any():
+        return prepared, inactive
+    obj = copy.copy(prepared)
+    obj.frame = prepared.frame.copy()
+    for name in ("d_gen_blast", "d_surplus_blast"):
+        obj.frame.loc[recover, name] += median.loc[recover]
+    obj.quality = {**prepared.quality, "short_process_recovery": {"recipe": dict(recipe),
+        "inferred_rows": int(recover.sum()), "active_origins": int(active.sum()),
+        "raw_values_preserved": True, "physical_values_replaced": False}}
+    return obj, active
 
 
 def _build_derived(frame: pd.DataFrame) -> None:
@@ -382,8 +503,9 @@ def prepare_data(config=C, mask_targets: tuple | None = None,
                     part.loc[:, targets] = np.nan
                 pieces.append(part)
             if pieces:
-                frame = pd.concat(pieces, axis=0).sort_index()
-                frame = frame.loc[~frame.index.duplicated(keep="first")]
+                # 同阶段多文件也必须检查冲突；跨阶段的新发布覆盖仍单独处理。
+                frame = _standardize_table(pd.concat(pieces).reset_index(),
+                                           f"{stage['name']}/{table}合并", conflicts)
                 per_table[table].append(frame)
                 loaded[table] = frame
         if loaded:
@@ -414,7 +536,7 @@ def prepare_data(config=C, mask_targets: tuple | None = None,
                      "duplicate_conflicts": int(sum(duplicate_conflicts)),
                      "problems": conflicts}
     _apply_sentinel_rules(frame, quality)
-    _causal_fill(frame, quality)
+    provenance = _causal_fill(frame, quality)
     _build_derived(frame)
     frame = pd.concat([frame, _observed_at_t_features(merged_tables, index, config)], axis=1)
 
@@ -427,6 +549,7 @@ def prepare_data(config=C, mask_targets: tuple | None = None,
     targets.loc[~valid] = np.nan
     for target in config.TARGETS:
         frame[config.TARGET_COLUMN[target]] = targets[target]
+        provenance[config.TARGET_COLUMN[target]] = targets[target].notna().astype(np.uint8)
 
     quality["target_valid"] = {t: int(targets[t].notna().sum()) for t in config.TARGETS}
     quality["target_missing_ratio"] = {t: float(targets[t].isna().mean()) for t in config.TARGETS}
@@ -440,10 +563,12 @@ def prepare_data(config=C, mask_targets: tuple | None = None,
                                                        pd.Timedelta(minutes=config.STEP_MINUTES) + 1))
     quality["source_files"] = len(source_hashes)
     quality["hash_algorithm"] = "sha256"
+    quality["preprocessing"] = _preprocessing_summary(frame, provenance)
 
     prepared = PreparedData(index=index, frame=frame, labels=targets,
                             quality=quality, scan=scan,
-                            source_hashes=source_hashes, stage_ranges=stage_ranges)
+                            source_hashes=source_hashes, stage_ranges=stage_ranges,
+                            provenance=provenance)
     if mask_targets is not None:
         prepared = prepared.masked_copy(mask_targets[0], mask_targets[1])
     return prepared

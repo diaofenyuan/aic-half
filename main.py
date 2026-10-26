@@ -278,6 +278,7 @@ def run_infer(quick: bool = False, experimental: bool = False,
               reuse_run: Path | None = None) -> int:
     """冻结模型后执行正式半决赛测试推理，并单独核验当次结果的提交条件。"""
     started = time.time()
+    output.training_cache_stats(reset=True)
     ctx = output.begin_run(C, mode="infer", experimental=quick or experimental, quick=quick)
     _setup_logger(ctx.log_path)
     LOGGER.info("推理运行目录: %s", ctx.root)
@@ -327,6 +328,8 @@ def run_infer(quick: bool = False, experimental: bool = False,
             if not publication_check["passed"]:
                 raise ValueError("复用资源模型不满足每日发布时间边界：" + "; ".join(publication_check["problems"]))
             summary["reused_models_from"] = str(reuse_run.resolve())
+            short_bundle.process_recovery = dict(C.SHORT_PROCESS_RECOVERY)
+            summary["preprocessing_recipe_updated"] = {"short_process_recovery": short_bundle.process_recovery}
             summary["validation_scope"] = "复用已有最终模型；神经网络按A/B/C冻结晋级，未评估D"
             stages.update(3)
             main_opt.refresh_physical_validation(resource_bundle, training, use_final=True)
@@ -390,12 +393,15 @@ def run_infer(quick: bool = False, experimental: bool = False,
                            "official_test_training_used": False,
                            "test_usage": ("frozen_model_official_inference" if window == "half_test"
                                           else "frozen_model_compatibility_dryrun")},
+            "preprocessing": {"training": training.quality.get("preprocessing", {}),
+                              "inference": prepared.quality.get("preprocessing", {})},
             "origins": int(len(origins)),
             "origin_range": [str(origins[0]), str(origins[-1])],
             "prediction_input_support": {
                 "power_gas_missing_origins": int((~np.isfinite(masked.frame[["d_use_blast", "d_use_coke", "d_use_converter"]]
                     .to_numpy(dtype=float)[masked.index.get_indexer(origins)]).all(axis=1)).sum()),
                 "short_fallback_active": bool(short_bundle.final_availability),
+                "short_process_recovery": short_bundle.process_recovery,
                 "long_fallback_active": bool(long_bundle.final_availability)},
             "short": {"scores": short_bundle.scores, "selection": short_bundle.selection,
                       "train_seconds": short_bundle.train_seconds},
@@ -465,6 +471,7 @@ def run_infer(quick: bool = False, experimental: bool = False,
 
 def run_full(quick: bool = False, experimental: bool = False) -> int:
     started = time.time()
+    output.training_cache_stats(reset=True)
     ctx = output.begin_run(C, mode="backtest", experimental=quick or experimental, quick=quick)
     _setup_logger(ctx.log_path)
     LOGGER.info("运行目录: %s", ctx.root)
@@ -564,6 +571,7 @@ def run_full(quick: bool = False, experimental: bool = False) -> int:
                 "target_invalid": prepared.quality["target_invalid"],
                 "duplicate_conflicts": prepared.quality["duplicate_conflicts"],
                 "key_missing_ratio": prepared.quality["key_missing_ratio"],
+                "preprocessing": prepared.quality.get("preprocessing", {}),
                 "causal_contract": {"passed": True, "target_mask": "整个开发验证窗口" if quick else "整个历史确认窗口",
                                     "future_dynamic_fields": "forbidden"},
                 "sources_unchanged": True,
@@ -755,16 +763,33 @@ def _train_generator1_final(training, short_bundle, long_bundle, quick=False, re
 
 
 
+def _calibration_contract(template, specialist, quick):
+    import main_nn
+    neural = template.final_nn_bundle
+    return {"primary": {k: getattr(template, k) for k in
+            ("kind", "features", "blend", "lgb_kind", "lgb_features", "nn_weights")},
+        "neural": {"kind": neural.kind, "config": neural.config, "seeds": len(neural.seed_states),
+                   "runtime": main_nn.training_runtime()},
+        "availability": {k: v for k, v in template.final_availability.items()
+                         if k not in ("models", "retained_state", "feature_names", "train_end", "role")},
+        "specialist": specialist, "quick": bool(quick)}
+
+
 def _train_final_calibration(training, short_bundle, long_bundle, span, recipe, quick=False):
     import copy
     if span != "short":
         raise ValueError("正式阶段校准只启用已晋级的短期配方")
-    ctx = output.begin_run(C, mode="final_calibration_" + span, experimental=True, quick=quick)
-    output.write_source_snapshot(ctx, C)
-    ctx.log_path.write_text("最终阶段权重表训练；完整训练日志同时写入主推理日志。\n", encoding="utf-8")
+    training.require_training_data()
     templates = {"short": short_bundle, "long": long_bundle}
     if templates[span].kind != "nn_lgb_ens" or pd.Timestamp(templates[span].final_train_end) != training.index[-1]:
         raise ValueError("最终校准要求同截止点的完整融合主模型")
+    cache = output.training_cache_path("calibration", _calibration_contract(templates[span], recipe, quick),
+                                       frames=(training.frame, training.labels))
+    artifact = output.read_training_cache(cache)
+    if artifact is not None:
+        return json.loads(artifact.read_text(encoding="utf-8"))
+    ctx = output.begin_run(C, mode="final_calibration_" + span, experimental=True, quick=quick)
+    ctx.log_path.write_text("最终阶段权重表训练；完整训练日志同时写入主推理日志。\n", encoding="utf-8")
     base_recipe = copy.deepcopy(recipe)
     base_recipe.pop("calibration", None)
     summary = {"run_id": ctx.run_id, "status": "RUNNING", "submittable": False, "quick": bool(quick),
@@ -795,6 +820,11 @@ def _train_final_calibration(training, short_bundle, long_bundle, span, recipe, 
     finally:
         summary["duration_seconds"] = time.time() - started
         output.write_report(ctx, summary)
+    def write_calibration(directory):
+        path = directory / "calibration.json"
+        path.write_text(json.dumps(calibration, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+    output.write_training_cache(cache, write_calibration)
     return calibration
 
 
@@ -819,11 +849,14 @@ def _fit_calibration_bundle(directory, prepared, spec, span, templates, speciali
     import copy
     import shutil
     import main_nn
+    training = prepared.prefix_copy(spec["train_end"])
+    training.require_training_data()
+    signature = output.training_fingerprint(_calibration_contract(templates[span], specialist_recipes[span], quick),
+                                            frames=(training.frame, training.labels))
     if not (directory / "complete.json").exists():
         for path in directory.parent.glob("*/complete.json"):
             record = json.loads(path.read_text(encoding="utf-8"))
-            if (record["train_end"] == spec["train_end"] and record["specialist_recipe"] == specialist_recipes[span]
-                    and bool(record.get("quick", False)) == bool(quick)):
+            if record.get("signature") == signature:
                 directory.mkdir(parents=True, exist_ok=True)
                 for component in ("primary", "availability", "specialist"):
                     shutil.copytree(path.parent / component, directory / component, dirs_exist_ok=True)
@@ -832,12 +865,9 @@ def _fit_calibration_bundle(directory, prepared, spec, span, templates, speciali
                 break
     if (directory / "complete.json").exists():
         record = json.loads((directory / "complete.json").read_text(encoding="utf-8"))
-        if (record["train_end"] != spec["train_end"] or record["specialist_recipe"] != specialist_recipes[span]
-                or bool(record.get("quick", False)) != bool(quick)):
-            raise ValueError("内层完整组合的冻结配方或截止点不一致")
+        if record.get("signature") != signature:
+            raise ValueError("内层完整组合的数据、实现或冻结配方已变化，不能复用")
         return _load_calibration_bundle(directory, span)
-    training = prepared.prefix_copy(spec["train_end"])
-    training.require_training_data()
     ref, end = len(training.index) - 1, str(training.index[-1])
     cls, horizons = main_s.ShortBundle, C.HORIZONS_S
     stride = C.QUICK_TRAIN_STRIDE if quick else C.TRAIN_STRIDE_SHORT
@@ -869,7 +899,7 @@ def _fit_calibration_bundle(directory, prepared, spec, span, templates, speciali
     main_s.save_generator1(bundle.final_generator1, directory / "specialist")
     record = {"train_end": end, "max_training_target": str(training.index[positions[-1] + max(horizons)]),
               "specialist_recipe": specialist_recipes[span], "quick": bool(quick),
-              "all_components_retrained_on_prefix": True}
+              "all_components_retrained_on_prefix": True, "signature": signature}
     (directory / "complete.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
     return bundle
 
@@ -979,12 +1009,6 @@ def _fit_calibration_prefixes(ctx, summary, prepared, specs, templates, spans=("
             for span in spans:
                 directory = ctx.model_dir / "inner_load" / span / spec["name"]
                 horizons = C.HORIZONS_S
-                complete = directory / "complete.json"
-                same_budget = (complete.exists() and bool(json.loads(complete.read_text(encoding="utf-8"))
-                                                         .get("quick", False)) == bool(quick))
-                if same_budget and all((directory / f"{scenario}.npz").exists() for scenario in ("normal", "all_missing", "outage_day7")):
-                    LOGGER.info("复用完整内层预测 %s/%s", span, spec["name"])
-                    continue
                 bundle = _fit_calibration_bundle(directory, prepared, spec, span, templates, summary["base_recipes"], quick=quick)
                 loaded = _load_calibration_bundle(directory, span)
                 audits = []

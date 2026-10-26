@@ -15,13 +15,29 @@ from .pipeline import (PreparedData, build_base_features, prepare_data,
 
 
 def data_contract_check(prepared: PreparedData) -> dict:
-    problems: list[str] = []
+    problems = list(prepared.scan.get("problems", [])) + list(prepared.quality.get("problems", []))
+    if not len(prepared.index):
+        return {"passed": False, "problems": problems + ["数据网格为空"], "rows": 0, "mask_start": None}
     if not prepared.index.is_monotonic_increasing:
         problems.append("时间索引非升序")
     if prepared.index.has_duplicates:
         problems.append("时间索引存在重复")
     if not prepared.labels.index.equals(prepared.index):
         problems.append("标签索引与特征索引不一致")
+    if not prepared.frame.index.equals(prepared.index):
+        problems.append("宽表索引与数据网格不一致")
+    if not (prepared.index[1:] - prepared.index[:-1] == pd.Timedelta(minutes=C.STEP_MINUTES)).all():
+        problems.append("数据网格不是连续15分钟")
+    if np.isinf(prepared.frame.to_numpy(dtype=float)).any():
+        problems.append("宽表仍含正负无穷值")
+    if not prepared.provenance.empty:
+        state = prepared.provenance
+        if not state.index.equals(prepared.index) or not state.columns.isin(prepared.frame.columns).all():
+            problems.append("观测来源索引或字段与宽表不一致")
+        elif (not np.isin(state.to_numpy(), [0, 1, 2]).all()
+                or not np.array_equal(state.to_numpy() > 0,
+                                      prepared.frame[state.columns].notna().to_numpy())):
+            problems.append("观测来源标记与清洗值不一致")
     if prepared.quality.get("data_scope") == "training_only":
         if prepared.index[-1] > pd.Timestamp(C.TRAIN_END):
             problems.append("训练数据超过允许截止点")
@@ -31,11 +47,16 @@ def data_contract_check(prepared: PreparedData) -> dict:
         if C.TARGET_COLUMN[target] not in prepared.frame.columns:
             problems.append(f"缺少目标列 {C.TARGET_COLUMN[target]}")
     if prepared.mask_start is not None:
-        present = prepared.frame.loc[prepared.frame.index >= prepared.mask_start,
-                                     [C.TARGET_COLUMN[t] for t in C.TARGETS]]
+        rows = prepared.frame.index >= prepared.mask_start
+        if prepared.mask_end is not None:
+            rows &= prepared.frame.index <= prepared.mask_end
+        columns = [C.TARGET_COLUMN[t] for t in C.TARGETS if C.TARGET_COLUMN[t] in prepared.frame]
+        present = prepared.frame.loc[rows, columns]
         if present.notna().any().any():
             problems.append("评测窗口目标未被完全遮挡")
-    return {"passed": not problems, "problems": problems,
+    return {"passed": not problems, "problems": list(dict.fromkeys(problems)),
+            # 新发布阶段覆盖旧版本属于已知修订，不与同阶段冲突混为一谈。
+            "stage_revision_conflicts": prepared.quality.get("duplicate_conflicts", 0),
             "rows": int(len(prepared.index)),
             "mask_start": str(prepared.mask_start) if prepared.mask_start is not None else None}
 
@@ -182,6 +203,65 @@ def _zero_preservation_check() -> dict:
     return {"passed": ok}
 
 
+def _preprocessing_contract_check() -> dict:
+    """核验真实观测与补值隔离、长缺口上限及质量门禁，不训练模型。"""
+    from .pipeline import _apply_sentinel_rules, _causal_fill, _build_derived, _standardize_table
+
+    index = pd.date_range("2025-01-01", periods=240, freq="15min")
+    raw = pd.DataFrame({"gas_air_heater_1": np.r_[np.full(96, 100.), np.full(144, np.nan)],
+                        "gas_coke_oven_1": 0., "gas_converter_1": 1.}, index=index)
+    for i in range(1, 6):
+        raw[f"gas_blast_furnace_{i}"] = np.nan if i == 3 else 100.
+    for gas in ("blast_furnace", "coke", "converter"):
+        raw[f"load_generator_use_{gas}_gas"] = 10.
+    raw.loc[index[20], "gas_coke_oven_1"] = np.inf
+    quality = {}
+    _apply_sentinel_rules(raw, quality)
+    provenance = _causal_fill(raw, quality)
+    _build_derived(raw)
+    probe = _synthetic_prepared(240)
+    for col in raw:
+        probe.frame[col] = raw[col]
+    probe.provenance = provenance
+    short = probe.prefix_copy(index[120])
+    imputed = provenance["gas_air_heater_1"].eq(2)
+    checks = {
+        "bounded_causal_fill": int(imputed.sum()) == C.CLEANING["ffill_limit"]
+            and raw.loc[index[96 + C.CLEANING["ffill_limit"]]:, "gas_air_heater_1"].isna().all(),
+        "zero_is_observed": provenance.loc[index[10], "gas_coke_oven_1"] == 1
+            and raw.loc[index[10], "gas_coke_oven_1"] == 0.,
+        "infinity_is_missing": provenance.loc[index[20], "gas_coke_oven_1"] == 0,
+        "partial_sum_kept_as_predictor": raw["d_gen_blast"].eq(400.).all()
+            and raw["d_gen_blast_valid_fraction"].eq(.8).all(),
+        "physical_view_rejects_partial_and_imputed": probe.observed_values(
+            [f"gas_blast_furnace_{i}" for i in range(1, 6)]).sum(axis=1, min_count=5).isna().all()
+            and probe.observed_values(["gas_air_heater_1"]).loc[imputed].isna().all().all(),
+        "prefix_provenance_aligned": short.provenance.index.equals(short.index),
+    }
+    failed = copy.deepcopy(probe)
+    failed.scan["problems"] = ["模拟扫描失败"]
+    checks["scan_failure_blocked"] = not data_contract_check(failed)["passed"]
+    failed = copy.deepcopy(probe)
+    failed.quality["problems"] = ["模拟同阶段时间戳冲突"]
+    checks["source_conflict_blocked"] = not data_contract_check(failed)["passed"]
+    checks["imputed_source_retained"] = probe.provenance.loc[index[100], "gas_air_heater_1"] == 2
+    failed = copy.deepcopy(probe)
+    failed.provenance.loc[index[-1], "gas_air_heater_1"] = 2
+    checks["inconsistent_provenance_blocked"] = not data_contract_check(failed)["passed"]
+    state = probe.observation_quality(["gas_air_heater_1", "gas_blast_furnace_3"])
+    checks["imputation_does_not_reset_observation_age"] = state["age_steps"].loc[index[100], "gas_air_heater_1"] == 5
+    checks["unobserved_history_age_unknown"] = (state["age_steps"]["gas_blast_furnace_3"].isna().all()
+        and state["no_observed_history"]["gas_blast_furnace_3"].all())
+    checks["masked_summary_refreshed"] = (probe.masked_power_gas_copy().quality["preprocessing"]["columns"]["load_generator_use_coke_gas"]["observed"] == 0
+        and probe.provenance["load_generator_use_coke_gas"].eq(1).all())
+    issues = []
+    _standardize_table(pd.DataFrame({"datetime": [index[0], index[0]], "x": [1., 2.]}), "probe", issues)
+    checks["duplicate_conflict_recorded"] = bool(issues)
+    masked = _synthetic_prepared(240).masked_copy(index[100], index[119])
+    checks["mask_end_respected"] = data_contract_check(masked)["passed"]
+    return {"passed": bool(all(checks.values())), **{k: bool(v) for k, v in checks.items()}}
+
+
 def _mask_check() -> dict:
     prepared = _synthetic_prepared(240)
     masked = prepared.masked_copy(prepared.index[100], prepared.index[-1])
@@ -189,6 +269,45 @@ def _mask_check() -> dict:
     empty = masked.frame.loc[masked.index >= masked.index[100], cols].isna().all().all()
     labels_kept = prepared.labels.equals(masked.labels)
     return {"passed": bool(empty and labels_kept)}
+
+
+def _short_process_recovery_check() -> dict:
+    """恢复分支不修改实测值，且耗气缺测起报点沿用完整原输入。"""
+    from unittest.mock import patch
+    from .pipeline import short_process_view
+    import main_s
+
+    data = _synthetic_prepared(480)
+    for i in range(1, 6):
+        data.frame[f"gas_blast_furnace_{i}"] = 200.
+    column = "gas_blast_furnace_3"
+    data.frame.loc[data.index[100:220], column] = np.nan
+    data.provenance = data.frame[[f"gas_blast_furnace_{i}" for i in range(1, 6)]].notna().astype(np.uint8)
+    recovered, active = short_process_view(data, C.SHORT_PROCESS_RECOVERY)
+    changed = data.frame.copy()
+    future = copy.deepcopy(data)
+    future.frame.loc[future.index > data.index[160], column] = 10000.
+    later, later_active = short_process_view(future, C.SHORT_PROCESS_RECOVERY)
+    absent = copy.deepcopy(data)
+    absent.provenance.loc[:, column] = 0
+    absent.frame.loc[:, column] = np.nan
+    _, no_history_active = short_process_view(absent, C.SHORT_PROCESS_RECOVERY)
+    unavailable = copy.deepcopy(data)
+    unavailable.frame.loc[unavailable.index[150]:, "d_use_coke"] = np.nan
+    bundle = main_s.ShortBundle("global", "gas", C.HORIZONS_S, {}, {}, {}, [])
+    def core(pack, view, origins, use_final=False):
+        return np.full((len(origins), 8, 2), 1. if view is unavailable else 2.)
+    with patch.object(main_s, "_predict_short_core", side_effect=core):
+        routed = main_s.predict_short(bundle, unavailable, data.index[[110, 160]])
+    checks = {"raw_values_and_coverage_kept": recovered.frame[column].equals(data.frame[column])
+        and recovered.provenance.equals(data.provenance) and data.frame.equals(changed),
+        "age_limit_uses_real_readings": recovered.frame.loc[data.index[195], "d_gen_blast"] > data.frame.loc[data.index[195], "d_gen_blast"]
+            and recovered.frame.loc[data.index[196], "d_gen_blast"] == data.frame.loc[data.index[196], "d_gen_blast"],
+        "no_backfill_before_own_observations": not no_history_active.any(),
+        "future_does_not_change_earlier_recovery": np.allclose(recovered.frame.iloc[:161], later.frame.iloc[:161], equal_nan=True)
+            and np.array_equal(active[:161], later_active[:161]),
+        "missing_power_gas_routes_original_window": bool(np.all(routed[0] == 2.) and np.all(routed[1] == 1.))}
+    return {"passed": bool(all(checks.values())), **{k: bool(v) for k, v in checks.items()}}
 
 
 def _profile_causality_check() -> dict:
@@ -875,6 +994,73 @@ def _daily_repair_check() -> dict:
     return {"passed": all(checks.values()), **checks}
 
 
+def _net_dispatch_check() -> dict:
+    """覆盖生产预留、逐柜初态及守恒反例，不以总量正常替代独立安全。"""
+    from types import SimpleNamespace
+    import main_opt
+    cfg = SimpleNamespace(**vars(C))
+    cfg.OPT_CONFIG = {**C.OPT_CONFIG, "solver_time_limit_s": 2.}
+    names = tuple(C.GAS_HOLDER["capacity_by_column_m3"])
+    initial = dict(zip(names, (180000., 100000.)))
+    units = dict.fromkeys(names, True)
+    heat = {"coefficients_mw_per_m3h": {"blast": .000346, "coke": .0019, "converter": .00059}}
+    generation = np.tile([1.6e6, 1e5, 2e5], (8, 1))
+    priority = np.tile([6e5, 4e4, 8e4], (8, 1))
+    reserved = np.tile([2e5, 3e4, 5e4], (8, 1))
+    boundary = main_opt.net_resource_boundary(generation, priority, reserved, issued_at="2025-01-02 07:00",
+        training_end="2025-01-02 07:00", flow_units_verified=True)
+    result = main_opt.solve_net_day(boundary, np.r_[np.full(4, .2), np.ones(4)], initial,
+        np.array([30., 30., 30., 30., 72., 72.]), [1.2e6, 1e5, 1e5], heat,
+        holder_units_verified=units, config=cfg)
+    if result["status"] not in ("OPTIMAL", "FEASIBLE_TIMEOUT"):
+        return {"passed": False, "reason": result.get("message")}
+    checks = {"net_demand_reserved_before_generation": np.allclose(boundary["available_m3h"], [8e5, 3e4, 7e4]),
+        "two_holder_solve_and_validation": result["network_validation"]["passed"],
+        "two_holder_terminal_return": np.allclose(result["holders_m3"][-1], list(initial.values()), atol=1.),
+        "not_field_certified": result["physical_feasibility_certified"] is False}
+    idle = main_opt.solve_net_day(boundary, np.ones(8), initial, np.zeros(6), [0., 0., 0.], heat,
+        holder_units_verified=units, config=cfg)
+    checks["unused_gas_explicitly_accounted_as_vent"] = (idle.get("network_validation", {}).get("passed", False)
+        and np.allclose(idle["vent"][1:], boundary["available_m3h"][:, 1:].T))
+    unsafe = {**initial, names[0]: 40000., names[1]: 150000.}
+    bad_initial = main_opt.solve_net_day(boundary, np.ones(8), unsafe, np.zeros(6), [1e6, 1e5, 1e5], heat,
+        holder_units_verified=units, config=cfg)
+    missing_initial = main_opt.solve_net_day(boundary, np.ones(8), {names[1]: 100000.}, np.zeros(6),
+        [1e6, 1e5, 1e5], heat, holder_units_verified=units, config=cfg)
+    checks["safe_sum_cannot_hide_unsafe_holder"] = bad_initial["status"] == "BLOCKED_OPT"
+    checks["missing_holder_not_invented"] = missing_initial["status"] == "BLOCKED_OPT"
+    tampered = copy.deepcopy(result)
+    tampered["holders_m3"][0] += [5000., -5000.]
+    checks["compensated_stock_tamper_rejected"] = not main_opt.validate_net_dispatch(boundary, tampered, initial, units)["passed"]
+    tampered = copy.deepcopy(result)
+    tampered["vent"][1, 0] += 100.
+    checks["gas_without_storage_must_close"] = not main_opt.validate_net_dispatch(boundary, tampered, initial, units)["passed"]
+    checks["holder_unit_required"] = not main_opt.validate_net_dispatch(boundary, result, initial,
+        {**units, names[0]: False})["passed"]
+    late = main_opt.net_resource_boundary(generation, priority, reserved, issued_at="2025-01-02 07:00",
+        training_end="2025-01-02 07:15")
+    missing = reserved.copy()
+    missing[0, 0] = np.nan
+    unknown = main_opt.net_resource_boundary(generation, priority, missing, issued_at="2025-01-02 07:00",
+        training_end="2025-01-02 07:00")
+    checks["future_training_rejected"] = not late["passed"]
+    checks["unknown_demand_not_zero"] = not unknown["passed"] and np.isnan(unknown["available_m3h"][0, 0])
+    deficit = main_opt.net_resource_boundary(np.zeros((4, 3)), np.tile([4000., 0., 0.], (4, 1)), np.zeros((4, 3)),
+        issued_at="2025-01-02 07:00", training_end="2025-01-02 07:00", flow_units_verified=True)
+    cfg.OPT_CONFIG["terminal_holder"] = False
+    drained = main_opt.solve_net_day(deficit, np.ones(4), initial, np.zeros(6), [0., 0., 0.], heat,
+        holder_units_verified=units, config=cfg)
+    checks["production_deficit_draws_storage_without_clipping"] = (drained.get("network_validation", {}).get("passed", False)
+        and abs(drained["holders_m3"][-1].sum() - sum(initial.values()) + 4000.) < 1.)
+    fake = {"summary": {"resource_mode": "net_surplus_after_priority_users", "plan_validation_passed": True,
+        "physical_feasibility_certified": True, "dispatch_mode": "daily_fixed", "intraday_refresh": False,
+        "time_semantics": "target_time", "planned_steps": 8}}
+    gate = main_opt.physical_submission_check(fake)
+    checks["blanket_flags_cannot_bypass_network_evidence"] = all(name in gate["blocked_items"]
+        for name in ("net_material_balance", "independent_holder_safety"))
+    return {"passed": bool(all(checks.values())), **{k: bool(v) for k, v in checks.items()}}
+
+
 def run_self_checks(config=C) -> dict:
     checks = {
         "stage_isolation": _stage_isolation_check(),
@@ -883,6 +1069,8 @@ def run_self_checks(config=C) -> dict:
         "future_perturbation": _future_perturbation_check(),
         "prefix_consistency": _prefix_consistency_check(),
         "zero_preservation": _zero_preservation_check(),
+        "preprocessing_contract": _preprocessing_contract_check(),
+        "short_process_recovery": _short_process_recovery_check(),
         "target_mask": _mask_check(),
         "profile_causality": _profile_causality_check(),
         "multistep_alignment": _multistep_alignment_check(),
@@ -892,6 +1080,7 @@ def run_self_checks(config=C) -> dict:
         "rolling_causality": _rolling_causality_check(),
         "daily_publication": _daily_publication_check(),
         "daily_repair": _daily_repair_check(),
+        "net_dispatch": _net_dispatch_check(),
         "execution_tracking": _execution_tracking_check(),
         "long_process_expert": _process_expert_check(),
         "power_gas_availability": _power_gas_availability_check(),

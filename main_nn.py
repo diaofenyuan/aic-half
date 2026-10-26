@@ -64,6 +64,18 @@ def peak_memory_mb() -> float:
     return float(torch.cuda.max_memory_allocated() / (1024 ** 2))
 
 
+def training_runtime() -> dict:
+    return {"torch": torch.__version__, "device": str(DEVICE), "cuda": torch.version.cuda,
+        "cudnn": torch.backends.cudnn.version(), "threads": torch.get_num_threads(),
+        "gpu": torch.cuda.get_device_name() if DEVICE.type == "cuda" else None,
+        "deterministic": torch.are_deterministic_algorithms_enabled(),
+        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        "matmul_tf32": torch.backends.cuda.matmul.allow_tf32,
+        "cudnn_tf32": torch.backends.cudnn.allow_tf32,
+        "cublas_workspace": os.environ.get("CUBLAS_WORKSPACE_CONFIG")}
+
+
 # ---------------------------------------------------------------------------
 # 独立八步资源网络（与负荷网络隔离，不共享标签或预测头）
 # ---------------------------------------------------------------------------
@@ -764,10 +776,23 @@ def train_nn(prepared: PreparedData, folds: list[dict], kind: str = "tcn_causal"
     if cutoff < 0:
         raise ValueError("NN 训练截止点不在数据网格")
     prepared = prepared.prefix_copy(tuning[0]["train_end"])
+    cfg["cutoff_position"] = cutoff
+    import output
+    started = time.time()
+    cache = output.training_cache_path("neural",
+        {"kind": kind, "horizons": horizons, "config": cfg, "quick": bool(quick),
+         "seeds": max(1, n_seeds), "runtime": training_runtime()}, frames=(prepared.frame, prepared.labels))
+    artifact = output.read_training_cache(cache)
+    if artifact is not None:
+        bundle = load_nn(artifact)
+        bundle.train_seconds = time.time() - started
+        bundle.train_rows = int(bundle.scores.get("train_rows", 0))
+        bundle.scores["training_cache"] = {"hit": True, "fit_seconds": bundle.scores.get("seconds"),
+                                          "lookup_seconds": bundle.train_seconds}
+        return bundle
     logger = logging.getLogger("aic-half")
     logger.info("NN %s 开始，截止=%s，预算=%d轮，batch=%d，精度=%s，目标空间=%s", kind,
                 tuning[0]["train_end"], epochs, batch, cfg.get("precision", "fp32"), mode)
-    started = time.time()
     if DEVICE.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
     hmax = max(horizons)
@@ -869,7 +894,7 @@ def train_nn(prepared: PreparedData, folds: list[dict], kind: str = "tcn_causal"
     del gpu, full_sample
     if DEVICE.type == "cuda":
         torch.cuda.empty_cache()
-    return NNBundle(kind=kind, look_back=look_back, horizons=horizons,
+    bundle = NNBundle(kind=kind, look_back=look_back, horizons=horizons,
                     feat_mean=mean, feat_std=std,
                     state_dict=states[0], seed_states=states,
                     scores={"early_stop": {"origin_start": str(prepared.index[val_pos[0]]),
@@ -890,6 +915,8 @@ def train_nn(prepared: PreparedData, folds: list[dict], kind: str = "tcn_causal"
                     train_end=str(prepared.index[cutoff]), feature_names=list(table.columns),
                     n_fut=n_fut, head_mode=mode, load_history=load_history,
                     config=dict(cfg))
+    output.write_training_cache(cache, lambda directory: save_nn(bundle, directory))
+    return bundle
 
 
 def _predict_cube(model_states: list[dict], table: torch.Tensor, positions: np.ndarray,

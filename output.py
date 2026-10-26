@@ -6,6 +6,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -15,6 +18,87 @@ import numpy as np
 import pandas as pd
 
 import config as C
+
+
+_TRAINING_CACHE_STATS = {"hits": {}, "misses": {}}
+
+
+def training_fingerprint(contract: dict, *, arrays=(), frames=()) -> str:
+    """按实际输入和实现生成缓存键，截止点相同但数据或配方不同也不得复用。"""
+    digest = hashlib.sha256()
+    settings = {k: v for k, v in vars(C).items() if k.isupper() and k != "PROGRESS_ENABLED"}
+    digest.update(json.dumps({"schema": 1, "contract": contract, "config": settings,
+        "numpy": np.__version__, "pandas": pd.__version__, "lightgbm": lgb.__version__},
+        sort_keys=True, ensure_ascii=False, default=str).encode("utf-8"))
+    for relative in ("config.py", "main.py", "main_s.py", "main_l.py", "main_nn.py",
+                     "main_opt.py", "data_cleaning/pipeline.py"):
+        digest.update(relative.encode("utf-8"))
+        digest.update((C.ROOT / relative).read_bytes())
+    for value in arrays:
+        value = np.ascontiguousarray(value)
+        digest.update(str((value.shape, value.dtype.str)).encode("ascii"))
+        digest.update(memoryview(value).cast("B"))
+    for frame in frames:
+        digest.update(str([(str(c), str(t)) for c, t in zip(frame.columns, frame.dtypes)]).encode("utf-8"))
+        digest.update(pd.util.hash_pandas_object(frame, index=True).to_numpy().tobytes())
+    return digest.hexdigest()
+
+
+def training_cache_path(kind: str, contract: dict, *, arrays=(), frames=()) -> Path | None:
+    if os.environ.get("AIC_TRAINING_CACHE", "1") == "0":
+        return None
+    key = training_fingerprint(contract, arrays=arrays, frames=frames)
+    return C.EXPERIMENT_OUTPUT_ROOT / "training_cache_v1" / C.MODEL_DIR / kind / key
+
+
+def read_training_cache(directory: Path | None) -> Path | None:
+    if directory is None:
+        return None
+    kind = directory.parent.name
+    try:
+        record = json.loads((directory / "complete.json").read_text(encoding="utf-8"))
+        if record["key"] != directory.name:
+            raise ValueError("训练缓存请求标识不匹配")
+        artifact = _artifact_path(directory, record["filename"])
+        if hashlib.sha256(artifact.read_bytes()).hexdigest() != record["sha256"]:
+            raise ValueError("训练缓存内容校验失败")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        if (directory / "complete.json").exists():
+            logging.getLogger("aic-half").warning("训练缓存失效，将重新拟合: %s", exc)
+        bucket = _TRAINING_CACHE_STATS["misses"]
+        bucket[kind] = bucket.get(kind, 0) + 1
+        return None
+    bucket = _TRAINING_CACHE_STATS["hits"]
+    bucket[kind] = bucket.get(kind, 0) + 1
+    logging.getLogger("aic-half").info("复用训练缓存: %s/%s", kind, directory.name[:12])
+    return artifact
+
+
+def write_training_cache(directory: Path | None, writer) -> None:
+    """先完成独立临时文件，再发布内容与校验标记；中断产物不能作为成功缓存。"""
+    if directory is None:
+        return
+    try:
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".writing-", dir=directory.parent) as scratch:
+            artifact = Path(writer(Path(scratch)))
+            record = {"key": directory.name, "filename": artifact.name,
+                      "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest()}
+            marker = Path(scratch) / "complete.json"
+            marker.write_text(json.dumps(record), encoding="utf-8")
+            directory.mkdir(exist_ok=True)
+            artifact.replace(directory / artifact.name)
+            marker.replace(directory / marker.name)
+    except OSError as exc:
+        logging.getLogger("aic-half").warning("训练缓存写入失败，保留本次内存模型: %s", exc)
+
+
+def training_cache_stats(*, reset: bool = False) -> dict:
+    result = {key: dict(value) for key, value in _TRAINING_CACHE_STATS.items()}
+    if reset:
+        for value in _TRAINING_CACHE_STATS.values():
+            value.clear()
+    return result
 
 
 @dataclass
@@ -385,6 +469,9 @@ def load_final_models(directory: Path):
             selection=item.get("selection", {"chosen": {"kind": item["kind"], "features": item["features"]}}),
             scores=item["scores"],
             train_end=item["train_end"], final_train_end=item["train_end"]))
+        if name == "short":
+            # 旧归档未记录此配方时恢复旧行为，不能暗中改变历史模型的输入语义。
+            bundles[-1].process_recovery = item.get("process_recovery", {})
         if item.get("availability"):
             state = dict(item["availability"])
             directory = model_root / name / "final_availability"
@@ -530,6 +617,7 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
                 "blend": bundle.blend, "feature_names": bundle.feature_names,
                 "lgb_kind": bundle.lgb_kind, "lgb_features": bundle.lgb_features,
                 "nn_weights": bundle.nn_weights,
+                **({"process_recovery": bundle.process_recovery} if hasattr(bundle, "process_recovery") else {}),
                 "scores": bundle.scores,
                 "train_end": nn.train_end if nn is not None else
                              (bundle.final_train_end if use_final else bundle.train_end)}
@@ -717,6 +805,7 @@ def build_zip(ctx: RunContext, submittable: bool, config=C) -> dict:
 
 def write_report(ctx: RunContext, summary: dict) -> Path:
     summary.setdefault("source", ctx.source_report)
+    summary["training_cache"] = training_cache_stats()
     path = ctx.report_dir / C.REPORT_JSON
     path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, default=str) + "\n",
                     encoding="utf-8")

@@ -35,16 +35,32 @@ def _mape_weights(y: np.ndarray, weights: np.ndarray | None) -> np.ndarray:
 
 
 def fit_booster(X: np.ndarray, y: np.ndarray, feature_names: list[str],
-                params: dict, num_round: int, weights: np.ndarray | None = None) -> lgb.Booster:
-    weights = _mape_weights(y, weights)
+                params: dict, num_round: int, weights: np.ndarray | None = None,
+                *, mape_weight: bool = True) -> lgb.Booster:
+    import output
+    if mape_weight:
+        weights = _mape_weights(y, weights)
+    cache = output.training_cache_path("boosters",
+        {"params": params, "rounds": int(num_round), "features": feature_names,
+         "weighted": weights is not None},
+        arrays=(X, y) if weights is None else (X, y, weights))
+    artifact = output.read_training_cache(cache)
+    if artifact is not None:
+        return lgb.Booster(model_str=artifact.read_text(encoding="utf-8"))
     dataset = lgb.Dataset(X, label=y, weight=weights, feature_name=feature_names,
                           free_raw_data=True)
     with C.progress(total=int(num_round), desc="LightGBM 迭代", unit="轮") as bar:
         def report_iteration(env):
             bar.update(1)
 
-        return lgb.train(params, dataset, num_boost_round=int(num_round),
-                         callbacks=[report_iteration])
+        model = lgb.train(params, dataset, num_boost_round=int(num_round),
+                          callbacks=[report_iteration])
+    def write_model(directory):
+        path = directory / "model.txt"
+        path.write_text(model.model_to_string(), encoding="utf-8")
+        return path
+    output.write_training_cache(cache, write_model)
+    return model
 
 
 def training_weights(prepared: PreparedData, positions: np.ndarray,
@@ -97,21 +113,31 @@ def build_training_block(prepared: PreparedData, base: pd.DataFrame,
     return X[valid], y[valid], weights[:, j][valid]
 
 
+def stack_features(base_values: np.ndarray, extras: dict, extra_names: list[str],
+                   positions: np.ndarray, horizons: tuple[int, ...]) -> np.ndarray:
+    """保留提前量优先的样本顺序，直接写入目标数组，避免逐步拼接与类型转换副本。"""
+    n, m, width = len(positions), len(horizons), base_values.shape[1]
+    blocks = np.empty((m, n, width + len(extra_names) + 1), dtype=np.float32)
+    blocks[:, :, :width] = base_values[positions]
+    for j, name in enumerate(extra_names):
+        blocks[:, :, width + j] = extras[name].T
+    blocks[:, :, -1] = np.asarray(horizons)[:, None]
+    return blocks.reshape(n * m, -1)
+
+
 def stack_training(prepared: PreparedData, base_values: np.ndarray, extras: dict,
                    extra_names: list[str], positions: np.ndarray,
                    horizons: tuple[int, ...], target: str,
-                   weights: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    n = len(positions)
-    width = base_values.shape[1] + len(extra_names) + 1
-    X = np.empty((n * len(horizons), width), dtype=np.float32)
-    y = np.empty(n * len(horizons), dtype=np.float64)
-    w = np.empty(n * len(horizons), dtype=np.float32)
-    for j, h in enumerate(horizons):
-        lo, hi = j * n, (j + 1) * n
-        X[lo:hi] = _block(base_values, positions, extras, extra_names, int(h), j)
-        y[lo:hi] = prepared.labels[target].to_numpy(dtype=float)[positions + int(h)]
-        w[lo:hi] = weights[:, j]
+                   weights: np.ndarray, design: np.ndarray | None = None
+                   ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    X = (stack_features(base_values, extras, extra_names, positions, horizons)
+         if design is None else design)
+    y = prepared.labels[target].to_numpy(dtype=float)[
+        positions[None, :] + np.asarray(horizons)[:, None]].ravel()
+    w = weights.T.astype(np.float32).ravel()
     valid = np.isfinite(y)
+    if valid.all():
+        return X, y, w
     return X[valid], y[valid], w[valid]
 
 
@@ -389,10 +415,13 @@ def _train_models(prepared: PreparedData, base_all: pd.DataFrame,
                 models[(target, int(h))] = fit_booster(X, y, names, params, num_round, w)
     elif kind in ("global", "grouped"):
         groups = _groups_for(horizons)
+        # 同一前缀的多目标共用特征；缺测标签仍按各目标分别筛选。
+        design = (stack_features(base_values, extras, extra_names, positions, horizons)
+                  if kind == "global" else None)
         for target in C.progress(targets, desc=f"{kind} 训练目标", unit="目标"):
             if kind == "global":
                 X, y, w = stack_training(prepared, base_values, extras, extra_names,
-                                         positions, horizons, target, weights)
+                                         positions, horizons, target, weights, design=design)
                 models[target] = fit_booster(X, y, names, params, num_round, w)
             else:
                 for gname, lo, hi in C.progress(groups, desc=f"{target} 提前量分组", unit="模型"):
@@ -481,6 +510,7 @@ class ShortBundle:
     final_train_end: str | None = None
     final_availability: dict | None = None
     final_generator1: dict | None = None
+    process_recovery: dict = field(default_factory=lambda: dict(C.SHORT_PROCESS_RECOVERY))
 
 
 def _fold_positions(prepared: PreparedData, fold: dict,
@@ -816,6 +846,25 @@ def apply_availability_fallback(bundle, prepared, positions, prediction, use_fin
 
 def predict_short(bundle: ShortBundle, prepared: PreparedData,
                   origins: pd.DatetimeIndex, use_final: bool = False) -> np.ndarray:
+    from data_cleaning.pipeline import short_process_view
+    recovered, active_all = short_process_view(prepared, bundle.process_recovery)
+    positions = prepared.index.get_indexer(origins)
+    if (positions < 0).any():
+        raise ValueError("起报点不在数据网格内")
+    active = active_all[positions]
+    if not active.any():
+        return _predict_short_core(bundle, prepared, origins, use_final)
+    if active.all():
+        return _predict_short_core(bundle, recovered, origins, use_final)
+    result = np.empty((len(origins), len(C.HORIZONS_S), len(C.TARGETS)))
+    # 两个分支的起报点互斥，耗气缺测专家不会读到恢复后的历史窗口。
+    result[active] = _predict_short_core(bundle, recovered, origins[active], use_final)
+    result[~active] = _predict_short_core(bundle, prepared, origins[~active], use_final)
+    return result
+
+
+def _predict_short_core(bundle: ShortBundle, prepared: PreparedData,
+                        origins: pd.DatetimeIndex, use_final: bool = False) -> np.ndarray:
     positions = prepared.index.get_indexer(origins)
     if (positions < 0).any():
         raise ValueError("起报点不在数据网格内")

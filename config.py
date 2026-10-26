@@ -135,7 +135,7 @@ CLEANING = {
     "nonnegative_prefixes": ("gas_blast_furnace_", "gas_coke_oven_", "gas_converter_",
                              "gas_air_heater_", "gas_into_gas_mixed_",
                              "gas_user_blast_furnace_user", "gas_user_converter_user"),
-    # 这些列由模拟量求和/供暖连续性要求，允许单边因果填补；发生量不做长缺口填补。
+    # 连续用气仅允许有限步前向补值；来源另行记录，发生量和目标始终不填补。
     "causal_fill_columns": (
         "gas_air_heater_1", "gas_air_heater_2", "gas_air_heater_3",
         "gas_air_heater_4", "gas_air_heater_5",
@@ -144,8 +144,6 @@ CLEANING = {
         "gas_user_converter_user1", "gas_user_converter_user2",
     ),
     "ffill_limit": 8,
-    "rolling_median_steps": 96,
-    "rolling_min_periods": 24,
 }
 # 数据字典明确：高炉煤气柜容量为 20 万和 30 万 m³。1 号柜有效样本不足且出现
 # 1e30 哨兵；赛事统一答复已明确 1 号柜 30 万、2 号柜 20 万，当前仅部署 2 号柜。
@@ -205,6 +203,12 @@ AT_T_MINUTE_GROUPS = {
 }
 PROFILE_DAYS = 28
 PROFILE_RATIO_CLIP = (0.5, 2.0)
+
+# 仅短期、起报点三气种耗气齐全时恢复派生输入；原始观测和物理账本保持缺测。
+SHORT_PROCESS_RECOVERY = {"method": "median_recent_observed", "column": "gas_blast_furnace_3",
+    "history_steps": 28 * STEPS_PER_DAY, "min_observed": 96, "median_samples": 4,
+    "max_age_steps": 96, "influence_steps": 288, "activation": "all_power_gases_observed",
+    "source_study": "20261026_gap_completion"}
 
 DECAY_DAYS = 60.0          # 样本时间衰减半衰期；None 表示不加权
 # 评分是 1-MAPE，训练按 1/|y| 加权对齐指标；power=1 即逆真值加权。
@@ -275,9 +279,10 @@ AVAILABILITY_FALLBACK["long"] = {
 LONG_GROUPS = (("short", 1, 8), ("medium", 9, 32), ("long", 33, 96))
 SHORT_GROUPS = (("head", 1, 4), ("tail", 5, 8))
 
-# 选模门槛（百分点）。仅作为预防单折噪声的工程阈值，不冒充官方标准。
+# 性能选模门槛（百分点）；按用户2026-10-26要求允许较小增益，逐折保护保留。
+# 官方规则适配和功能修复不适用提分门槛；这些工程阈值不代表统计显著性。
 SELECTION = {
-    "min_mean_gain_pp": 0.20,
+    "min_mean_gain_pp": 0.05,
     "max_worst_fold_drop_pp": 0.20,
     "confirm_drop_tolerance_pp": 1.5,
     "blend_grid": (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0),
