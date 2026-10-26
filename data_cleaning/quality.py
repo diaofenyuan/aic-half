@@ -212,7 +212,7 @@ def _multistep_alignment_check() -> dict:
     from main_s import (_predict_models, _feature_columns, design_inputs,
                         build_training_block, training_weights)
     from main_opt import (_resource_base, _resource_design, ResourceBundle,
-                          forecast_resources, forecast_resources_quantile, _stack)
+                          forecast_resources, _stack)
 
     class Probe:
         def predict(self, X):
@@ -242,9 +242,8 @@ def _multistep_alignment_check() -> dict:
     rb = _resource_base(prepared)
     _, names = _resource_design(prepared, rb, positions, C.HORIZONS_L)
     pool = {g: Probe() for g in C.RESOURCE_NAMES}
-    bundle = ResourceBundle(pool, pool, names, quantile_models={"p10": pool})
-    for forecast in (lambda o: forecast_resources(bundle, prepared, o),
-                     lambda o: forecast_resources_quantile(bundle, prepared, o, "p10")):
+    bundle = ResourceBundle(pool, pool, names)
+    for forecast in (lambda o: forecast_resources(bundle, prepared, o),):
         bulk = forecast(prepared.index[positions])
         single = np.concatenate([forecast(prepared.index[[p]]) for p in positions])
         checks.append(np.allclose(bulk, single))
@@ -294,15 +293,17 @@ def _nn_contract_check() -> dict:
     # 两个更新步后时间主干必须收到梯度；仅检查预测有限会漏掉连续零初始化闭锁。
     torch = main_nn.torch
     torch.manual_seed(19)
-    network = main_nn.DLinear(8, 2, 3, cfg={"head_mode": "residual"})
+    network = main_nn.CausalTCN(8, 2, 3, n_fut=1, cfg={"head_mode": "scaled",
+        "d_model": 8, "n_blocks": 1, "dropout": 0., "temporal_norm": "layer"})
+    future = torch.zeros(12, 2, 1)
     x, target = torch.randn(12, 8, 3), torch.randn(12, 2, 2)
     optimizer = torch.optim.SGD(network.parameters(), lr=.05)
     for _ in range(2):
         optimizer.zero_grad(set_to_none=True)
-        (network(x) - target).square().mean().backward()
+        (network(x, future) - target).square().mean().backward()
         optimizer.step()
-    gradient = bool(network.linear_trend.weight.grad.abs().sum() > 0)
-    sensitive = not torch.allclose(network(x), network(x + 2.))
+    gradient = bool(network.stem.weight.grad.abs().sum() > 0)
+    sensitive = not torch.allclose(network(x, future), network(x + 2., future))
     with patch.object(C, "PROFILE_DAYS", 2):
         positions = np.array([200, 215, 270])
         blocked = main_nn._blocked_profiles(prepared, positions, (1, 2), 2)
@@ -358,7 +359,7 @@ def _optimizer_contract_check() -> dict:
     from types import SimpleNamespace
     from main_opt import (_fallback_day, _solve_day, _gas_caps, _price_vector, validate_day,
                           _execute_proxy_step, score_resources, _dispatch_metrics,
-                          calibrate_resources_online, _adjust_available_resources)
+                          _adjust_available_resources)
     prepared = _synthetic_prepared(480)
     prepared.frame[C.GAS_HOLDER["column"]] = prepared.frame["d_holder_level"]
     heat = {"coefficients_mw_per_m3h": {"blast": 0.000346, "coke": 0.0019, "converter": 0.00059}}
@@ -426,13 +427,6 @@ def _optimizer_contract_check() -> dict:
     metrics_ok = (abs(metrics["price_weighted_load_ratio"] - expected) < 1e-9
                   and len(metrics["daily"]) == 2
                   and not _dispatch_metrics(times, np.array([100., np.nan]), tariff)["complete"])
-    paths = np.full((8, 96, 3), 100.)
-    observations = np.full((12, 3), 120.)
-    calibrated = calibrate_resources_online(paths, observations, np.arange(8))
-    observations[4:] = 0.
-    perturbed = calibrate_resources_online(paths, observations, np.arange(8))
-    calibration_causal = (np.array_equal(calibrated[:4], perturbed[:4])
-                          and calibrated[-1, 0, 0] > 100.)
     gate_data = _synthetic_prepared(480)
     gate_origins = gate_data.index[[128, 200]]
     columns = ["d_use_blast", "d_use_coke", "d_use_converter"]
@@ -473,7 +467,7 @@ def _optimizer_contract_check() -> dict:
                             and np.all(curtailed["power"] == 0) and curtailed["holder"] == 30000.
                             and zero_counted
                             and stress_passed
-                            and substitute_safe and recovered and overflow_recovered and metrics_ok and calibration_causal
+                            and substitute_safe and recovered and overflow_recovered and metrics_ok
                             and resource_adjustment_ok
                             and price.tolist() == [1.0, 2.0]),
             "solver_status": result["status"], "tamper_detected": bool(detected),
@@ -481,7 +475,6 @@ def _optimizer_contract_check() -> dict:
             "substitute_resource_shock_steps": 1200, "fuel_substitution_recovered_power": bool(recovered),
             "overflow_substitution_preserves_power_and_holder": bool(overflow_recovered),
             "daily_price_metric_and_missing_values": bool(metrics_ok),
-            "online_resource_calibration_causal": bool(calibration_causal),
             "peak_resource_adjustment_causal_missing_safe": bool(resource_adjustment_ok),
             "zero_resource_curtailment": True, "resource_zeros_counted": bool(zero_counted)}
 
@@ -522,104 +515,6 @@ def _rolling_causality_check() -> dict:
     return {"passed": bool(holder_not_injected and no_oracle and continuous),
             "historical_holder_not_injected": holder_not_injected,
             "first_commit_future_independent": no_oracle, "continuous_state": continuous}
-
-
-def _plan_research_check() -> dict:
-    from types import SimpleNamespace
-    import lightgbm as lgb
-    from .pipeline import fit_profile_state, state_slot_profile
-    from main_opt import (ZeroMixtureResource, load_resource_model, fit_inventory_risk,
-                          _holder_plan_bounds, _solve_day, _fit_resource_models)
-    from main_s import (_train_models, predict_allocation, design_inputs,
-                        future_resource_features)
-    prepared = _synthetic_prepared(40 * 96)
-    prepared.frame["d_use_share_coke"] = prepared.frame.d_use_coke / prepared.frame.d_use_total
-    prepared.frame["d_use_share_converter"] = prepared.frame.d_use_converter / prepared.frame.d_use_total
-    recipe = fit_profile_state(prepared, 20 * 96)
-    origin = 25 * 96 + 12
-    masked = prepared.masked_copy(prepared.index[20 * 96], prepared.index[-1])
-    profile = state_slot_profile(masked, np.array([origin]), (1, 8, 96), "generator_1", recipe)[0]
-    altered = copy.deepcopy(masked)
-    altered.frame.loc[prepared.index[origin + 1]:] = 1e9
-    altered.labels.loc[prepared.index[20 * 96]:] = 1e12
-    same = state_slot_profile(altered, np.array([origin]), (1, 8, 96), "generator_1", recipe)[0]
-    future_independent = np.array_equal(profile, same)
-    missing = copy.deepcopy(masked)
-    missing.frame.loc[prepared.index[origin], recipe["columns"]] = np.nan
-    fallback = state_slot_profile(missing, np.array([origin]), (1, 8, 96), "generator_1", recipe)[0]
-    missing_safe = np.array_equal(fallback, target_slot_profile(missing, np.array([origin]), (1, 8, 96), "generator_1"))
-    zero = copy.deepcopy(prepared)
-    zero.frame[C.TARGET_COLUMN["generator_1"]] = 0.
-    zeros_kept = np.all(state_slot_profile(zero, np.array([origin]), (1, 8, 96), "generator_1", recipe)[0] == 0.)
-    X = np.arange(120., dtype=float).reshape(-1, 1)
-    params = {**C.LGBM_BASE, "min_data_in_leaf": 5, "num_threads": 1}
-    classifier = lgb.train({**params, "objective": "binary"}, lgb.Dataset(X, label=(X[:, 0] < 30)), num_boost_round=3)
-    positive = lgb.train({**params, "objective": "regression_l2"}, lgb.Dataset(X, label=X[:, 0] + 1), num_boost_round=3)
-    mixture = ZeroMixtureResource(classifier, positive)
-    mixture_ok = np.array_equal(mixture.predict(X), load_resource_model(mixture.model_to_string()).predict(X))
-    mixture_ok &= np.allclose(mixture.predict(X), (1. - classifier.predict(X)) * positive.predict(X))
-    forecast = np.full((192, 96, 3), 100.)
-    risk = fit_inventory_risk(forecast, forecast.copy(), "2025-05-30", "2025-05-31")
-    impossible = fit_inventory_risk(forecast, forecast + 1e5, "2025-05-30", "2025-05-31")
-    cfg = SimpleNamespace(**vars(C))
-    cfg.OPT_CONFIG = {**C.OPT_CONFIG, "inventory_risk": impossible}
-    low, high = _holder_plan_bounds(96, cfg)
-    bad = _solve_day(forecast[0], np.ones(96), 1e5, np.zeros(6), np.full(3, 1e6),
-        {"coefficients_mw_per_m3h": {g: .001 for g in C.RESOURCE_NAMES}}, cfg)
-    risk_ok = risk["feasible"] and not impossible["feasible"] and (low > high).any() and bad["status"] == "RISK_INFEASIBLE"
-    units = fit_inventory_risk(forecast, forecast + 100., "2025-05-30", "2025-05-31")
-    risk_ok &= units["cumulative_diagnostics"]["blast"]["cumulative_paths"]["24h"]["mean_m3"] == 2400.
-    positions = np.arange(origin, origin + 3)
-    future = future_resource_features(masked, positions, forecast[:3], np.zeros_like(forecast[:3]))
-    future_changed = future_resource_features(altered, positions[:1], forecast[:1], np.zeros_like(forecast[:1]))
-    features_causal = all(np.array_equal(value[:1], future_changed[key], equal_nan=True) for key, value in future.items())
-    base = pd.DataFrame({"x": np.zeros(len(prepared.index))}, index=prepared.index)
-    _, names = design_inputs(masked, base, positions, (1, 8, 96), "gas")
-    class ConstantModel:
-        def __init__(self, value):
-            self.value = value
-
-        def predict(self, X):
-            return np.full(len(X), self.value)
-    protected = np.zeros((3, 3, 2))
-    protected[:, :, 1] = np.array([0., 150., 440.])[:, None]
-    allocation = predict_allocation(masked, base, positions, (1, 8, 96),
-        {"allocation": ConstantModel(.9)}, names, protected)
-    allocation_ok = (np.array_equal(allocation[:, :, 1], protected[:, :, 1]) and
-        (allocation[:, :, 0] <= 200.).all() and (allocation[:, :, 1] - allocation[:, :, 0] <= 240.).all())
-    import main_opt
-    original_prices = main_opt.load_prices
-    try:
-        main_opt.load_prices = lambda: {1: np.ones(96)}
-        resource_base = main_opt._resource_base(masked)
-        _, resource_names = main_opt._resource_design(masked, resource_base, positions, C.HORIZONS_L)
-        direct = {g: ConstantModel(1000.) for g in C.RESOURCE_NAMES}
-        selection = {"availability_adjustment": {"method": "positive_persistence_peak", "threshold_ratio": .05, "weight": 1.}}
-        heat = {"ok": True, "coefficients_mw_per_m3h": {g: .001 for g in C.RESOURCE_NAMES}}
-        baseline = main_opt.forecast_resources(main_opt.ResourceBundle(direct, {}, resource_names,
-            selection=selection, heat_rate=heat), masked, masked.index[positions])
-        replacement = {**direct, "coke": ConstantModel(1e6), **{g + "__reference": m for g, m in direct.items()}}
-        trial = main_opt.forecast_resources(main_opt.ResourceBundle(replacement, {}, resource_names,
-            selection={**selection, "frozen_adjustment_reference": True}, heat_rate=heat), masked, masked.index[positions])
-        blast_fixed = np.array_equal(baseline[:, :, 0], trial[:, :, 0]) and np.max(baseline[:, :8, 0]) > 1000.
-    finally:
-        main_opt.load_prices = original_prices
-    rejected = []
-    for call in (lambda: fit_inventory_risk(forecast, forecast, "2025-06-01", "2025-05-31"),
-                 lambda: _fit_resource_models(prepared, np.array([100]), 1, 100),
-                 lambda: _train_models(prepared, pd.DataFrame(), np.array([100]), (1,), "global", "gas", 1, 100)):
-        try:
-            call()
-        except ValueError:
-            rejected.append(True)
-        else:
-            rejected.append(False)
-    checks = {"state_profile_future_independent": bool(future_independent),
-              "state_profile_missing_fallback": bool(missing_safe), "state_profile_zero_preserved": bool(zeros_kept),
-              "mixture_mean_and_reload": bool(mixture_ok), "risk_infeasible_keeps_hard_bounds": bool(risk_ok),
-              "prefix_boundary_rejections": all(rejected), "future_resource_features_causal": bool(features_causal),
-              "allocation_preserves_total": bool(allocation_ok), "resource_replacement_protects_blast": bool(blast_fixed)}
-    return {"passed": all(checks.values()), **checks}
 
 
 def _power_gas_availability_check() -> dict:
@@ -693,9 +588,9 @@ def _generator1_contract_check() -> dict:
     origin = 35 * 96
     changed = copy.deepcopy(prepared)
     changed.frame.loc[changed.index > changed.index[origin], :] = np.nan
-    causal = all(np.allclose(main_s.generator1_base(prepared, days, power).iloc[:origin + 1],
-        main_s.generator1_base(changed, days, power).iloc[:origin + 1], equal_nan=True)
-        for days in (0, 21) for power in (False, True))
+    causal = all(np.allclose(main_s.generator1_base(prepared, include_power=power).iloc[:origin + 1],
+        main_s.generator1_base(changed, include_power=power).iloc[:origin + 1], equal_nan=True)
+        for power in (False, True))
     positions = np.array([origin, origin + 1])
     first = C.PROFILE_DAYS * 96
     start = first + ((origin - first) // (21 * 96)) * 21 * 96
@@ -734,7 +629,7 @@ def _generator1_contract_check() -> dict:
     transition_names = [f"g1_d_use_{gas}_log_age" for gas in ("blast", "coke", "converter")] + ["g1_generator_1_log_age", "h"]
     transition_input = np.array([[0., 0., 0., 0., 1.], [1., 1., 1., 1., 1.],
                                  [0., 0., 0., 2., 8.], [3., 3., 3., 3.2, 8.]], dtype=np.float32)
-    transition_ok = np.array_equal(main_s.generator1_transition_bins(transition_input, transition_names, True), [0, 2, 7, 11])
+    transition_ok = np.array_equal(main_s.generator1_transition_bins(transition_input, transition_names), [0, 2, 7, 11])
     checks = {"future_independent": causal, "blocked_profile_matches_service": profiles_same,
               "total_preserved": total_same, "structure_bounds": bool(bounds),
               "specialist_loss_ignores_total_output": target_only,
@@ -742,9 +637,27 @@ def _generator1_contract_check() -> dict:
     return {"passed": bool(all(checks.values())), **checks}
 
 
+def _training_target_cutoff_check() -> dict:
+    from main_s import _train_models
+    from main_opt import _fit_resource_models
+    prepared = _synthetic_prepared(480)
+    rejected = []
+    for fit in (lambda: _train_models(prepared, pd.DataFrame(), np.array([100]),
+                 (1,), "global", "gas", 1, 100),
+                lambda: _fit_resource_models(prepared, np.array([100]), 1, 100)):
+        try:
+            fit()
+        except ValueError:
+            rejected.append(True)
+        else:
+            rejected.append(False)
+    return {"passed": all(rejected), "load_and_resource_targets_rejected": all(rejected)}
+
+
 def run_self_checks(config=C) -> dict:
     checks = {
         "stage_isolation": _stage_isolation_check(),
+        "training_target_cutoff": _training_target_cutoff_check(),
         "future_perturbation": _future_perturbation_check(),
         "prefix_consistency": _prefix_consistency_check(),
         "zero_preservation": _zero_preservation_check(),
@@ -755,23 +668,9 @@ def run_self_checks(config=C) -> dict:
         "model_roles": _model_role_check(),
         "optimizer_contract": _optimizer_contract_check(),
         "rolling_causality": _rolling_causality_check(),
-        "plan_research": _plan_research_check(),
         "power_gas_availability": _power_gas_availability_check(),
         "observed_at_t": _observed_at_t_check(),
         "generator1_contract": _generator1_contract_check(),
     }
     checks["passed"] = all(v.get("passed", False) for v in checks.values())
     return checks
-
-
-def real_data_check(config=C) -> dict:
-    """真实数据的前缀一致性检查：只取一段前缀，避免整表重复清洗过慢。"""
-    prepared = prepare_data(config)
-    cutoff = prepared.index[int(len(prepared.index) * 0.6)]
-    prefix = prepare_data(config, cutoff=cutoff)
-    left = build_base_features(prepared, include_targets=True).loc[:cutoff - pd.Timedelta(minutes=15)]
-    right = build_base_features(prefix, include_targets=True)
-    common = left.index.intersection(right.index)
-    same = np.allclose(left.loc[common].to_numpy(dtype=float),
-                       right.loc[common].to_numpy(dtype=float), equal_nan=True)
-    return {"passed": bool(same), "cutoff": str(cutoff), "rows": int(len(common))}

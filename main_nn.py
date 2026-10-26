@@ -1,10 +1,10 @@
-"""负荷条件时序网络（TSMixer / 因果TCN / DLinear）与独立八步资源网络。
+"""负荷条件时序网络（TSMixer / 因果TCN）与独立八步资源网络。
 
 16GB GPU 专项优化要点：
 1. 因果特征只算一次并常驻显存的 ``[T, F]`` 张量表，滑窗按批 gather，避免构造
    ``N×L×F`` 三重数组；同一折的多次训练/推理复用同一张表。
 2. 训练走 bf16 自动混合精度，推理回到 fp32，保证批量与单点预测逐值一致可复验。
-3. 支持容量归一化直接预测与画像残差对照；早停按原量纲物理投影后的 MAPE。
+3. 按已冻结的输出空间训练，早停使用原量纲物理投影后的 MAPE。
 4. 内部归一化不使用早停段，验证目标历史连续遮挡，选轮和重训复用学习率轨迹。
 """
 from __future__ import annotations
@@ -43,10 +43,8 @@ except Exception:
     pass
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-# 各网络默认预测空间：比值空间只对条件网络启用，线性基线保留原始量纲便于对照。
-DEFAULT_HEADS = {"dlinear": "direct", "nhits": "direct", "tcn": "direct",
-                 "tsmixer": "ratio", "tcn_causal": "ratio"}
-
+# 条件网络的预测空间随已冻结配方保存。
+DEFAULT_HEADS = {"tsmixer": "scaled", "tcn_causal": "scaled"}
 
 def _cfg(overrides: dict | None = None) -> dict:
     cfg = dict(C.NN_CONFIG)
@@ -82,86 +80,32 @@ class _ResourceResidualMLP(nn.Module):
         return self.layers(x).reshape(-1, 8, 3) + anchor[:, None, :]
 
 
-class _ResourceResidualTCN(nn.Module):
-    """近期三气种观测和缺失标记经因果卷积编码，再与当前过程量共同预测。"""
-    def __init__(self, width: int):
-        super().__init__()
-        self.current = nn.Sequential(nn.Linear(width, 64), nn.SiLU())
-        self.stem = nn.Conv1d(6, 32, 1)
-        self.blocks = nn.Sequential(*[_CausalBlock(32, 2 ** i, .10) for i in range(5)])
-        self.head = nn.Sequential(nn.Linear(128, 64), nn.SiLU(), nn.Linear(64, 24))
-        nn.init.zeros_(self.head[-1].weight)
-        nn.init.zeros_(self.head[-1].bias)
-
-    def forward(self, x, anchor, sequence):
-        history = self.blocks(self.stem(sequence.transpose(1, 2)))
-        context = torch.cat((self.current(x), history[:, :, -1], history.mean(-1)), dim=-1)
-        return self.head(context).reshape(-1, 8, 3) + anchor[:, None, :]
-
-
-def _resource_sequence(actual, positions, scale, look_back=96):
-    selected = actual[positions[:, None] - np.arange(look_back - 1, -1, -1)]
-    normalized = np.nan_to_num(np.clip(selected / scale, 0., 10.), nan=0.)
-    return np.concatenate((normalized, np.isfinite(selected)), axis=-1).astype(np.float32)
-
-
 def _resource_nn_matrix(values: np.ndarray, positions: np.ndarray,
-                        center: np.ndarray, scale: np.ndarray,
-                        history: np.ndarray | None = None,
-                        history_center: np.ndarray | None = None,
-                        history_scale: np.ndarray | None = None) -> np.ndarray:
-    """当前过程量 + 缺失指示（+ 起报点前气量路径的固定窗口均值/标准差）。"""
+                        center: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    """过程量与缺失指示共同输入，不把缺测当作真实零供气。"""
     selected = values[positions]
     z = np.clip((selected - center) / scale, -10., 10.)
-    # 标准化后的中性值与缺失指示同时输入，不把过程缺测伪装成真实零供气。
-    parts = [np.nan_to_num(z, nan=0.), np.isfinite(selected).astype(np.float32)]
-    if history is not None and history_center is not None:
-        zh = np.clip((np.asarray(history, dtype=np.float32) - history_center) / history_scale,
-                     -10., 10.)
-        pooled = []
-        for window in (8, 32):
-            idx = positions[:, None] - np.arange(window)[None, :]
-            block = zh[np.clip(idx, 0, len(zh) - 1)]
-            block = np.where((idx >= 0)[:, :, None], block, np.nan)
-            pooled.append(np.nan_to_num(np.nanmean(block, axis=1), nan=0.))
-            pooled.append(np.nan_to_num(np.nanstd(block, axis=1), nan=0.))
-        parts.append(np.concatenate(pooled, axis=1))
-    return np.concatenate(parts, axis=1).astype(np.float32)
+    return np.concatenate([np.nan_to_num(z, nan=0.), np.isfinite(selected).astype(np.float32)], axis=1).astype(np.float32)
 
 
-def _resource_nn_features(values: np.ndarray, positions: np.ndarray, fit_end: int,
-                          history: np.ndarray | None = None
-                          ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+def _resource_nn_features(values: np.ndarray, positions: np.ndarray, fit_end: int):
     prefix = values[:fit_end + 1]
     center = np.nan_to_num(np.nanmedian(prefix, axis=0), nan=0.)
     scale = np.nanpercentile(prefix, 75, axis=0) - np.nanpercentile(prefix, 25, axis=0)
     scale = np.where(np.isfinite(scale) & (scale > 1e-5), scale, 1.)
-    history_center = history_scale = None
-    if history is not None:
-        # 历史窗口池化：只看起报点及以前的气量路径，给网络“近期水平/波动”上下文。
-        series = np.asarray(history, dtype=np.float32)[:fit_end + 1]
-        history_center = np.nan_to_num(np.nanmedian(series, axis=0), nan=0.)
-        history_scale = (np.nanpercentile(series, 75, axis=0)
-                         - np.nanpercentile(series, 25, axis=0))
-        history_scale = np.where(np.isfinite(history_scale) & (history_scale > 1e-5),
-                                 history_scale, 1.)
-    X = _resource_nn_matrix(values, positions, center, scale, history,
-                            history_center, history_scale)
-    return X, center, scale, (history_center, history_scale)
+    return _resource_nn_matrix(values, positions, center, scale), center, scale
 
 
 def _fit_resource_nn(X, anchor, target, energy_weights, price_weights,
                      epochs: int, validation=None, seed: int = 73,
-                     sequence=None, batch: int = 256):
+                     batch: int = 256):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    model = (_ResourceResidualTCN(X.shape[1]) if sequence is not None else
-             _ResourceResidualMLP(X.shape[1])).to(DEVICE)
+    model = _ResourceResidualMLP(X.shape[1]).to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=6e-4, weight_decay=1e-4)
     tensors = [torch.as_tensor(a, dtype=torch.float32, device=DEVICE)
                for a in (X, anchor, target, price_weights)]
     ew = torch.as_tensor(energy_weights, dtype=torch.float32, device=DEVICE)
-    sequence = None if sequence is None else torch.as_tensor(sequence, device=DEVICE)
     best, best_epoch, stale = np.inf, 1, 0
     for epoch in C.progress(range(1, epochs + 1),
                             desc="资源 NN 内部早停" if validation is not None else "资源 NN 重训",
@@ -170,10 +114,7 @@ def _fit_resource_nn(X, anchor, target, energy_weights, price_weights,
         order = torch.randperm(len(X), device=DEVICE)
         for start in C.progress(range(0, len(X), batch), desc="资源 NN 训练批次", unit="批"):
             take = order[start:start + batch]
-            with torch.autocast("cuda", dtype=torch.bfloat16,
-                                enabled=sequence is not None and DEVICE.type == "cuda"):
-                prediction = (model(tensors[0][take], tensors[1][take], sequence[take])
-                              if sequence is not None else model(tensors[0][take], tensors[1][take]))
+            prediction = model(tensors[0][take], tensors[1][take])
             prediction = prediction.float()
             y = tensors[2][take]
             valid = torch.isfinite(y)
@@ -192,15 +133,10 @@ def _fit_resource_nn(X, anchor, target, energy_weights, price_weights,
             model.eval()
             with torch.no_grad():
                 vx, va, vy = validation[:3]
-                prediction = model(vx, va, validation[3]) if sequence is not None else model(vx, va)
+                prediction = model(vx, va)
                 mask = torch.isfinite(vy)
                 error = torch.abs(prediction - torch.nan_to_num(vy, nan=0.)) * mask * ew
-                # 与资源选模一致：逐气种 WAPE 含零真值误报，再等权聚合。
-                if sequence is None:
-                    score = float(error.sum() / (mask * ew).sum())
-                else:
-                    score = float(((torch.abs(prediction - torch.nan_to_num(vy, nan=0.)) * mask).sum((0, 1)) /
-                                   (torch.nan_to_num(vy, nan=0.).abs() * mask).sum((0, 1)).clamp_min(1e-6)).mean())
+                score = float(error.sum() / (mask * ew).sum())
             if score < best - 1e-5:
                 best, best_epoch, stale = score, epoch, 0
             else:
@@ -212,16 +148,11 @@ def _fit_resource_nn(X, anchor, target, energy_weights, price_weights,
 
 def train_resource_nn(base: pd.DataFrame, resource: pd.DataFrame, end_pos: int,
                       heat: dict, prices: dict, quick: bool = False, seed: int = 73,
-                       use_history: bool = True, network_kind: str | None = None,
                        max_epochs: int = 100, batch: int = 256) -> dict:
     """仅在起报前前缀选轮数，再以该轮数重训；不访问外层验证标签。"""
     torch.set_num_threads(min(4, os.cpu_count() or 1))
     values = base.to_numpy(dtype=np.float32)
     actual = resource[list(C.RESOURCE_NAMES)].to_numpy(dtype=np.float32)
-    network_kind = network_kind or C.OPT_CONFIG.get("resource_nn_kind", "mlp")
-    if network_kind not in ("mlp", "tcn"):
-        raise ValueError("资源网络仅支持 mlp/tcn")
-    history = actual if use_history else None
     positions = np.arange(C.PROFILE_DAYS * C.STEPS_PER_DAY, end_pos - 8 + 1)
     if quick:
         positions = positions[::C.QUICK_TRAIN_STRIDE][-2048:]
@@ -242,59 +173,45 @@ def train_resource_nn(base: pd.DataFrame, resource: pd.DataFrame, end_pos: int,
     inner_scale = np.maximum(np.nanmedian(actual[:split], axis=0), 1.)
     inner_anchor = np.nan_to_num(actual[positions] / inner_scale, nan=0.)
     inner_target = actual[positions[:, None] + np.arange(1, 9)] / inner_scale
-    inner_weights = (inner_scale * beta) / (inner_scale @ beta)
-    inner_X, _, _, _ = _resource_nn_features(values, positions, split - 1, history)
+    inner_X, _, _ = _resource_nn_features(values, positions, split - 1)
     validation = tuple(torch.as_tensor(v, dtype=torch.float32, device=DEVICE)
                        for v in (inner_X[valid], inner_anchor[valid], inner_target[valid]))
-    inner_sequence = _resource_sequence(actual, positions, inner_scale) if network_kind == "tcn" else None
-    if inner_sequence is not None:
-        validation += (torch.as_tensor(inner_sequence[valid], device=DEVICE),)
     _, epochs, error = _fit_resource_nn(inner_X[train], inner_anchor[train], inner_target[train],
-        inner_weights if network_kind == "tcn" else energy_weights,
+        energy_weights,
         price_weight[train], 2 if quick else max_epochs, validation, seed,
-        sequence=None if inner_sequence is None else inner_sequence[train], batch=batch)
-    X, center, scale, (history_center, history_scale) = _resource_nn_features(
-        values, positions, end_pos, history)
-    sequence = _resource_sequence(actual, positions, gas_scale) if network_kind == "tcn" else None
+        batch=batch)
+    X, center, scale = _resource_nn_features(values, positions, end_pos)
     model, _, _ = _fit_resource_nn(X, anchor, target, energy_weights, price_weight, epochs,
-                                  seed=seed, sequence=sequence, batch=batch)
-    return {"kind": "resource_tcn" if network_kind == "tcn" else "resource_mlp",
+                                  seed=seed, batch=batch)
+    return {"kind": "resource_mlp",
             "state_dict": model.cpu().state_dict(), "width": X.shape[1],
             "epochs": epochs, "inner_error": error, "feature_names": list(base.columns),
             "center": center, "scale": scale, "gas_scale": gas_scale,
-            "use_history": bool(use_history),
-            "history_center": history_center, "history_scale": history_scale,
             "train_end": str(base.index[end_pos]), "inner_train_end": str(base.index[split - 1]),
             "max_training_target": str(base.index[positions[-1] + 8]), "seed": seed}
 
 
 def predict_resource_nn(pack: dict, base: pd.DataFrame, resource: pd.DataFrame,
                         positions: np.ndarray) -> np.ndarray:
+    if pack["kind"] != "resource_mlp" or pack.get("use_history", False):
+        raise ValueError("该资源网络未晋级，请使用历史归档核验")
     if list(base.columns) != pack["feature_names"]:
         raise ValueError("资源网络特征顺序不一致")
     model = pack.get("_runtime_model")
     if model is None:
-        model = (_ResourceResidualTCN(pack["width"]) if pack["kind"] == "resource_tcn" else
-                 _ResourceResidualMLP(pack["width"])).to(DEVICE)
+        model = _ResourceResidualMLP(pack["width"]).to(DEVICE)
         model.load_state_dict(pack["state_dict"])
         model.eval()
         pack["_runtime_model"] = model
     values = base.to_numpy(dtype=np.float32)
     actual = resource[list(C.RESOURCE_NAMES)].to_numpy(dtype=np.float32)
-    history = actual if pack.get("use_history") else None
-    X = _resource_nn_matrix(values, np.asarray(positions, dtype=int), pack["center"],
-                            pack["scale"], history, pack.get("history_center"),
-                            pack.get("history_scale"))
+    X = _resource_nn_matrix(values, np.asarray(positions, dtype=int), pack["center"], pack["scale"])
     anchor = np.nan_to_num(actual[positions] / pack["gas_scale"], nan=0.)
-    sequence = (_resource_sequence(actual, positions, pack["gas_scale"])
-                if pack["kind"] == "resource_tcn" else None)
     with torch.no_grad():
         estimates = []
         for start in C.progress(range(0, len(X), 512), desc="资源 NN 预测批次", unit="批"):
             take = slice(start, start + 512)
             args = (torch.as_tensor(X[take], device=DEVICE), torch.as_tensor(anchor[take], device=DEVICE))
-            if sequence is not None:
-                args += (torch.as_tensor(sequence[take], device=DEVICE),)
             estimates.append(model(*args).cpu().numpy())
         output = np.concatenate(estimates)
     return np.maximum(output * pack["gas_scale"], 0.)
@@ -546,34 +463,6 @@ def _blocked_profiles(prepared: PreparedData, positions: np.ndarray,
 # ---------------------------------------------------------------------------
 # 网络结构
 # ---------------------------------------------------------------------------
-class DLinear(nn.Module):
-    """序列线性分解（趋势 + 季节）后线性映射到多步，退化基线对照。"""
-
-    def __init__(self, look_back: int, horizon: int, n_feat: int,
-                 n_fut: int = 0, cfg: dict | None = None):
-        super().__init__()
-        cfg = cfg or {}
-        self.horizon = horizon
-        self.trend_pool = nn.AvgPool1d(kernel_size=3, stride=1, padding=1)
-        self.linear_trend = nn.Linear(look_back, horizon)
-        self.linear_season = nn.Linear(look_back, horizon)
-        self.mix = nn.Linear(n_feat, 2)
-        if cfg.get("head_mode") in ("ratio", "residual", "scaled"):
-            # 只清零末层；时间映射保留非零初始化，否则连续两层全零会永久阻断梯度。
-            nn.init.zeros_(self.mix.weight)
-            with torch.no_grad():
-                self.mix.bias.fill_({"ratio": 1., "scaled": .5}.get(cfg.get("head_mode"), 0.))
-
-    def forward(self, x: torch.Tensor, fut: torch.Tensor | None = None) -> torch.Tensor:
-        series = x.transpose(1, 2)                            # (B, F, L)
-        trend = self.trend_pool(series)                       # (B, F, L)
-        season = series - trend
-        out_t = self.linear_trend(trend)                      # (B, F, H)
-        out_s = self.linear_season(season)
-        merged = (out_t + out_s).transpose(1, 2)              # (B, H, F)
-        return self.mix(merged)                               # (B, H, 2)
-
-
 class _MixBlock(nn.Module):
     """TSMixer 单块：时间混合 + 特征混合，各自带残差与 LayerNorm。"""
 
@@ -621,7 +510,7 @@ class TSMixer(nn.Module):
         d_model = int(cfg.get("d_model", 64))
         n_blocks = int(cfg.get("n_blocks", 2))
         dropout = float(cfg.get("dropout", 0.15))
-        init_level = {"ratio": 1., "scaled": .5}.get(cfg.get("head_mode"), 0.)
+        init_level = .5
         self.proj = nn.Linear(n_feat, d_model)
         self.blocks = nn.ModuleList([_MixBlock(look_back, d_model, dropout)
                                      for _ in range(n_blocks)])
@@ -668,7 +557,7 @@ class CausalTCN(nn.Module):
         channels = int(cfg.get("d_model", 64))
         n_blocks = int(cfg.get("n_blocks", 3))
         dropout = float(cfg.get("dropout", 0.10))
-        init_level = {"ratio": 1., "scaled": .5}.get(cfg.get("head_mode"), 0.)
+        init_level = .5
         self.stem = nn.Conv1d(n_feat, channels, kernel_size=1)
         self.blocks = nn.ModuleList([_CausalBlock(channels, 2 ** i, dropout,
                                      str(cfg.get("temporal_norm", "batch")))
@@ -686,80 +575,7 @@ class CausalTCN(nn.Module):
         return self.head(context, fut)
 
 
-class _NHiTSBlock(nn.Module):
-    def __init__(self, look_back: int, horizon: int, n_feat: int,
-                 d_model: int, pool_kernel: int):
-        super().__init__()
-        k = max(pool_kernel, 1)
-        self.pool = nn.AvgPool1d(k, stride=k) if k > 1 else nn.Identity()
-        self.proj_in = nn.Linear(n_feat, d_model)
-        self.fc1 = nn.Linear((look_back // k) * d_model, d_model)
-        self.fc2 = nn.Linear(d_model, d_model)
-        self.head = nn.Linear(d_model, horizon * 2)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = torch.relu(self.proj_in(x))
-        z = self.pool(z.transpose(1, 2)).transpose(1, 2)
-        z = z.reshape(z.size(0), -1)
-        z = torch.relu(self.fc1(z))
-        z = torch.relu(self.fc2(z))
-        return self.head(z).view(-1, self.head.out_features // 2, 2)
-
-
-class NHiTS(nn.Module):
-    """分层池化多块叠加，长外推对照（非完整 N-HiTS）。"""
-
-    def __init__(self, look_back: int, horizon: int, n_feat: int,
-                 n_fut: int = 0, cfg: dict | None = None):
-        super().__init__()
-        cfg = cfg or {}
-        d_model = int(cfg.get("d_model", 64))
-        n_blocks = int(cfg.get("n_blocks", 3))
-        kernels = [1, 2, 4][:n_blocks]
-        self.blocks = nn.ModuleList([
-            _NHiTSBlock(look_back, horizon, n_feat, d_model, k) for k in kernels])
-
-    def forward(self, x: torch.Tensor, fut: torch.Tensor | None = None) -> torch.Tensor:
-        out = 0.0
-        for block in self.blocks:
-            out = out + block(x)
-        return out
-
-
-class TCNBlock(nn.Module):
-    """旧版对称 padding 卷积块，仅保留作历史对照。"""
-
-    def __init__(self, n_feat: int, channels: int, dilation: int):
-        super().__init__()
-        self.conv = nn.Conv1d(n_feat, channels, kernel_size=3,
-                              dilation=dilation, padding=dilation)
-        self.relu = nn.ReLU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.relu(self.conv(x))
-
-
-class TCN(nn.Module):
-    def __init__(self, look_back: int, horizon: int, n_feat: int,
-                 n_fut: int = 0, cfg: dict | None = None):
-        super().__init__()
-        cfg = cfg or {}
-        channels = int(cfg.get("d_model", 32))
-        n_layers = int(cfg.get("n_blocks", 3))
-        layers = [TCNBlock(n_feat, channels, 1)]
-        for i in range(1, n_layers):
-            layers.append(TCNBlock(channels, channels, 2 ** i))
-        self.net = nn.Sequential(*layers)
-        self.head = nn.Linear(channels * look_back, horizon * 2)
-
-    def forward(self, x: torch.Tensor, fut: torch.Tensor | None = None) -> torch.Tensor:
-        z = self.net(x.transpose(1, 2))
-        return self.head(z.reshape(z.size(0), -1)).view(-1, self.head.out_features // 2, 2)
-
-
-MODEL_ZOO = {"dlinear": DLinear, "tsmixer": TSMixer, "tcn_causal": CausalTCN,
-             "nhits": NHiTS, "tcn": TCN}
-
+MODEL_ZOO = {"tsmixer": TSMixer, "tcn_causal": CausalTCN}
 
 def build_model(kind: str, look_back: int, horizon: int, n_feat: int,
                 n_fut: int, cfg: dict) -> nn.Module:
@@ -783,7 +599,6 @@ class _Sample:
         self.look_back = look_back
         self.batch = batch
         self.mode = mode
-        self.residual_limit = float(cfg.get("residual_limit", 0.) or 0.)
         self.memory_limit = float(cfg.get("max_gpu_memory_gib", 15.)) * 1024 ** 3
         self.capacity = torch.tensor([C.CAPACITY[t] for t in C.TARGETS], device=DEVICE)
         self.positions = positions.astype(np.int64)
@@ -804,11 +619,6 @@ class _Sample:
         floor_ratio = float(cfg.get("mape_floor_ratio", 0.02))
         self.floor = torch.as_tensor([floor_ratio * float(C.CAPACITY[t]) for t in C.TARGETS],
                                      dtype=torch.float32, device=DEVICE)
-        # 增广只作用于历史输入，不改未来协变量与目标：样本量受“天”数限制，
-        # 轻微噪声/通道丢弃能抑制 trunk 记住训练期工况。
-        self.aug_noise = float(cfg.get("aug_noise", 0.0) or 0.0)
-        self.aug_channel_drop = float(cfg.get("aug_channel_drop", 0.0) or 0.0)
-        self.prior = float(cfg.get("prior_lambda", 0.0) or 0.0)
         self.target_indices = list(cfg.get("target_indices", (0, 1)))
         if not self.target_indices or any(i not in (0, 1) for i in self.target_indices):
             raise ValueError("NN专项目标索引必须来自两个合法目标")
@@ -822,12 +632,6 @@ class _Sample:
         prediction = prediction.float()
         if self.mode == "scaled":
             return prediction * self.capacity
-        if self.mode == "ratio":
-            return prediction * self.profile[take]
-        if self.mode == "residual":
-            if self.residual_limit > 0:
-                prediction = self.residual_limit * torch.tanh(prediction)
-            return self.profile[take] + prediction * self.capacity
         return prediction
 
     def loss(self, prediction: torch.Tensor, take: torch.Tensor) -> torch.Tensor:
@@ -843,10 +647,6 @@ class _Sample:
                 (positive * weights).sum((0, 1)).clamp_min(1.))[self.target_indices].mean()
         loss = loss + .1 * ((error / self.capacity * zero).sum((0, 1)) /
                             zero.sum((0, 1)).clamp_min(1.))[self.target_indices].mean()
-        if self.prior > 0.0 and self.mode == "ratio":
-            # 向“完全信任画像”收缩：开发折显示柔性网络会把训练期工况当成规律，
-            # 遇到换季后的新工况反而低于画像，用显式先验压住这类偏移。
-            loss = loss + self.prior * ((prediction.float() - 1.0) ** 2).mean()
         return loss
 
     def epoch(self, model: nn.Module, optimizer, amp: bool) -> float:
@@ -856,14 +656,6 @@ class _Sample:
         for start in C.progress(range(0, self.count, self.batch), desc="NN 训练批次", unit="批"):
             take = order[start:start + self.batch]
             x = _windows(self.table, self.pos[take], self.look_back)
-            if self.aug_noise > 0 or self.aug_channel_drop > 0:
-                x = x.clone()
-                if self.aug_noise > 0:
-                    x = x + torch.randn_like(x) * self.aug_noise
-                if self.aug_channel_drop > 0:
-                    keep = (torch.rand((x.shape[0], 1, x.shape[2]), device=x.device)
-                            >= self.aug_channel_drop).to(x.dtype)
-                    x = x * keep
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
                 prediction = model(x, self.future[take])
             loss = self.loss(prediction, take)
@@ -915,7 +707,7 @@ def _make_sample(prepared: PreparedData, table: torch.Tensor, positions: np.ndar
     positions, targets = positions[keep], targets[keep]
     future = _future_columns(prepared, positions, horizons, cfg)
     profile = None
-    if mode in ("ratio", "residual") or cfg.get("profile_conditions_scaled"):
+    if cfg.get("profile_conditions_scaled"):
         mask_days = int(cfg.get("training_mask_days", 0))
         profile = (_blocked_profiles(prepared, positions, horizons, mask_days)
                    if mask_days > 0 else _profile_cube(prepared, positions, horizons, fuel=_profile_is_fuel(cfg)))
@@ -941,12 +733,12 @@ class NNBundle:
     train_end: str | None = None
     feature_names: list[str] = field(default_factory=list)
     n_fut: int = 0
-    head_mode: str = "direct"
+    head_mode: str = "scaled"
     load_history: bool = False
     config: dict = field(default_factory=dict)
 
 
-def train_nn(prepared: PreparedData, folds: list[dict], kind: str = "dlinear",
+def train_nn(prepared: PreparedData, folds: list[dict], kind: str = "tcn_causal",
              horizons: tuple[int, ...] | None = None, quick: bool = False,
              n_seeds: int = 1, cfg: dict | None = None) -> NNBundle:
     """单个训练截止点拟合：前缀内早停选轮数，再按固定轮数重训合法前缀。"""
@@ -958,10 +750,9 @@ def train_nn(prepared: PreparedData, folds: list[dict], kind: str = "dlinear",
     patience = int(cfg["quick_patience"] if quick else cfg["patience"])
     batch = int(cfg["quick_batch_size"] if quick else cfg["batch_size"])
     stride = C.QUICK_TRAIN_STRIDE if quick else int(cfg.get("train_stride", 1))
-    mode = str(cfg.get("head_mode") or DEFAULT_HEADS.get(kind, "direct"))
-    if mode in ("ratio", "residual") and int(C.PROFILE_DAYS) <= 0:
-        # 合成自检把画像窗口裁成 0，此时退回原始量纲，保证契约检查可跑通。
-        mode = "direct"
+    mode = str(cfg.get("head_mode") or DEFAULT_HEADS.get(kind, "scaled"))
+    if mode != "scaled":
+        raise ValueError("正式网络只支持已晋级的容量归一化输出")
     cfg["head_mode"] = mode
     load_history = bool(cfg.get("load_history", False))
     tuning = [f for f in folds if f["role"] == "tuning"]
@@ -1151,6 +942,8 @@ def predict_nn(bundle: NNBundle, prepared: PreparedData,
     """输出 (n_origins, n_horizons, 2)；越界起报点保持 NaN 由调用方回退画像。"""
     from main_s import enforce_physics
 
+    if bundle.head_mode != "scaled":
+        raise ValueError("正式网络只支持已晋级的容量归一化输出")
     positions = prepared.index.get_indexer(origins)
     n, m = len(origins), len(bundle.horizons)
     out = np.full((n, m, 2), np.nan, dtype=float)
@@ -1170,7 +963,7 @@ def predict_nn(bundle: NNBundle, prepared: PreparedData,
         cfg["ensemble_weights"] = 1. / np.maximum(losses, 1e-4) ** float(cfg.get("aggregation_power", 1.))
     future = _future_columns(prepared, sub, bundle.horizons, cfg)
     profile = None
-    if bundle.head_mode in ("ratio", "residual") or cfg.get("profile_conditions_scaled"):
+    if cfg.get("profile_conditions_scaled"):
         profile = _profile_cube(prepared, sub, bundle.horizons, fuel=_profile_is_fuel(cfg))
         if cfg.get("profile_conditions"):
             future = _profile_conditions(prepared, sub, future, profile)
@@ -1185,15 +978,7 @@ def predict_nn(bundle: NNBundle, prepared: PreparedData,
         bundle._runtime_models = runtime
     cube = _predict_cube(states, gpu, sub, future, bundle.look_back, m, bundle.kind,
                          bundle.n_fut, cfg, int(cfg.get("predict_batch", 1024)), runtime_models=runtime)
-    if bundle.head_mode == "ratio":
-        cube = cube * profile
-    elif bundle.head_mode == "residual":
-        limit = float(cfg.get("residual_limit", 0.) or 0.)
-        if limit > 0:
-            cube = limit * np.tanh(cube)
-        cube = profile + cube * np.array([C.CAPACITY[t] for t in C.TARGETS])
-    elif bundle.head_mode == "scaled":
-        cube = cube * np.array([C.CAPACITY[t] for t in C.TARGETS])
+    cube = cube * np.array([C.CAPACITY[t] for t in C.TARGETS])
     cube = np.clip(cube, 0.0, None)
     out[valid] = cube
     for row in np.nonzero(~valid)[0]:
@@ -1233,58 +1018,6 @@ def load_nn(path: Path) -> NNBundle:
                     scores=payload.get("scores", {}), train_end=payload.get("train_end"),
                     feature_names=payload.get("feature_names", []),
                     n_fut=int(payload.get("n_fut", 0)),
-                    head_mode=payload.get("head_mode", "direct"),
+                    head_mode=payload.get("head_mode", "scaled"),
                     load_history=bool(payload.get("load_history", False)),
                     config=payload.get("config", {}))
-
-
-def benchmark_engine(directory: Path, kind: str, cfg: dict) -> list[dict]:
-    """固定更新步的合成算子基准，不产生预测分数，权重不得用于赛事模型。"""
-    if DEVICE.type != "cuda":
-        raise RuntimeError("GPU 基准需要可用 CUDA")
-    directory.mkdir(parents=True, exist_ok=True)
-    cfg = {**_cfg(cfg), "head_mode": "scaled", "aug_noise": 0., "aug_channel_drop": 0.}
-    length, horizon, features = int(cfg["look_back"]), 8, 192
-    results = []
-    for precision in C.progress(("fp32", "bf16"), desc="GPU 基准精度", unit="种"):
-        for batch in C.progress((128, 512, 1024, 2048, 4096), desc=f"GPU {precision} batch", unit="配置"):
-            if batch == 4096 and precision == "fp32":
-                continue
-            torch.manual_seed(73)
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
-            model = build_model(kind, length, horizon, features, 6, cfg)
-            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-            x = torch.randn(batch, length, features, device=DEVICE)
-            future = torch.zeros(batch, horizon, 6, device=DEVICE)
-            target = torch.full((batch, horizon, 2), .6, device=DEVICE)
-            item = {"batch": batch, "precision": precision, "steps": 12,
-                    "synthetic_only": True, "kind": kind, "look_back": length}
-            prediction = loss = None
-            try:
-                for step in range(15):
-                    if step == 3:
-                        torch.cuda.synchronize()
-                        tick = time.perf_counter()
-                    optimizer.zero_grad(set_to_none=True)
-                    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=precision == "bf16"):
-                        prediction = model(x, future)
-                    loss = (prediction.float() - target).abs().mean()
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), 1.)
-                    optimizer.step()
-                torch.cuda.synchronize()
-                seconds = time.perf_counter() - tick
-                item.update(seconds=seconds, step_ms=seconds / 12 * 1000,
-                            samples_per_second=batch * 12 / seconds,
-                            peak_allocated_mb=peak_memory_mb(),
-                            peak_reserved_mb=torch.cuda.max_memory_reserved() / 1024 ** 2)
-                torch.save({"purpose": "synthetic_benchmark_only", "state_dict": model.cpu().state_dict()},
-                           directory / f"{kind}_{precision}_{batch}.pt")
-            except torch.cuda.OutOfMemoryError:
-                item["status"] = "OOM_not_selected"
-            results.append(item)
-            logging.getLogger("aic-half").info("GPU基准: %s", item)
-            del model, optimizer, x, future, target, prediction, loss
-            torch.cuda.empty_cache()
-    return results

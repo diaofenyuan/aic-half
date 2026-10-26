@@ -61,8 +61,7 @@ def training_weights(prepared: PreparedData, positions: np.ndarray,
 
 def design_inputs(prepared: PreparedData, base: pd.DataFrame,
                   positions: np.ndarray, horizons: tuple[int, ...],
-                  features: str, profile_state: dict | None = None,
-                  future_features: dict | None = None) -> tuple[dict[str, np.ndarray], list[str]]:
+                  features: str) -> tuple[dict[str, np.ndarray], list[str]]:
     """构造与提前量相关的目标时刻日历、画像特征。"""
     extras = target_calendar(prepared, positions, horizons)
     # 少特征分支不得通过燃料缩放重新读到被排除的发电耗气。
@@ -74,18 +73,6 @@ def design_inputs(prepared: PreparedData, base: pd.DataFrame,
     for target in C.TARGETS:
         extras[f"profile_{target}"] = target_slot_profile(
             prepared, positions, horizons, target)
-        if profile_state:
-            from data_cleaning.pipeline import state_slot_profile
-            values, count, age, distance = state_slot_profile(
-                prepared, positions, horizons, target, profile_state)
-            extras[f"profile_{target}"] = values
-            extras[f"profile_{target}_count"] = count
-            extras[f"profile_{target}_age"] = age
-            extras[f"profile_{target}_distance"] = distance
-    for key, value in (future_features or {}).items():
-        if np.asarray(value).shape != (len(positions), len(horizons)):
-            raise ValueError("折外资源特征与起报点/提前量不匹配")
-        extras[key] = value
     names = list(base.columns) + list(extras.keys()) + ["h"]
     return extras, names
 
@@ -377,8 +364,7 @@ def _groups_for(horizons: tuple[int, ...]):
 def _train_models(prepared: PreparedData, base_all: pd.DataFrame,
                   positions: np.ndarray, horizons: tuple[int, ...],
                   kind: str, features: str, num_round: int,
-                  ref_pos: int, profile_state: dict | None = None,
-                  future_features: dict | None = None,
+                  ref_pos: int,
                   targets: tuple | None = None, params_override: dict | None = None) -> tuple[dict, list[str]]:
     prepared.require_training_data()
     if len(positions) == 0 or np.max(positions) + max(horizons) > ref_pos:
@@ -387,7 +373,7 @@ def _train_models(prepared: PreparedData, base_all: pd.DataFrame,
     columns = _feature_columns(base_all, features)
     base = base_all[columns]
     base_values = base.to_numpy(dtype=np.float32)
-    extras, names = design_inputs(prepared, base, positions, horizons, features, profile_state, future_features)
+    extras, names = design_inputs(prepared, base, positions, horizons, features)
     extra_names = names[len(columns):-1]
     weights = training_weights(prepared, positions, horizons, ref_pos)
     models: dict = {}
@@ -424,14 +410,13 @@ def _train_models(prepared: PreparedData, base_all: pd.DataFrame,
 def _predict_models(prepared: PreparedData, base_all: pd.DataFrame,
                     positions: np.ndarray, horizons: tuple[int, ...],
                     kind: str, features: str, models: dict,
-                    feature_names: list[str], profile_state: dict | None = None,
-                    future_features: dict | None = None,
+                    feature_names: list[str],
                     targets: tuple | None = None) -> np.ndarray:
     base_all = _with_observed_features(prepared, base_all, features)
     columns = _feature_columns(base_all, features)
     base = base_all[columns]
     base_values = base.to_numpy(dtype=np.float32)
-    extras, names = design_inputs(prepared, base, positions, horizons, features, profile_state, future_features)
+    extras, names = design_inputs(prepared, base, positions, horizons, features)
     extra_names = names[len(columns):-1]
     if names != feature_names:
         raise ValueError("预测特征顺序与训练不一致")
@@ -472,82 +457,6 @@ def _predict_models(prepared: PreparedData, base_all: pd.DataFrame,
     else:
         raise ValueError(f"未知模型类型 {kind}")
     return out
-
-
-def future_resource_features(prepared: PreparedData, positions: np.ndarray,
-                             forecast: np.ndarray, widths: np.ndarray) -> dict:
-    from data_cleaning import resource_series
-    if forecast.shape != (len(positions), 96, 3) or widths.shape != forecast.shape:
-        raise ValueError("未来资源特征必须由匹配起报点的完整预测路径构造")
-    if not np.isfinite(forecast).all():
-        raise ValueError("资源点预测含非有限数")
-    current = resource_series(prepared).to_numpy(dtype=float)[positions]
-    result = {}
-    for gi, gas in enumerate(C.RESOURCE_NAMES):
-        result[f"future_{gas}"] = forecast[:, :, gi]
-        result[f"future_{gas}_width"] = widths[:, :, gi]
-        result[f"future_{gas}_change"] = (forecast[:, :, gi] - current[:, gi, None]) / np.maximum(np.abs(current[:, gi, None]), 1.)
-        for count in (8, 32, 96):
-            amount = forecast[:, :count, gi].sum(axis=1) * .25
-            result[f"future_{gas}_volume_{count}"] = np.repeat(amount[:, None], 96, axis=1)
-    return result
-
-
-def fit_allocation(prepared: PreparedData, base: pd.DataFrame, positions: np.ndarray,
-                   horizons: tuple[int, ...], ref_pos: int, rounds: int,
-                   profile_state: dict | None = None) -> tuple:
-    """只学习小机组组分配，评分时总负荷由保护基线提供。"""
-    prepared.require_training_data()
-    if len(positions) == 0 or max(positions) + max(horizons) > ref_pos:
-        raise ValueError("分配模型训练目标跨越冻结截止点")
-    base = base[_feature_columns(base, "gas")]
-    extras, names = design_inputs(prepared, base, positions, horizons, "gas", profile_state)
-    X, y1, weights = stack_training(prepared, base.to_numpy(dtype=np.float32), extras,
-        list(extras), positions, horizons, "generator_1",
-        training_weights(prepared, positions, horizons, ref_pos))
-    # 两目标缺失位置可能不同，联合筛选后才能构造比例监督。
-    first = np.concatenate([prepared.labels.generator_1.to_numpy()[positions + h] for h in horizons])
-    total = np.concatenate([prepared.labels.generator_all.to_numpy()[positions + h] for h in horizons])
-    total = total[np.isfinite(first)]
-    valid = np.isfinite(total) & (total > 0) & (y1 >= 0) & (y1 <= total)
-    ratio = y1[valid] / total[valid]
-    weights = weights[valid] * total[valid] / np.maximum(y1[valid], 1.)
-    model = lgb.train(C.LGBM_BASE, lgb.Dataset(X[valid], label=ratio,
-        weight=weights / max(weights.mean(), 1e-9), feature_name=names), num_boost_round=rounds)
-    return {"allocation": model}, names
-
-
-def predict_allocation(prepared: PreparedData, base: pd.DataFrame, positions: np.ndarray,
-                       horizons: tuple[int, ...], models: dict, names: list,
-                       protected: np.ndarray, profile_state: dict | None = None) -> np.ndarray:
-    base = base[_feature_columns(base, "gas")]
-    extras, expected = design_inputs(prepared, base, positions, horizons, "gas", profile_state)
-    if names != expected:
-        raise ValueError("分配模型特征顺序不一致")
-    X = np.concatenate([_block(base.to_numpy(dtype=np.float32), positions, extras,
-                        list(extras), h, j) for j, h in enumerate(horizons)])
-    ratio = np.clip(models["allocation"].predict(X).reshape(len(horizons), len(positions)).T, 0., 1.)
-    result = protected.copy()
-    total = protected[:, :, 1]
-    result[:, :, 0] = np.clip(ratio * total, np.maximum(total - 240., 0.), np.minimum(total, 200.))
-    return result
-
-
-def load_promotion(predictions: list, baseline: list, truths: list,
-                   horizons: tuple[int, ...]) -> dict:
-    if not predictions or len(predictions) != len(baseline) or len(predictions) != len(truths):
-        raise ValueError("负荷晋级必须逐折成对比较，不能截断缺失折")
-    scores = [score_cube(p, y, horizons) for p, y in zip(predictions, truths)]
-    references = [score_cube(p, y, horizons) for p, y in zip(baseline, truths)]
-    gain = float(np.mean([a["accuracy"] - b["accuracy"] for a, b in zip(scores, references)]))
-    deltas = [{t: a["targets"][t]["accuracy"] - b["targets"][t]["accuracy"]
-               for t in C.TARGETS} for a, b in zip(scores, references)]
-    passed = (len(scores) == 3 and gain >= C.SELECTION["min_mean_gain_pp"]
-              and all(v >= -C.SELECTION["max_worst_fold_drop_pp"] for d in deltas for v in d.values()))
-    return {"accepted": bool(passed), "mean_gain_pp": gain,
-            "mean_accuracy": float(np.mean([s["accuracy"] for s in scores])),
-            "fold_target_deltas_pp": deltas, "scores": scores,
-            "scope": "ABC_21_days" if len(scores) == 3 else "screen_only"}
 
 
 @dataclass
@@ -625,7 +534,7 @@ def train_short(prepared: PreparedData, folds: list[dict], quick: bool = False) 
         solo = [{**fold, "role": "tuning"},
                 {**fold, "role": "confirm", "name": fold["name"] + "_val"}]
         nb = main_nn.train_nn(prepared, solo,
-                              kind=str(C.NN_CONFIG.get("kind_short", "dlinear")),
+                              kind=str(C.NN_CONFIG.get("kind_short", "tcn_causal")),
                               horizons=C.HORIZONS_S, quick=quick,
                               n_seeds=int(C.NN_CONFIG.get("n_seeds", 1)))
         pred = main_nn.predict_nn(nb, item["prepared"], item["prepared"].index[item["eval"]])
@@ -709,7 +618,7 @@ def train_short(prepared: PreparedData, folds: list[dict], quick: bool = False) 
         solo = [{**confirm_fold, "role": "tuning"},
                 {**confirm_fold, "role": "confirm", "name": "val"}]
         nn_c = main_nn.train_nn(prepared, solo,
-                                kind=str(C.NN_CONFIG.get("kind_short", "dlinear")),
+                                kind=str(C.NN_CONFIG.get("kind_short", "tcn_causal")),
                                 horizons=C.HORIZONS_S, quick=quick,
                                 n_seeds=int(C.NN_CONFIG.get("n_seeds", 1)))
         confirm_pred = main_nn.predict_nn(nn_c, confirm_masked,
@@ -756,7 +665,7 @@ def train_short(prepared: PreparedData, folds: list[dict], quick: bool = False) 
         all_folds = [{"name": "final", "role": "tuning",
                       "train_end": str(valid.index[-1])}]
         nn_final = main_nn.train_nn(prepared, all_folds,
-                                    kind=str(C.NN_CONFIG.get("kind_short", "dlinear")),
+                                    kind=str(C.NN_CONFIG.get("kind_short", "tcn_causal")),
                                     horizons=C.HORIZONS_S, quick=quick,
                                     n_seeds=int(C.NN_CONFIG.get("n_seeds", 1)))
         final_models, final_names = {}, []
@@ -926,13 +835,13 @@ def generator1_project(candidate: np.ndarray, reference: np.ndarray) -> np.ndarr
     return result
 
 
-def generator1_base(prepared: PreparedData, block_days: int = 0, include_power: bool = False) -> pd.DataFrame:
+def generator1_base(prepared: PreparedData, include_power: bool = False) -> pd.DataFrame:
     """专项特征单独构造，既有模型的列集合及数值保持不变。"""
     from data_cleaning.pipeline import _last_valid
     features = "gas_at_t" if include_power else "gas_no_power_at_t"
     base = _with_observed_features(prepared, build_base_features(prepared, True), features)
     base = base[_feature_columns(base, features)].copy()
-    frame, positions = prepared.frame, np.arange(len(prepared.index))
+    frame = prepared.frame
     for col in ("d_use_blast", "d_use_coke", "d_use_converter", "d_gen_blast", "d_gen_coke"):
         _, age = _last_valid(frame[col])
         base[f"g1_{col}_log_age"] = np.log1p(age / C.STEPS_PER_DAY)
@@ -940,64 +849,9 @@ def generator1_base(prepared: PreparedData, block_days: int = 0, include_power: 
             base[f"g1_{col}_coverage{window}"] = frame[col].notna().rolling(window, min_periods=1).mean()
     for target in C.TARGETS:
         level, age = _last_valid(frame[C.TARGET_COLUMN[target]])
-        if block_days:
-            first = C.PROFILE_DAYS * C.STEPS_PER_DAY
-            start = first + np.maximum(positions - first, 0) // (block_days * C.STEPS_PER_DAY) * (block_days * C.STEPS_PER_DAY)
-            visible = np.maximum(0, np.minimum(positions, start - 1))
-            level, age = level[visible], age[visible] + positions - visible
         base[f"g1_{target}_last_level"] = level
         base[f"g1_{target}_log_age"] = np.log1p(age / C.STEPS_PER_DAY)
     return base
-
-
-def generator1_fit(prepared, ref_pos, horizons, *, residual=False, blocked=False, quick=False):
-    """残差以因果历史画像为锚，MAPE权重始终由真实负荷而非残差计算。"""
-    prepared.require_training_data()
-    cutoff = prepared.index[ref_pos]
-    training = prepared.prefix_copy(cutoff)
-    if blocked:
-        for offset in range(7 * C.STEPS_PER_DAY, ref_pos, 21 * C.STEPS_PER_DAY):
-            training = training.masked_power_gas_copy(training.index[offset],
-                training.index[min(offset + 14 * C.STEPS_PER_DAY - 1, ref_pos)])
-    days = 21 if blocked else 0
-    base = generator1_base(training, days)
-    # 整体训练仍使用全部合法前缀；长期仅按既有步长下采样起报点。
-    stride = C.QUICK_TRAIN_STRIDE if quick else (1 if max(horizons) <= 8 else 2)
-    positions = np.arange(C.PROFILE_DAYS * C.STEPS_PER_DAY, ref_pos - max(horizons) + 1, stride)
-    extras, names = design_inputs(training, base, positions, horizons, "gas_no_power_at_t")
-    if days:
-        profile = main_nn._blocked_profiles(training, positions, horizons, days)
-        for i, target in enumerate(C.TARGETS):
-            extras[f"profile_{target}"] = profile[..., i]
-    values = base.to_numpy(dtype=np.float32)
-    weights = training_weights(training, positions, horizons, ref_pos)
-    X, truth, weight = stack_training(training, values, extras, list(extras), positions,
-                                     horizons, "generator_1", weights)
-    anchor = np.concatenate([extras["profile_generator_1"][:, j] for j in range(len(horizons))])
-    raw_truth = np.concatenate([training.labels.generator_1.to_numpy()[positions + h] for h in horizons])
-    anchor = anchor[np.isfinite(raw_truth)]
-    params = {**C.LGBM_BASE, "num_leaves": 15, "lambda_l2": 5.}
-    weight = _mape_weights(truth, weight)
-    model = lgb.train(params, lgb.Dataset(X, label=truth - anchor if residual else truth,
-        weight=weight, feature_name=names), num_boost_round=C.LGBM_TREES_QUICK if quick else C.LGBM_TREES_LONG)
-    return {"model": model, "feature_names": names, "residual": bool(residual),
-            "blocked": bool(blocked), "train_end": str(cutoff),
-            "max_training_target": str(training.index[positions[-1] + max(horizons)]),
-            "rows": len(truth), "anchor": "causal_slot_profile" if residual else None}
-
-
-def generator1_predict(pack, prepared, positions, horizons):
-    base = generator1_base(prepared)
-    extras, names = design_inputs(prepared, base, positions, horizons, "gas_no_power_at_t")
-    if names != pack["feature_names"]:
-        raise ValueError("generator_1专项特征顺序不一致")
-    values, predictions = base.to_numpy(dtype=np.float32), []
-    for j, h in enumerate(horizons):
-        pred = pack["model"].predict(_block(values, positions, extras, list(extras), h, j))
-        if pack["residual"]:
-            pred += extras["profile_generator_1"][:, j]
-        predictions.append(pred)
-    return np.asarray(predictions).T
 
 
 def generator1_gate_matrix(prepared, positions, horizons, before, after):
@@ -1012,15 +866,14 @@ def generator1_gate_matrix(prepared, positions, horizons, before, after):
     return np.concatenate(parts).astype(np.float32), cols + ["before", "after", "difference", "h"]
 
 
-def generator1_transition_bins(X, names, stateful=False):
+def generator1_transition_bins(X, names):
     columns = [names.index(f"g1_d_use_{gas}_log_age") for gas in ("blast", "coke", "converter")]
     age = np.nanmax(X[:, columns], axis=1)
     day = np.searchsorted(np.log1p([1., 7.]), age, side="right")
     lead = (X[:, names.index("h")] > 4).astype(int)
     result = day * 2 + lead
-    if stateful:
-        target_age = np.expm1(X[:, names.index("g1_generator_1_log_age")])
-        result += 6 * (target_age - np.expm1(age) >= 1.).astype(int)
+    target_age = np.expm1(X[:, names.index("g1_generator_1_log_age")])
+    result += 6 * (target_age - np.expm1(age) >= 1.).astype(int)
     return result
 
 
@@ -1028,28 +881,15 @@ def generator1_transition_weights(calibration, prepared, positions, horizons, be
     X, names = generator1_gate_matrix(prepared, positions, horizons, before, after)
     if names != calibration["feature_names"]:
         raise ValueError("缺测阶段校准特征与归档顺序不一致")
-    stateful = calibration["family"] == "duration_state"
-    if calibration["family"] not in ("duration", "duration_state"):
+    if calibration["family"] != "duration_state":
         raise ValueError("不支持的缺测阶段校准")
     table = np.asarray(calibration["table"], dtype=float)
     shrink = float(calibration["shrink"])
-    if (len(table) != (12 if stateful else 6) or not np.isfinite(table).all()
+    if (len(table) != 12 or not np.isfinite(table).all()
             or np.any((table < 0.) | (table > .5)) or not 0. <= shrink <= 1.):
         raise ValueError("缺测阶段权重不合法")
-    raw = table[generator1_transition_bins(X, names, stateful)]
+    raw = table[generator1_transition_bins(X, names)]
     return np.clip(.25 + shrink * (raw.reshape(len(horizons), -1).T - .25), 0., .5)
-
-
-def generator1_gate_fit(X, before, after, truth, names):
-    before, after, truth = (x.T.ravel() for x in (before, after, truth))
-    delta = after - before
-    valid = np.isfinite(truth) & np.isfinite(delta) & (np.abs(delta) > .1)
-    target = np.clip((truth[valid] - before[valid]) / delta[valid], 0., 1.)
-    weight = np.abs(delta[valid]) / np.maximum(np.abs(truth[valid]), 1.)
-    model = lgb.train({**C.LGBM_BASE, "num_leaves": 4, "max_depth": 2,
-        "min_data_in_leaf": 256, "lambda_l2": 20., "learning_rate": .03},
-        lgb.Dataset(X[valid], label=target, weight=weight, feature_name=names), num_boost_round=160)
-    return model
 
 
 def apply_generator1_specialist(bundle, prepared, positions, prediction, use_final):
@@ -1088,17 +928,14 @@ def apply_generator1_specialist(bundle, prepared, positions, prediction, use_fin
         active = ~np.isfinite(observed).all(axis=1)
         if not active.any():
             return prediction
-    if recipe["kind"] == "tree":
-        expert = generator1_predict(state["tree"], prepared, positions, horizons)
-    elif recipe["kind"] == "nn":
+    if recipe["kind"] == "nn":
         expert = main_nn.predict_nn(state["nn"], prepared, prepared.index[positions])[..., 0]
     else:
         base = build_base_features(prepared, True)
         members = [np.clip(_predict_models(prepared, base, positions, horizons,
             state["expert_kind"], state["expert_features"], seed["models"], seed["feature_names"],
             targets=("generator_1",))[..., 0], 0., 200.) for seed in state.get("experts", [state])]
-        expert = (np.median(members, axis=0) if recipe.get("expert_aggregation") == "median"
-                  else np.mean(members, axis=0))
+        expert = np.mean(members, axis=0)
         profile = target_slot_profile(prepared, positions, horizons, "generator_1")
         for group, lo, hi in _groups_for(horizons):
             js = [j for j, h in enumerate(horizons) if lo <= h <= hi]
@@ -1108,11 +945,6 @@ def apply_generator1_specialist(bundle, prepared, positions, prediction, use_fin
     if recipe.get("disagreement_margin_mw"):
         margin = recipe["disagreement_margin_mw"]
         weight = weight * np.clip((np.abs(expert - prediction[..., 0]) - margin) / margin, 0., 1.)
-    if recipe["kind"] == "nested_gate":
-        X, names = generator1_gate_matrix(prepared, positions, horizons, prediction[..., 0], expert)
-        if names != state["gate"].feature_name():
-            raise ValueError("generator_1门控部署特征不一致")
-        weight = np.clip(state["gate"].predict(X).reshape(len(horizons), -1).T, 0., 1.)
     if recipe.get("missing_only", True):
         weight = weight * active[:, None]
     result = generator1_project(prediction[..., 0] + weight * (expert - prediction[..., 0]), prediction)
@@ -1124,7 +956,7 @@ def save_generator1(state, directory):
     """仅保存当前专项实际使用的模型，不把内层折外模型或数组混入交付物。"""
     import json
     directory.mkdir(parents=True, exist_ok=True)
-    meta = {k: v for k, v in state.items() if k not in ("tree", "nn", "models", "gate", "experts", "base_state")}
+    meta = {k: v for k, v in state.items() if k not in ("nn", "models", "experts", "base_state")}
     if state.get("base_state"):
         save_generator1(state["base_state"], directory / "base")
         meta["base_path"] = "base"
@@ -1134,9 +966,6 @@ def save_generator1(state, directory):
             name = f"seed_{i}"
             save_generator1(expert, directory / name)
             meta["expert_paths"].append(name)
-    if "tree" in state:
-        meta["tree"] = {k: v for k, v in state["tree"].items() if k != "model"}
-        (directory / "tree.txt").write_text(state["tree"]["model"].model_to_string(), encoding="utf-8")
     if "nn" in state:
         meta["nn_path"] = main_nn.save_nn(state["nn"], directory).split("\\")[-1].split("/")[-1]
     if "models" in state:
@@ -1145,8 +974,6 @@ def save_generator1(state, directory):
             filename = f"expert_{i}.txt"
             (directory / filename).write_text(model.model_to_string(), encoding="utf-8")
             meta["files"].append({"key": list(key) if isinstance(key, tuple) else key, "filename": filename})
-    if "gate" in state:
-        (directory / "gate.txt").write_text(state["gate"].model_to_string(), encoding="utf-8")
     (directory / "state.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     return meta
 
@@ -1158,13 +985,9 @@ def load_generator1(directory):
         meta["base_state"] = load_generator1(directory / meta["base_path"])
     if meta.get("expert_paths"):
         meta["experts"] = [load_generator1(directory / name) for name in meta["expert_paths"]]
-    if "tree" in meta:
-        meta["tree"]["model"] = lgb.Booster(model_str=(directory / "tree.txt").read_text(encoding="utf-8"))
     if "nn_path" in meta:
         meta["nn"] = main_nn.load_nn(directory / meta["nn_path"])
     if "files" in meta:
         meta["models"] = {(tuple(row["key"]) if isinstance(row["key"], list) else row["key"]):
             lgb.Booster(model_str=(directory / row["filename"]).read_text(encoding="utf-8")) for row in meta["files"]}
-    if (directory / "gate.txt").exists():
-        meta["gate"] = lgb.Booster(model_str=(directory / "gate.txt").read_text(encoding="utf-8"))
     return meta

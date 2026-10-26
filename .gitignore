@@ -2,6 +2,7 @@ data/
 outputs/
 tmp/*
 !tmp/.gitkeep
+tmp_main/
 models/
 __pycache__/
 *.pyc

@@ -633,36 +633,6 @@ def _causal_slot_profiles(values: np.ndarray, ref_days: np.ndarray,
     return profiles, cache
 
 
-def _day_types(index: pd.DatetimeIndex) -> np.ndarray:
-    """1=工作日，0=周末；工业负荷两者形态差异大，画像不能混着取中位数。"""
-    return (index.dayofweek.to_numpy() < 5).astype(np.int8)
-
-
-def _causal_slot_profiles_typed(values: np.ndarray, ref_days: np.ndarray,
-                                day_types: np.ndarray, days: int
-                                ) -> np.ndarray:
-    """同槽位中位数，但只在同日型（工作日/周末）历史里取，避免周末拉低工作日画像。"""
-    matrix = _day_matrix(values)
-    n_days = len(matrix)
-    out = np.full((len(ref_days), C.STEPS_PER_DAY), np.nan)
-    for i, day in enumerate(ref_days):
-        day = int(min(max(day, -1), n_days - 1))
-        if day < 0:
-            continue
-        lo = max(0, day - days + 1)
-        # 同日型优先；同日型样本不足 3 天时退回全日型中位数。
-        same = [d for d in range(lo, day + 1) if day_types[d] == day_types[day]]
-        pool = same if len(same) >= 3 else list(range(lo, day + 1))
-        block = matrix[np.asarray(pool, dtype=int)]
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            prof = np.nanmedian(block, axis=0)
-        counts = np.sum(np.isfinite(block), axis=0)
-        fallback = float(np.nanmedian(prof)) if np.isfinite(prof).any() else float("nan")
-        out[i] = np.where((counts >= 2) & np.isfinite(prof), prof, fallback)
-    return out
-
-
 def target_slot_profile(prepared: PreparedData, positions: np.ndarray,
                         horizons: tuple[int, ...], target: str,
                         days: int = None) -> np.ndarray:
@@ -703,68 +673,6 @@ def fuel_level_ratio(prepared: PreparedData, positions: np.ndarray,
     return np.clip(ratio, low, high)
 
 
-def fit_profile_state(prepared: PreparedData, ref_pos: int) -> dict:
-    """工况距离只按训练前缀定标，参数随候选模型冻结。"""
-    prepared.require_training_data()
-    columns = ["d_use_total", "d_use_share_coke", "d_use_share_converter"]
-    values = prepared.frame[columns].iloc[:ref_pos + 1].to_numpy(dtype=float)
-    center = np.nanmedian(values, axis=0)
-    scale = np.nanquantile(values, .75, axis=0) - np.nanquantile(values, .25, axis=0)
-    return {"columns": columns, "center": center.tolist(),
-            "scale": np.maximum(scale, 1e-6).tolist(), "temperature": 1.,
-            "days": C.PROFILE_DAYS, "half_life_days": 14., "minimum_days": 3,
-            "train_end": str(prepared.index[ref_pos])}
-
-
-def state_slot_profile(prepared: PreparedData, positions: np.ndarray,
-                       horizons: tuple[int, ...], target: str, recipe: dict) -> tuple:
-    """按当前与历史同槽位供气状态加权；无足够相似日则回退原画像。"""
-    positions = np.asarray(positions, dtype=int)
-    fallback = target_slot_profile(prepared, positions, horizons, target)
-    result = fallback.copy()
-    count = np.zeros_like(result)
-    age = np.full_like(result, np.nan)
-    distance = np.full_like(result, np.nan)
-    labels = prepared.frame[C.TARGET_COLUMN[target]].to_numpy(dtype=float)
-    process = prepared.frame[recipe["columns"]].to_numpy(dtype=float)
-    state = (process - np.asarray(recipe["center"])) / np.asarray(recipe["scale"])
-    offsets = np.asarray(horizons, dtype=int)
-    for i, origin in enumerate(positions):
-        last_day = _day_reference(int(origin))
-        days = np.arange(max(0, last_day - int(recipe["days"]) + 1), last_day + 1)
-        slots = (origin + offsets) % C.STEPS_PER_DAY
-        indices = days[:, None] * C.STEPS_PER_DAY + slots
-        if len(days) == 0:
-            continue
-        values = labels[indices]
-        valid = np.isfinite(values)
-        count[i] = valid.sum(axis=0)
-        age[i] = np.min(np.where(valid, (origin - indices) / C.STEPS_PER_DAY, np.inf), axis=0)
-        age[i, ~valid.any(axis=0)] = np.nan
-        history = days * C.STEPS_PER_DAY + origin % C.STEPS_PER_DAY
-        usable = np.isfinite(state[history]).all(axis=1) & np.isfinite(state[origin]).all()
-        if usable.sum() < int(recipe["minimum_days"]):
-            continue
-        dist = np.sqrt(np.mean((state[history] - state[origin]) ** 2, axis=1))
-        weights = np.exp(-dist / float(recipe["temperature"])) * np.power(
-            .5, (origin - history) / C.STEPS_PER_DAY / float(recipe["half_life_days"]))
-        weights[~usable] = 0.
-        effective = valid & usable[:, None]
-        w = np.where(effective, weights[:, None], 0.)
-        # 极小有效样本量意味着由单日支配，此时保留保护基线。
-        ess = w.sum(axis=0) ** 2 / np.maximum((w ** 2).sum(axis=0), 1e-12)
-        eligible = (effective.sum(axis=0) >= int(recipe["minimum_days"])) & (ess >= 2.)
-        order = np.argsort(np.where(effective, values, np.inf), axis=0)
-        sorted_values = np.take_along_axis(values, order, axis=0)
-        sorted_weights = np.take_along_axis(w, order, axis=0)
-        median_index = (np.cumsum(sorted_weights, axis=0) < .5 * w.sum(axis=0)).sum(axis=0)
-        median_index = np.minimum(median_index, len(days) - 1)
-        estimate = sorted_values[median_index, np.arange(len(offsets))]
-        result[i, eligible] = estimate[eligible]
-        distance[i] = np.sum(np.where(effective, dist[:, None], 0.) * w, axis=0) / np.maximum(w.sum(axis=0), 1e-12)
-    return result, count, age, distance
-
-
 def last_valid_level(prepared: PreparedData, positions: np.ndarray,
                      target: str) -> np.ndarray:
     level, _ = _last_valid(prepared.frame[C.TARGET_COLUMN[target]])
@@ -783,14 +691,4 @@ def resource_series(prepared: PreparedData) -> pd.DataFrame:
     out["blast"] = frame["d_use_blast"]
     out["coke"] = frame["d_use_coke"]
     out["converter"] = frame["d_use_converter"]
-    return out
-
-
-def surplus_series(prepared: PreparedData) -> pd.DataFrame:
-    """发生量减已知用户/混气的诊断余气，仅用于资源侧误差分析，不直接进优化。"""
-    frame = prepared.frame
-    out = pd.DataFrame(index=prepared.index)
-    out["blast"] = frame["d_surplus_blast"].clip(lower=0)
-    out["coke"] = frame["d_surplus_coke"].clip(lower=0)
-    out["converter"] = frame["d_surplus_converter"].clip(lower=0)
     return out

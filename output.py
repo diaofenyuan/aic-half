@@ -37,7 +37,8 @@ def begin_run(config=C, mode: str = "backtest", experimental: bool = False) -> R
     # 实验复用完整归档链路，但整个目录必须隔离，避免干扰选定运行结果。
     base = config.EXPERIMENT_OUTPUT_ROOT if experimental else config.OUTPUT_ROOT
     root = base / run_id
-    source = root / config.SOURCE_DIR
+    source = ((config.ROOT / "tmp_main" / run_id / config.SOURCE_DIR)
+              if experimental else root / config.SOURCE_DIR)
     models = root / config.MODEL_DIR
     report = root / config.REPORT_DIR
     for path in (root, source, models, report):
@@ -356,14 +357,6 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
                     "kind": resource_nn["kind"], "train_end": resource_nn["train_end"],
                     "max_training_target": resource_nn["max_training_target"], "reload_ok": bool(same)}
                 summary["reload_ok"] &= bool(same)
-    summary["resource_quantile"] = {}
-    if opt_summary.get("availability_mode") == "robust_low":
-        pool = resource_bundle.final_quantile_models if use_final else resource_bundle.quantile_models
-        for label, models in pool.items():
-            info = _save_boosters(ctx.model_dir / "resource" / f"{role}_{label}",
-                                  f"resource_{label}", models, resource_bundle.feature_names, temp_dir)
-            summary["resource_quantile"][label] = info
-            summary["reload_ok"] &= info["reload_ok"]
     if temp_dir.exists():
         if not temp_dir.resolve().is_relative_to(ctx.root.resolve()):
             raise ValueError("临时模型目录超出当次运行路径")
@@ -400,8 +393,6 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
                                                       "control_options", "scope", "promotion")},
                      "heat_rate": resource_bundle.final_heat_rate if use_final else resource_bundle.heat_rate,
                      "gas_caps": resource_bundle.final_gas_caps if use_final else resource_bundle.gas_caps,
-                     "quantile_metrics": (resource_bundle.quantile_metrics
-                                          if opt_summary.get("availability_mode") == "robust_low" else {}),
                      "train_end": resource_bundle.final_train_end if use_final else resource_bundle.train_end,
                      "blocker": resource_bundle.blocker},
         "optimization": opt_summary,
@@ -480,7 +471,7 @@ def write_source_snapshot(ctx: RunContext, config=C) -> dict:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, target)
         copied.append(f"data_cleaning/{path.name}")
-    return {"files": copied, "count": len(copied)}
+    return {"files": copied, "count": len(copied), "directory": str(ctx.source_dir)}
 
 
 def build_zip(ctx: RunContext, submittable: bool, config=C) -> dict:
@@ -490,13 +481,13 @@ def build_zip(ctx: RunContext, submittable: bool, config=C) -> dict:
     members = ["s_result.csv", "l_result.csv"]
     if (ctx.root / "opt_result.csv").is_file():
         members.append("opt_result.csv")
-    paths = [ctx.root / member for member in members]
-    for folder in (config.SOURCE_DIR, config.MODEL_DIR):
-        paths.extend(path for path in sorted((ctx.root / folder).rglob("*"))
-                     if path.is_file() and path.name != ".gitignore")
+    paths = [(ctx.root / member, member) for member in members]
+    for name, folder in ((config.SOURCE_DIR, ctx.source_dir), (config.MODEL_DIR, ctx.model_dir)):
+        paths.extend((path, f"{name}/{path.relative_to(folder).as_posix()}")
+                     for path in sorted(folder.rglob("*")) if path.is_file() and path.name != ".gitignore")
     with ZipFile(temp_path, "w", ZIP_DEFLATED) as packed:
-        for path in C.progress(paths, desc="生成压缩包", unit="文件"):
-            packed.write(path, path.relative_to(ctx.root).as_posix())
+        for path, member in C.progress(paths, desc="生成压缩包", unit="文件"):
+            packed.write(path, member)
     with ZipFile(temp_path) as packed:
         bad = packed.testzip()
         if bad is not None:

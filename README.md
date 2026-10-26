@@ -99,9 +99,8 @@ python main.py verify --run-dir tmp/tmp_outputs/<run_id>
 440 MW，两者之差对应 2×120 MW。短期与长期独立训练、选参和保存，不裁剪长期
 结果冒充短期预测；默认也不将短期结果覆盖长期头部。
 
-当前已归档主模型为 TCN 与 LightGBM/画像的融合。DLinear、其他网络结构及研究
-算子保留为候选，结构存在不表示已经晋级。耗气缺测时读取冻结的少特征/观测分支，
-当前观测完整时使用选定主模型。
+当前已归档主模型为因果 TCN 与 LightGBM/画像的融合，短期专项保留已晋级的
+TSMixer。耗气缺测时读取冻结的少特征/观测分支，观测完整时使用选定主模型。
 
 小机组组短期专项按训练前缀内的早停误差平方倒数聚合原三种子网络，以25%作为
 另一组三种子网络的融合先验；后者保留训练期已观测耗气。当前按缺测前可见历史、
@@ -176,8 +175,7 @@ A/B/C开发窗口的逐折分数均值**，不是测试成绩或官网分数：
 默认采用确定性 `point` 供气模式。每日、每小时和15分钟重规划通过开发回放比较，
 实际采用的间隔与气种替代动作由资源模型归档的 `dispatch_selection` 决定，当前
 归档为15分钟重规划及 `substitute_vent`。库存跨日接续，只有在目标时刻资源实际
-可见后才能执行降载并反馈下一次规划。`robust_low`、库存终端价值等保留为研究
-模式，未经完整晋级验证不替换当前策略。
+可见后才能执行降载并反馈下一次规划。未晋级的鲁棒供气、库存终端价值等实现已移至独立历史研究归档。
 
 计划收入、代理执行收入、历史发电收入和真实气网净效益分别记录；代理释放量也不
 等于现场放散。真实净余气、历史放散和官方罚金缺失时，不计算官方净效益提升率。
@@ -239,53 +237,15 @@ python main.py infer --experiment --reuse-run tmp/tmp_outputs/<已有最终模�
 python main.py verify --run-dir tmp/tmp_outputs/<新运行>
 ```
 
-复用模型的训练截止须早于测试起报点；专项更新还会按入口核对合法截止和冻结配方。
+复用模型的训练截止须早于测试起报点；正式训练只使用已保存的晋级配方。
 归档模型需通过保存重载一致性检查，改变数据、代码或配置后以新运行记录为准。
 
-## 8. 开发与专项入口
+## 8. 实验代码隔离
 
-研究入口服务于整体流水线，结果先在历史开发窗口比较，通过联合门槛后才接入推理。
-专项不使用测试输入选模，不能把 quick、合成基准或已查看窗口当作独立确认。
-
-| 入口/参数 | 用途 |
-|---|---|
-| `--nn-only --nn-span short/long/resource` | 独立神经网络开发；负荷支路的 `--nn-kind` 支持 dlinear、tsmixer、tcn_causal |
-| `--nn-seeds` / `--nn-config` / `--nn-reference` | 多种子、JSON参数覆盖与同折树模型对照 |
-| `--nn-benchmark` / `--nn-reblend` | 合成输入吞吐比较、复用A/B/C预测选择融合 |
-| `--plan-study baseline`、`E1`～`E6` | 重建公平基线，比较时间衰减、工况画像、分量分配、资源与风险策略 |
-| `--plan-study availability/observed` | 耗气缺测适配与起报点设备、分钟观测分支 |
-| `--plan-study generator1/generator1-refine` | 保持总负荷与优化策略的小机组组专项及精修 |
-| `--plan-study deep` | 缺测阶段融合、完整组合前缀折外残差、累计资源误差与完整调度回放 |
-| `--plan-study pressure` | 已查看的10月1～9日分布诊断，不参加晋级 |
-| `--study-resume` | 在原实验目录核验并续跑，完整产物继续保存在该目录 |
-
-表中的斜杠表示择一参数值。常用示例：
-
-```powershell
-python main.py run --experiment --nn-only --nn-span long --nn-kind tcn_causal --folds A,B,C --nn-seeds 3
-python main.py run --experiment --plan-study availability --study-reference tmp/tmp_outputs/<完整方案基线>
-python main.py run --experiment --plan-study observed --study-reference tmp/tmp_outputs/<完整可用性专项>
-python main.py run --experiment --plan-study generator1 --study-reference tmp/tmp_outputs/<完整观测专项>
-python main.py run --experiment --plan-study generator1-refine --study-reference tmp/tmp_outputs/<已核验generator1专项>
-python main.py run --experiment --plan-study deep --study-reference tmp/tmp_outputs/<阶段校准前的完整双网络模型运行>
-python main.py verify --run-dir tmp/tmp_outputs/<已完成专项>
-```
-
-`generator1` 可通过 `--g1-stages G0,G1,G2,G3,G4,G5,G6,G7` 控制阶段；
-`generator1-refine` 默认执行 `reuse,train,normal,seeds,combine`，可用
-`--g1-refine-stages` 配合续跑。网络只在A/B/C内开发，短期与长期分别训练。
-
-`deep` 默认执行 `inner,short,long,resource`，可用 `--deep-stages` 分阶段续跑。
-本轮以已核验的generator1-refine双网络模型为起点，不叠加第二层阶段校准。
-负荷对照需要该最终模型关联专项的A/B/C归档；内层重新训练完整主模型、缺测专家与专项
-分支，校正标签严格早于外层窗口。资源修正保持高炉气与前8步预测不变，历史缓存
-缺失时按冻结配方重建，并完成三折各21天的成对调度回放。已单独完成并核验的资源
-阶段可通过 `--deep-resource-reference` 汇入同配方联合实验。
-
-推理接入已核验专项时，使用 `--availability-study-run` 或
-`--generator1-study-run`；二者可按对应冻结配方训练最终分支。`--nn-study-run`
-须搭配 `--reuse-run`，可按短期、长期多次传入。复用主模型时仅补充必要训练，
-实际分支与参数完整保存，专项预测增益仍须与调度收益分开核验。
+正式入口只保留推理、历史回测及必要检查。历史研究实现、失败候选和旧专项命令已迁入
+`tmp_main/20261026_history_cleanup/原始代码/`，历史实验可通过
+`tmp_main/20261026_history_cleanup/历史实验.py` 独立核验。新实验必须另建 `tmp_main/<experiment_id>/` 保存代码，
+结果写入 `tmp/tmp_outputs/<experiment_id>/`；通过完整晋级验收后只迁入获胜方案必需的实现。
 
 ## 9. 参赛与工程约束
 

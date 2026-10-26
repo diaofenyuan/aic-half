@@ -167,7 +167,6 @@ FUEL_PROXY_WEIGHTS = {"blast": 1.0, "coke": 5.0, "converter": 2.4}
 # ---------------------------------------------------------------------------
 # 特征与模型
 # ---------------------------------------------------------------------------
-FEATURE_SETS = ("gas", "target")
 # 需要做滞后/滚动统计的关键列；其余列只取当前值，控制训练内存。
 FEATURE_WINDOW_COLUMNS = (
     "d_use_total", "d_use_blast", "d_use_coke", "d_use_converter",
@@ -238,17 +237,12 @@ NN_CONFIG = {"look_back": 192, "epochs": 80, "quick_epochs": 8,
              "kind_long": "tcn_causal", "kind_short": "tcn_causal",
              "head_mode": "scaled", "load_history": False,
              "feature_set": "engineered", "training_mask_days": 0, "far_weight": 1.0,
-             "profile_conditions": True, "residual_limit": 0.15,
+             "profile_conditions": True,
              "temporal_norm": "layer", "future_calendar": "cyclic",
              "max_gpu_memory_gib": 15.0,
-             # 画像残差作为研究对照；部署以三 seed 均值降低训练随机性。
+             # 三种子聚合降低训练随机性；实际聚合算子随模型保存。
              "profile_base": "plain", "mape_floor_ratio": 0.02, "n_seeds": 3,
-             # 向画像收缩的先验；开发折未带来改善，默认关闭，保留研究开关。
-             "prior_lambda": 0.0,
-             # 增广未通过本轮受控比较，默认关闭。
-             "aug_noise": 0.0, "aug_channel_drop": 0.0}
-# 默认独立输出；重叠带覆盖只作为在开发折验证过的可选策略，不推断官方要求。
-LONG_HEAD_FROM_SHORT = False
+             }
 # 完整 A/B/C 缺测情景通过后冻结；配方随源码交付，不依赖 tmp 中的实验文件。
 AVAILABILITY_FALLBACK = {
     "short": {"kind": "direct", "features": "gas_no_power", "fallback_weight": 1.,
@@ -286,7 +280,6 @@ SELECTION = {
 }
 
 # 用户于2026-10-25放宽专项平均增益要求；折间保护与总负荷约束保持独立。
-GENERATOR1_GATE = {"normal_gain_pp": .2, "missing_gain_pp": .2, "max_fold_drop_pp": .2}
 GENERATOR1_SPECIALIST = {'short': {'kind': 'refined_nn',
            'base_recipe': {'kind': 'nn',
                            'model_stage': 'G6_specialist_mixer_3seeds',
@@ -386,11 +379,6 @@ GENERATOR1_SPECIALIST = {'short': {'kind': 'refined_nn',
 # 资源预测与发电优化
 # ---------------------------------------------------------------------------
 RESOURCE_NAMES = ("blast", "coke", "converter")
-RESOURCE_LABELS = {
-    "blast": "available_blast_gas",
-    "coke": "available_coke_gas",
-    "converter": "available_converter_gas",
-}
 # converter_1 的量纲与其它流量不一致；用历史“用户+混气+发电耗气 / converter_1”
 # 的中位数反推比例。该值明确标记为 inferred，正式数据字典确认后必须复核。
 CONVERTER_GAS_SCALE = 7043.5
@@ -400,26 +388,12 @@ OPT_CONFIG = {
     "min_load_ratio": 0.60,
     "ramp_fraction_per_min": 0.10,
     "availability_safety": 0.80,   # 预测余气打折，抵消未建模用户与计量误差
-    # 可用气模式：point 为确定性 MILP 基线；robust_low 叠加近期低分位约束。
-    # 历史盲测显示 robust_low 会显著牺牲电价收益且仍无法消除预测误差导致的
-    # 柜位风险，因此默认部署 point，O2 保留为可切换研究模式。
     "availability_mode": "point",
     "gas_safety": {"blast": 1.0, "coke": 1.0, "converter": 1.0},
-    # 在点预测之外再叠加近期同槽位低分位约束，避免只信单条预测路径。
-    "robust_low_quantile": 0.10,
-    "robust_history_days": 14,
-    "robust_headroom": 0.98,
-    # P2：资源分位数预测。p10 供 robust_low 作下行边界，p50 作中位数校验。
-    "resource_quantiles": (0.10, 0.50),
-    # 资源八步网络是否附带 8/32 步气量路径池化；开发折上 coke/converter 的
-    # short WAPE 无一致改善（blast 反而略升），默认关闭，保留为可切换研究开关。
-    "resource_nn_history": False,
     # 计划柜位相对安全区间再留 5% 裕度；回测仍按官方 15%~90% 检查。
     "holder_margin_ratio": 0.05,
     # 日末回到初始柜位，避免计划靠净放空/净充满气柜获得虚假收益。
     "terminal_holder": True,
-    "terminal_policy": "return",
-    "terminal_band_ratio": 0.10,
     "execution_gas_mode": "clip",  # 替代配比须经开发折验证后晋级
     # 仅用于代理溢出的敏感性评价，不能冒充官方放散罚金。
     "evaluation_release_penalties": (0.0, 0.5, 1.0),

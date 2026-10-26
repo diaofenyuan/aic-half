@@ -13,11 +13,11 @@ import numpy as np
 import pandas as pd
 
 import config as C
-from data_cleaning import (PreparedData, build_base_features, target_slot_profile)
+from data_cleaning import PreparedData, build_base_features
 import main_nn
 from main_s import (_fold_positions, _predict_models, _train_models,
                     baseline_cubes, blend_cube, effective_model_name,
-                    enforce_physics, score_cube, select_blend, select_candidate, truth_cube,
+                    enforce_physics, score_cube, select_candidate, truth_cube,
                     evaluate_blended_candidates, select_nn_tree_weights, apply_availability_fallback,
                     train_availability_fallback)
 
@@ -37,7 +37,7 @@ class LongBundle:
     models: dict
     final_models: dict
     feature_names: list[str]
-    # NN 支路：浅层 DLinear 为长周期主力候选；kind 含 'dlinear' 时启用。
+    # 长期网络按已晋级的因果 TCN 配方独立训练。
     nn_bundle: object | None = None
     final_nn_bundle: object | None = None
     nn_weights: dict = field(default_factory=dict)
@@ -89,7 +89,7 @@ def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -
                 {**fold, "role": "confirm", "name": fold["name"] + "_val"}]
         # 开发预算逐层传递；quick 的分数只用于链路和候选初筛。
         nb = main_nn.train_nn(prepared, solo,
-                              kind=str(C.NN_CONFIG.get("kind_long", "dlinear")),
+                              kind=str(C.NN_CONFIG.get("kind_long", "tcn_causal")),
                               horizons=C.HORIZONS_L, quick=quick,
                               n_seeds=int(C.NN_CONFIG.get("n_seeds", 1)))
         pred = main_nn.predict_nn(nb, item["prepared"], item["prepared"].index[item["eval"]])
@@ -176,7 +176,7 @@ def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -
         solo = [{**confirm_fold, "role": "tuning"},
                 {**confirm_fold, "role": "confirm", "name": "val"}]
         nn_c = main_nn.train_nn(prepared, solo,
-                                kind=str(C.NN_CONFIG.get("kind_long", "dlinear")),
+                                kind=str(C.NN_CONFIG.get("kind_long", "tcn_causal")),
                                 horizons=C.HORIZONS_L, quick=quick,
                                 n_seeds=int(C.NN_CONFIG.get("n_seeds", 1)))
         nn_pred = main_nn.predict_nn(nn_c, confirm_masked,
@@ -215,7 +215,7 @@ def train_long(prepared: PreparedData, folds: list[dict], quick: bool = False) -
         all_folds = [{"name": "final", "role": "tuning",
                       "train_end": str(valid.index[-1])}]
         nn_final = main_nn.train_nn(prepared, all_folds,
-                                    kind=str(C.NN_CONFIG.get("kind_long", "dlinear")),
+                                    kind=str(C.NN_CONFIG.get("kind_long", "tcn_causal")),
                                     horizons=C.HORIZONS_L, quick=quick,
                                     n_seeds=int(C.NN_CONFIG.get("n_seeds", 1)))
         if chosen["kind"] == "nn_lgb_ens":
