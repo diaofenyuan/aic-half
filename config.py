@@ -448,9 +448,9 @@ OPT_CONFIG = {
     # 2026-10-26 统一答复：datetime 为调度指令生效时刻，与长期预测目标时刻对齐。
     "datetime_semantics": "target_time",
     "datetime_semantics_confirmed": True,
-    # 最新答复要求时间列与长期表一致，首点由前一刻起报生成，日内计划不刷新。
+    # 按真实业务班次固定07:00发布，首尾部分窗口仍覆盖长期表的全部时间点。
     "publication_mode": "daily_fixed",
-    "publication_lead_steps": 1,
+    "publication_time": "07:00",
     "price_file": "first_train/price.xlsx",
     "price_unit": "CNY_per_kWh",
 }

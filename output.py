@@ -133,6 +133,39 @@ def expected_result_grid(name: str, origins=None, quick: bool = False) -> pd.Dat
     return grid
 
 
+def validate_publication_contract(meta: dict, grid) -> dict:
+    """核对新归档的实际发布窗口；历史包未声明该扩展契约时保留兼容读取。"""
+    clock = meta.get("output_contract", {}).get("optimization_publication_time")
+    if clock is None:
+        return {"passed": True, "checked": False, "problems": []}
+    from main_opt import daily_publication_times
+    problems = []
+    try:
+        grid = pd.DatetimeIndex(grid)
+        expected = daily_publication_times(grid, publication_time=clock)
+        summary = meta.get("optimization", {})
+        plans = summary.get("daily_plans", [])
+        issues = pd.DatetimeIndex([p["issued_at"] for p in plans])
+        if not issues.equals(expected) or summary.get("publication_time") != clock:
+            problems.append("每日实际发布时间与归档契约不一致")
+        for plan, issue in zip(plans, issues):
+            effective = pd.date_range(issue + pd.Timedelta(minutes=C.STEP_MINUTES),
+                periods=C.STEPS_PER_DAY, freq=f"{C.STEP_MINUTES}min")
+            visible = effective.intersection(grid)
+            if plan.get("steps") != C.STEPS_PER_DAY or plan.get("published_steps") != len(visible):
+                problems.append("每日窗口长度或首尾提交范围不一致")
+        resource = meta["resource"]
+        ends = [resource["train_end"], resource.get("heat_rate", {}).get("calibration_end")]
+        recorded = summary.get("resource_publication_check", {})
+        ends.extend(recorded.get("training_ends", {}).values())
+        if (not len(expected) or not recorded.get("passed")
+                or any(pd.isna(pd.Timestamp(v)) or pd.Timestamp(v) > expected[0] for v in ends if v is not None)):
+            problems.append("资源权重或标定参数晚于首份计划发布时刻")
+    except (KeyError, TypeError, ValueError) as exc:
+        problems.append("每日发布契约无效: " + str(exc))
+    return {"passed": not problems, "checked": True, "problems": list(dict.fromkeys(problems))}
+
+
 def validate_official_frame(name: str, frame: pd.DataFrame, expected_grid=None) -> dict:
     """按赛题字段契约校验预测/优化宽表，问题不静默放过。"""
     kind = {"s_result.csv": "s", "l_result.csv": "l",
@@ -490,7 +523,9 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
                             "optimization": _grid_spec(ctx.optimization_grid),
                             "optimization_coverage_basis": "same_datetime_as_long_forecast; daily_fixed_publication",
                             "window": ctx.window,
-                            "optimization_time_semantics": C.OPT_CONFIG["datetime_semantics"]},
+                            "optimization_time_semantics": C.OPT_CONFIG["datetime_semantics"],
+                            "optimization_publication_time": opt_summary.get("publication_time"),
+                            "resource_publication_check": opt_summary.get("resource_publication_check")},
         "source": write_source_snapshot(ctx),
         "short": forecast_meta(short_bundle), "long": forecast_meta(long_bundle),
         "resource": {"metrics": resource_bundle.metrics,
@@ -500,7 +535,7 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
                                         for k in ("gases", "weight", "horizons", "method")},
                      "dispatch_selection": {k: resource_bundle.dispatch_selection.get(k)
                                             for k in ("chosen", "candidate", "replan_steps",
-                                                      "control_options", "scope", "promotion")},
+                                                      "control_options", "scope", "promotion", "publication_time")},
                      "heat_rate": resource_bundle.final_heat_rate if use_final else resource_bundle.heat_rate,
                      "gas_caps": resource_bundle.final_gas_caps if use_final else resource_bundle.gas_caps,
                      "train_end": resource_bundle.final_train_end if use_final else resource_bundle.train_end,
@@ -511,6 +546,10 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
         "data_contract": {"target_mask": "整个评测窗口", "step_minutes": C.STEP_MINUTES,
                           "future_dynamic_fields": "forbidden"},
     }
+    if ctx.optimization_grid is not None:
+        publication = validate_publication_contract(meta, ctx.optimization_grid)
+        if not publication["passed"]:
+            raise ValueError("模型归档的每日发布契约不一致: " + "; ".join(publication["problems"]))
     (ctx.model_dir / "model_meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
     return summary

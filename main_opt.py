@@ -30,6 +30,41 @@ def load_resource_model(text: str):
     return lgb.Booster(model_str=text)
 
 
+def daily_publication_times(origins, quick: bool = False, publication_time: str | None = None) -> pd.DatetimeIndex:
+    """生效时刻归属最近一次已发布计划；发布当刻仍执行上一份计划的末步。"""
+    grid = pd.DatetimeIndex(origins)
+    if quick:
+        grid = grid[:2 * C.STEPS_PER_DAY]
+    clock = publication_time if publication_time is not None else C.OPT_CONFIG["publication_time"]
+    if not isinstance(clock, str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):(?:00|15|30|45)", clock):
+        raise ValueError("每日发布时间必须为15分钟网格上的HH:MM")
+    hour, minute = (int(v) for v in clock.split(":"))
+    boundaries = grid.normalize() + pd.Timedelta(hours=hour, minutes=minute)
+    issued = boundaries.where(grid > boundaries, boundaries - pd.Timedelta(days=1))
+    return issued.unique().sort_values()
+
+
+def resource_publication_check(bundle, first_issue, use_final: bool = False) -> dict:
+    """资源权重、耗气转换及网络必须在最早发布时刻前冻结，复用旧包同样检查。"""
+    end = bundle.final_train_end if use_final else bundle.train_end
+    heat = bundle.final_heat_rate if use_final else bundle.heat_rate
+    neural = bundle.final_resource_nn if use_final else bundle.resource_nn
+    sources = {"resource_model": end}
+    if heat.get("calibration_end") is not None:
+        sources["gas_to_power"] = heat["calibration_end"]
+    if neural is not None:
+        sources["resource_nn"] = neural.get("train_end")
+    problems = []
+    for name, value in sources.items():
+        try:
+            timestamp = pd.Timestamp(value) if value is not None else pd.NaT
+            if pd.isna(timestamp) or timestamp > pd.Timestamp(first_issue):
+                problems.append(f"{name}训练截止{value}晚于首份计划发布时刻{first_issue}，或缺少截止记录")
+        except (TypeError, ValueError):
+            problems.append(f"{name}训练截止记录无效: {value}")
+    return {"passed": not problems, "first_issue": str(first_issue), "training_ends": sources, "problems": problems}
+
+
 @dataclass
 class ResourceBundle:
     models: dict
@@ -827,6 +862,11 @@ def train_resources(prepared: PreparedData, folds: list[dict],
         confirm["start"],
         pd.Timestamp(confirm["start"]) + pd.Timedelta(days=int(confirm["days"])))
     positions, eval_positions, ref_pos = _resource_positions(masked, confirm, quick)
+    first_issue = daily_publication_times(masked.index[eval_positions], quick=quick)[0]
+    ref_pos = min(ref_pos, int(prepared.index.get_indexer([first_issue])[0]))
+    if ref_pos < 0:
+        raise ValueError("资源确认折缺少首份每日计划的发布时刻")
+    positions = positions[positions + max(C.HORIZONS_L) <= ref_pos]
     num_round = C.LGBM_TREES_QUICK if quick else C.LGBM_TREES_LONG
     selection = _resource_oof(prepared, folds, quick, num_round)
     logging.getLogger("aic-half").info("资源头=%s，融合权重=%s，控制候选=%s",
@@ -1601,7 +1641,7 @@ def optimize_rolling(resource_forecast: np.ndarray, prepared: PreparedData,
 def optimize_daily(prepared: PreparedData, origins: pd.DatetimeIndex,
                    resource_bundle: ResourceBundle, quick: bool = False,
                    use_final: bool = False) -> dict:
-    """每天提前一刻发布完整计划；日内观测只参与事后诊断，不刷新已发布值。"""
+    """按业务时刻发布96步计划，首尾裁取提交网格，日内不刷新指令。"""
     grid = pd.DatetimeIndex(origins)
     if quick:
         grid = grid[:2 * C.STEPS_PER_DAY]
@@ -1610,12 +1650,19 @@ def optimize_daily(prepared: PreparedData, origins: pd.DatetimeIndex,
             or not grid.equals(pd.date_range(grid[0], periods=len(grid), freq="15min"))):
         return {"status": "BLOCKED_OPT", "schedule": None,
                 "summary": {"reason": "每日固定发布要求完整、连续的自然日网格"}}
-    days = grid[::C.STEPS_PER_DAY]
-    issue_times = days - pd.Timedelta(minutes=C.STEP_MINUTES)
+    try:
+        issue_times = daily_publication_times(grid)
+    except ValueError as exc:
+        return {"status": "BLOCKED_OPT", "schedule": None, "summary": {"reason": str(exc)}}
     positions = prepared.index.get_indexer(issue_times)
     if (positions < 0).any():
         return {"status": "BLOCKED_OPT", "schedule": None,
-                "summary": {"reason": "缺少每日首点指令提前生成所需的历史起报点"}}
+                "summary": {"reason": "缺少每日计划发布时刻所需的历史起报点"}}
+    publication_check = resource_publication_check(resource_bundle, issue_times[0], use_final)
+    if not publication_check["passed"]:
+        return {"status": "BLOCKED_OPT", "schedule": None,
+                "summary": {"reason": "; ".join(publication_check["problems"]),
+                            "resource_publication_check": publication_check}}
     heat = resource_bundle.final_heat_rate if use_final else resource_bundle.heat_rate
     caps = resource_bundle.final_gas_caps if use_final else resource_bundle.gas_caps
     if not heat.get("ok"):
@@ -1634,7 +1681,9 @@ def optimize_daily(prepared: PreparedData, origins: pd.DatetimeIndex,
     cfg = SimpleNamespace(**vars(C))
     cfg.OPT_CONFIG = {**C.OPT_CONFIG, "solver_time_limit_s": 5.}
     cap_vector = np.array([caps[g] for g in C.RESOURCE_NAMES])
-    for day, issue, pos, avail in zip(days, issue_times, positions, forecast):
+    submitted_initial_holder = submitted_terminal_holder = None
+    for issue, pos, avail in zip(issue_times, positions, forecast):
+        day = issue + pd.Timedelta(minutes=C.STEP_MINUTES)
         price = _price_vector(prices, day, C.STEPS_PER_DAY)
         result = _solve_day(avail, price, holder, previous, cap_vector, heat, cfg)
         if result["status"] not in ("OPTIMAL", "FEASIBLE_TIMEOUT"):
@@ -1643,34 +1692,51 @@ def optimize_daily(prepared: PreparedData, origins: pd.DatetimeIndex,
         if result["status"] not in ("OPTIMAL", "FEASIBLE_TIMEOUT", "FALLBACK_SAFE"):
             return {"status": "BLOCKED_OPT", "schedule": None,
                     "summary": {"reason": result.get("message", result["status"]), "failed_day": str(day)}}
-        plans.append({"day": str(day.date()), "issued_at": str(issue), "steps": C.STEPS_PER_DAY,
+        effective = pd.date_range(day, periods=C.STEPS_PER_DAY, freq=f"{C.STEP_MINUTES}min")
+        published = effective[(effective >= grid[0]) & (effective <= grid[-1])]
+        plans.append({"day": str(issue.date()), "issued_at": str(issue), "steps": C.STEPS_PER_DAY,
+                      "effective_start": str(effective[0]), "effective_end": str(effective[-1]),
+                      "published_steps": len(published),
+                      "published_start": str(published[0]), "published_end": str(published[-1]),
                       "validation": result["validation"], "solver_status": result["status"],
                       "initial_holder_m3": holder, "terminal_holder_m3": float(result["holder"][-1])})
         for k in range(C.STEPS_PER_DAY):
+            when = effective[k]
+            if when < grid[0] or when > grid[-1]:
+                continue
             power, gas = result["power"][:, k], result["gas"][:, k]
+            if submitted_initial_holder is None:
+                submitted_initial_holder = float(result["holder"][k - 1]) if k else holder
+            submitted_terminal_holder = float(result["holder"][k])
             if records:
                 for value, prior, (_, limit) in zip((power[:4].sum(), power.sum()), records[-1][-2:], _aggregate_ramp_groups(cfg)):
                     if abs(float(value) - prior) > limit + cfg.OPT_CONFIG["power_tolerance_mw"]:
                         return {"status": "BLOCKED_OPT", "schedule": None,
                                 "summary": {"reason": "每日发布计划的聚合爬坡衔接冲突", "failed_day": str(day)}}
-            records.append([day + pd.Timedelta(minutes=k * C.STEP_MINUTES), *gas, power[:4].sum(), power.sum()])
+            records.append([when, *gas, power[:4].sum(), power.sum()])
         holder, previous = float(result["holder"][-1]), result["power"][:, -1].copy()
     schedule = pd.DataFrame(records, columns=["datetime", "opt_generator_use_blast_furnace_gas",
         "opt_generator_use_coke_gas", "opt_generator_use_converter_gas", "opt_generator_1", "opt_generator_all"])
     times = pd.DatetimeIndex(schedule.datetime)
+    if not times.equals(grid):
+        return {"status": "BLOCKED_OPT", "schedule": None,
+                "summary": {"reason": "每日计划未完整覆盖长期预测时间网格"}}
     metrics = _dispatch_metrics(times, schedule.opt_generator_all.to_numpy(), prices)
     return {"status": "SIMULATED_NOT_SUBMITTABLE", "submittable": False, "schedule": schedule,
         "summary": {"status": "SIMULATED_NOT_SUBMITTABLE", "resource_mode": "historical_consumption_envelope",
             "dispatch_mode": "daily_fixed", "daily_publications": len(plans), "daily_plans": plans,
+            "publication_time": C.OPT_CONFIG["publication_time"], "publication_schedule_passed": True,
+            "resource_publication_check": publication_check,
             "plan_feasible": True, "plan_validation_passed": True, "physical_feasibility_certified": False,
             "forecast_uses_historical_holder": False, "planned_steps": len(schedule),
-            "initial_holder_m3": holder0, "terminal_holder_m3": holder,
+            "initial_holder_m3": submitted_initial_holder, "terminal_holder_m3": submitted_terminal_holder,
+            "initial_planning_holder_m3": holder0, "terminal_planning_holder_m3": holder,
             "planned_metrics": metrics, "planned_revenue_cny": metrics["generation_revenue_cny"],
             "planned_generation_mwh": metrics["generation_mwh"],
             "time_semantics": "target_time; daily instructions issued before the first effective timestamp",
             "coverage_basis": "same_datetime_as_long_forecast", "intraday_refresh": False,
             "physical_validation": (resource_bundle.final_physical_validation if use_final else resource_bundle.physical_validation),
-            "note": "每日计划固定发布；库存连续接续预测计划，不把历史柜位重置为优化后的真实状态。"}}
+            "note": "每日计划固定发布；首尾窗口外计划只参与模型内状态衔接，不计提交收益；库存连续接续，不用历史柜位每日重置。"}}
 
 
 def optimize(resource_forecast: np.ndarray, prepared: PreparedData,
@@ -1685,5 +1751,5 @@ def optimize(resource_forecast: np.ndarray, prepared: PreparedData,
                 "summary": {"reason": resource_bundle.blocker}}
     resource_bundle.dispatch_selection = {"chosen": "daily_fixed", "replan_steps": C.STEPS_PER_DAY,
         "scope": "official_daily_publication_requirement_20261026", "intraday_refresh": False,
-        "issue_lead_steps": 1, "coverage_basis": "same_datetime_as_long_forecast"}
+        "publication_time": C.OPT_CONFIG["publication_time"], "coverage_basis": "same_datetime_as_long_forecast"}
     return optimize_daily(prepared, origins, resource_bundle, quick=quick, use_final=use_final)

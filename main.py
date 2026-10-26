@@ -161,6 +161,9 @@ def run_verify(directory: Path | None = None) -> int:
                     problems.append("模型元数据中的优化覆盖契约不一致")
                 if contract.get("optimization_time_semantics") != C.OPT_CONFIG["datetime_semantics"]:
                     problems.append("优化时间语义与当前实现不一致")
+                publication = output.validate_publication_contract(meta,
+                    output.expected_result_grid("opt_result.csv", origins, quick))
+                problems.extend(publication["problems"])
             elif opt_spec is not None:
                 problems.append("缺少元数据中声明的优化结果")
         coverage = output.validate_result_files(directory, origins, quick)
@@ -299,6 +302,10 @@ def run_infer(quick: bool = False, experimental: bool = False,
             pd.Timestamp(C.TRAIN_END), origins[0] - pd.Timedelta(minutes=C.STEP_MINUTES)))
         LOGGER.info("训练白名单: %s .. %s；半决赛测试输入仅用于冻结模型推理",
                     training.index[0], training.index[-1])
+        first_issue = main_opt.daily_publication_times(origins, quick=quick)[0]
+        resource_training = training.prefix_copy(min(training.index[-1], first_issue))
+        LOGGER.info("每日%s发布；资源训练截止=%s，首份计划发布=%s",
+                    C.OPT_CONFIG["publication_time"], resource_training.index[-1], first_issue)
         stages.update(1)
         if reuse_run is None:
             folds = build_folds(training, quick=quick)
@@ -309,7 +316,7 @@ def run_infer(quick: bool = False, experimental: bool = False,
             long_bundle = main_l.train_long(training, folds, quick=quick)
             stages.update(1)
             stages.set_description("推理 · 资源训练")
-            resource_bundle = main_opt.train_resources(training, folds, quick=quick)
+            resource_bundle = main_opt.train_resources(resource_training, folds, quick=quick)
             stages.update(1)
         else:
             stages.set_description("推理 · 复用模型与冻结 NN")
@@ -317,6 +324,9 @@ def run_infer(quick: bool = False, experimental: bool = False,
             for bundle in (short_bundle, long_bundle, resource_bundle):
                 if pd.Timestamp(bundle.final_train_end) >= origins[0]:
                     raise ValueError("复用模型的训练截止点不得进入推理窗口")
+            publication_check = main_opt.resource_publication_check(resource_bundle, first_issue, use_final=True)
+            if not publication_check["passed"]:
+                raise ValueError("复用资源模型不满足每日发布时间边界：" + "; ".join(publication_check["problems"]))
             summary["reused_models_from"] = str(reuse_run.resolve())
             summary["validation_scope"] = "复用已有最终模型；神经网络按A/B/C冻结晋级，未评估D"
             stages.update(3)
@@ -375,6 +385,8 @@ def run_infer(quick: bool = False, experimental: bool = False,
             "status": "SUCCESS_INFER" if window == "half_test" else "SUCCESS_DRYRUN",
             "window": window,
             "data_usage": {"training_range": [str(training.index[0]), str(training.index[-1])],
+                           "resource_training_range": [str(resource_training.index[0]), str(resource_training.index[-1])],
+                           "first_dispatch_issue": str(first_issue),
                            "training_stages": list(training.stage_ranges),
                            "official_test_training_used": False,
                            "test_usage": ("frozen_model_official_inference" if window == "half_test"

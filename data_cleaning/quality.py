@@ -706,16 +706,32 @@ def _daily_publication_check() -> dict:
     origins = prepared.index[192:384]
     heat = {"ok": True, "coefficients_mw_per_m3h": {"blast": .000346, "coke": .0019, "converter": .00059}}
     caps = {"blast": 1.2e6, "coke": 1e5, "converter": 1e5}
-    bundle = main_opt.ResourceBundle({}, {}, [], heat_rate=heat, gas_caps=caps)
-    with patch.object(main_opt, "forecast_resources", return_value=np.tile([8e5, 3e4, 7e4], (2, 96, 1))) as forecast, \
+    bundle = main_opt.ResourceBundle({}, {}, [], heat_rate=heat, gas_caps=caps,
+        train_end=str(prepared.index[100]))
+    expected_issues = pd.date_range("2025-01-02 07:00", periods=3, freq="D")
+    with patch.dict(C.OPT_CONFIG, {"publication_time": "07:00"}), \
+            patch.object(main_opt, "forecast_resources", return_value=np.tile([8e5, 3e4, 7e4], (3, 96, 1))) as forecast, \
             patch.object(main_opt, "load_prices", return_value={1: np.ones(96)}):
         result = main_opt.optimize_daily(prepared, origins, bundle)
     if result.get("schedule") is None:
         return {"passed": False, "reason": result.get("summary")}
     frame = result["schedule"]
     issues = forecast.call_args.args[2]
-    checks = {"one_plan_per_natural_day": result["summary"]["daily_publications"] == 2,
-        "issued_before_first_effective_time": issues.equals(origins[::96] - pd.Timedelta(minutes=15)),
+    full_grid = pd.date_range(C.OFFICIAL_EVAL_START, C.OFFICIAL_EVAL_END, freq="15min")
+    full_issues = main_opt.daily_publication_times(full_grid, publication_time="07:00")
+    bundle.train_end = "2025-01-02 07:15"
+    with patch.dict(C.OPT_CONFIG, {"publication_time": "07:00"}), patch.object(main_opt, "forecast_resources") as late_forecast:
+        late = main_opt.optimize_daily(prepared, origins, bundle)
+    bundle.train_end = str(prepared.index[100])
+    bundle.resource_nn = {"train_end": "2025-01-02 07:15"}
+    late_nn = main_opt.resource_publication_check(bundle, expected_issues[0])
+    checks = {"one_plan_per_business_day": result["summary"]["daily_publications"] == 3,
+        "business_issue_times": issues.equals(expected_issues),
+        "full_window_including_edges": (len(full_issues) == 22 and full_issues[0] == pd.Timestamp("2025-10-10 07:00")
+            and full_issues[-1] == pd.Timestamp("2025-10-31 07:00")),
+        "edge_window_counts": [p["published_steps"] for p in result["summary"]["daily_plans"]] == [29, 96, 67],
+        "late_training_rejected_before_forecast": late["status"] == "BLOCKED_OPT" and not late_forecast.called,
+        "late_resource_nn_rejected": not late_nn["passed"],
         "same_grid_as_long_forecast": expected_result_grid("opt_result.csv", origins).equals(origins),
         "no_intraday_refresh": result["summary"]["intraday_refresh"] is False,
         "continuous_constraints": validate_official_frame("opt_result.csv", frame, origins)["passed"],
