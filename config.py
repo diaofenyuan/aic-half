@@ -428,7 +428,7 @@ OPT_CONFIG = {
     "holder_margin_ratio": 0.05,
     # 日末回到初始柜位，避免计划靠净放空/净充满气柜获得虚假收益。
     "terminal_holder": True,
-    "execution_gas_mode": "clip",  # 替代配比须经开发折验证后晋级
+    "execution_gas_mode": "substitute_vent",  # 完整A/B/C每日回放通过，仅用于事后代理执行诊断
     # 仅用于代理溢出的敏感性评价，不能冒充官方放散罚金。
     "evaluation_release_penalties": (0.0, 0.5, 1.0),
     "gas_cap_quantile": 0.995,
@@ -468,6 +468,12 @@ OPT_CONFIG = {
     # 按真实业务班次固定07:00发布，首尾部分窗口仍覆盖长期表的全部时间点。
     "publication_mode": "daily_fixed",
     "publication_time": "07:00",
+    # A/B/C完整每日回放通过：留跨日库存及末步可达裕度；已知耗气仅在发布时间使用。
+    "daily_terminal_inventory_m3": 140000.,
+    "daily_terminal_power_cap_mw": 200.,
+    "daily_base_power_cap_mw": 240.,
+    "daily_max_power_cap_mw": 280.,
+    "daily_observed_fuel_ratio": .8,
     "price_file": "first_train/price.xlsx",
     "price_unit": "CNY_per_kWh",
 }

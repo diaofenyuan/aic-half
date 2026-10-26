@@ -406,8 +406,10 @@ def _optimizer_contract_check() -> dict:
     cfg.OPT_CONFIG = {**C.OPT_CONFIG, "execution_gas_mode": "substitute"}
     request = np.array([50., 50., 50., 50., 0., 0.])
     mapping = {"coefficients_mw_per_m3h": {"blast": .0004, "coke": .002, "converter": .0006}}
+    clip_config = SimpleNamespace(**vars(C))
+    clip_config.OPT_CONFIG = {**C.OPT_CONFIG, "execution_gas_mode": "clip"}
     clipped = _execute_proxy_step(request, np.array([4.375e5, 1.25e4, 0.]),
-        np.array([6e5, 0., 0.]), 1e5, request, caps, mapping)
+        np.array([6e5, 0., 0.]), 1e5, request, caps, mapping, clip_config)
     substituted = _execute_proxy_step(request, np.array([4.375e5, 1.25e4, 0.]),
         np.array([6e5, 0., 0.]), 1e5, request, caps, mapping, cfg)
     recovered = (substituted["shortfall_mwh"] < clipped["shortfall_mwh"]
@@ -728,6 +730,9 @@ def _daily_publication_check() -> dict:
     missing = copy.deepcopy(metadata)
     missing["resource"]["heat_rate"] = {}
     missing_rejected = not output.validate_publication_contract(missing, origins)["passed"]
+    changed_control = copy.deepcopy(metadata)
+    changed_control["optimization"]["daily_plans"][0]["control"]["total_power_cap_mw"] = 440.
+    control_rejected = not output.validate_publication_contract(changed_control, origins)["passed"]
     full_grid = pd.date_range(C.OFFICIAL_EVAL_START, C.OFFICIAL_EVAL_END, freq="15min")
     full_issues = main_opt.daily_publication_times(full_grid, publication_time="07:00")
     bundle.train_end = "2025-01-02 07:15"
@@ -746,6 +751,7 @@ def _daily_publication_check() -> dict:
         "archive_publication_contract": publication_ok,
         "archive_effective_time_tamper_rejected": changed_rejected,
         "archive_missing_calibration_cutoff_rejected": missing_rejected,
+        "archive_daily_control_tamper_rejected": control_rejected,
         "same_grid_as_long_forecast": expected_result_grid("opt_result.csv", origins).equals(origins),
         "no_intraday_refresh": result["summary"]["intraday_refresh"] is False,
         "continuous_constraints": validate_official_frame("opt_result.csv", frame, origins)["passed"],
@@ -824,6 +830,51 @@ def _frozen_final_training_check() -> dict:
     return {"passed": all(checks.values()), **checks}
 
 
+def _daily_repair_check() -> dict:
+    """核验冻结控制的观测边界、分组守恒及独立末端约束。"""
+    import copy
+    import main_opt
+    heat = {"ok": True, "coefficients_mw_per_m3h": {"blast": .000346, "coke": .0019, "converter": .00059}}
+    missing, missing_control = main_opt.daily_plan_config(100000., [np.nan, 20000., 30000.], heat)
+    known, known_control = main_opt.daily_plan_config(100000., [900000., 30000., 70000.], heat)
+    avail = np.tile([800000., 30000., 70000.], (8, 1))
+    initial = np.array([30., 30., 30., 30., 72., 72.])
+    caps = np.array([1.2e6, 1e5, 1e5])
+    result = main_opt._solve_day(avail, np.ones(8), 100000., initial, caps, heat, known)
+    if result["status"] not in ("OPTIMAL", "FEASIBLE_TIMEOUT"):
+        return {"passed": False, "reason": result.get("message")}
+    allocation = main_opt.allocate_group_gas(result["power"], result["gas"], heat)
+    target = float(known.OPT_CONFIG["terminal_inventory_m3"])
+    bad = copy.deepcopy(result)
+    bad["power"][:, -1] *= 2.
+    rejected = not main_opt.validate_day(bad, avail, 100000., initial, caps, heat, known)["passed"]
+    bad_gas = result["gas"].copy()
+    bad_gas[0, 0] += 10000.
+    try:
+        main_opt.allocate_group_gas(result["power"], bad_gas, heat)
+        fuel_rejected = False
+    except ValueError:
+        fuel_rejected = True
+    checks = {"missing_gas_preserved_with_base_cap": missing_control["total_power_cap_mw"] == 240.
+                and not missing_control["observed_power_gas_available"],
+              "known_gas_cap_bounded": 240. <= known_control["total_power_cap_mw"] <= 280.,
+              "group_fuel_conservation": allocation["validation"]["passed"]
+                and np.allclose(allocation["group_gas_m3h"].sum(axis=0), result["gas"]),
+              "terminal_inventory_reserve": abs(result["holder"][-1] - target) < 1.,
+              "terminal_load_reachable": result["power"][:, -1].sum() <= 200. + 1e-4,
+              "terminal_tamper_rejected": rejected, "fuel_allocation_tamper_rejected": fuel_rejected}
+    synthetic = _synthetic_prepared(480)
+    synthetic.frame[C.GAS_HOLDER["column"]] = 100000.
+    synthetic.frame["gas_holder_blast_furnace_gas_holder_1"] = 21.
+    evidence = main_opt.build_physical_validation(synthetic, 400, heat)
+    first_holder = evidence["holder_mapping"]["columns"]["gas_holder_blast_furnace_gas_holder_1"]
+    checks["unknown_holder_unit_not_misclassified_as_low_inventory"] = (
+        first_holder["raw_unit_verified"] is False and first_holder["inside_official_safety_fraction"] is None)
+    checks["raw_converter_not_an_energy_coefficient"] = evidence["converter_units"]["empirical_conversion_uses_raw_generation_scale"] is False
+    checks = {name: bool(value) for name, value in checks.items()}
+    return {"passed": all(checks.values()), **checks}
+
+
 def run_self_checks(config=C) -> dict:
     checks = {
         "stage_isolation": _stage_isolation_check(),
@@ -840,6 +891,7 @@ def run_self_checks(config=C) -> dict:
         "optimizer_contract": _optimizer_contract_check(),
         "rolling_causality": _rolling_causality_check(),
         "daily_publication": _daily_publication_check(),
+        "daily_repair": _daily_repair_check(),
         "execution_tracking": _execution_tracking_check(),
         "long_process_expert": _process_expert_check(),
         "power_gas_availability": _power_gas_availability_check(),

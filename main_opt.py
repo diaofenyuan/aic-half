@@ -234,8 +234,11 @@ def build_physical_validation(prepared, end_pos, heat_rate):
         "flow_units_confirmed": True, "flow_unit_basis": "official_standard_m3_per_hour_for_generator_consumption",
         "usable_for_empirical_conversion": mapping_ok,
         "aggregate_mapping_passed": mapping_ok, "generator_1_mapping_passed": False,
+        "group_power_semantics": "controllable_group_gas_allocation; not_unique_regression_from_total_gas",
+        "planned_allocation_validation": "recorded_per_daily_plan_after_solving",
+        "separate_group_efficiency_measured": False,
         "official_model_trigger": "load_deviation_correction_or_missing_load_inference",
-        "reason": ("总负荷经验映射已核验，但四台50MW机组的独立气电映射尚未通过跨期验证"
+        "reason": ("总负荷经验映射已核验；分组供气按控制量闭合，两组独立效率缺少观测，仍为共享经验效率假设"
                    if mapping_ok else "经验气电映射未通过训练内留出核验")}
 
     holders = {}
@@ -247,10 +250,11 @@ def build_physical_validation(prepared, end_pos, heat_rate):
         high = capacity * C.GAS_HOLDER["safe_high_ratio"] if capacity is not None else None
         holders[col] = {**_physical_stats(x), "capacity_m3": capacity,
             "safe_low_m3": low, "safe_high_m3": high, "deployed": col == C.GAS_HOLDER["column"],
+            "raw_unit_verified": col == C.GAS_HOLDER["column"],
             "inside_capacity_fraction": float(np.mean((x[valid] >= 0.) & (x[valid] <= capacity)))
-            if valid.any() and capacity is not None else None,
+            if valid.any() and capacity is not None and col == C.GAS_HOLDER["column"] else None,
             "inside_official_safety_fraction": float(np.mean((x[valid] >= low) & (x[valid] <= high)))
-            if valid.any() and capacity is not None else None}
+            if valid.any() and capacity is not None and col == C.GAS_HOLDER["column"] else None}
     column = C.GAS_HOLDER["column"]
     capacity = C.GAS_HOLDER["capacity_by_column_m3"].get(column)
     holder_ok = (column == "gas_holder_blast_furnace_gas_holder_2" and capacity == C.GAS_HOLDER["capacity_m3"]
@@ -266,7 +270,9 @@ def build_physical_validation(prepared, end_pos, heat_rate):
         "reason": ("2号柜映射已核验；1号柜单位与状态不可用，无法证明两座独立气柜均满足安全区间"
                    if holder_ok else "实际部署气柜的容量、量级或数值范围核验未通过"),
         "holder_1_scale_verified": False,
-        "holder_1_deployed": False}
+        "holder_1_deployed": False,
+        "holder_1_absolute_status": "unknown_unit; cannot_classify_as_observed_low_inventory",
+        "holder_1_storage_offered_to_optimizer_m3": 0.}
 
     _, ledger = physical_gas_ledger(prepared, end_pos)
     evidence["priority_user_supply"] = {"passed": False, "basis": "official_priority_rule_and_training_ledger",
@@ -287,6 +293,9 @@ def build_physical_validation(prepared, end_pos, heat_rate):
         "evidence": "2026-10-26赛事统一答复已明确标准m³/h；原始转炉发生量与已知用量仍不闭合，历史倍率不等于官方单位换算。",
         "standard_unit_confirmed": True, "standard_unit": "m3/h", "raw_converter_scale_verified": False,
         "inferred_scale": C.CONVERTER_GAS_SCALE, "known_consumption_scale_lower_bound": _physical_stats(ratio),
+        "dispatch_consumption_unit_confirmed": True,
+        "empirical_conversion_uses_raw_generation_scale": False,
+        "raw_generation_role": "inferred_scaled_sensor_feature_and_diagnostic_ledger; not_a_direct_flow_constraint",
         "inferred_scale_below_known_demand_fraction": float((ratio[valid] > C.CONVERTER_GAS_SCALE).mean())
         if valid.any() else None,
         "reason": "标准m³/h已明确，但converter_1原始量级归一仍缺可闭合证据；7043.5保持历史推算标记"}
@@ -812,6 +821,9 @@ def _holder_plan_bounds(n: int, config=C) -> tuple:
     capacity = config.GAS_HOLDER["capacity_m3"]
     low = np.full(n, capacity * (config.GAS_HOLDER["safe_low_ratio"] + config.OPT_CONFIG["holder_margin_ratio"]))
     high = np.full(n, capacity * (config.GAS_HOLDER["safe_high_ratio"] - config.OPT_CONFIG["holder_margin_ratio"]))
+    floor = config.OPT_CONFIG.get("planned_inventory_floor_m3")
+    if floor is not None:
+        low = np.maximum(low, float(floor))
     return low, high
 
 
@@ -986,9 +998,11 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
             sw = off_sw + i * n_h + k
             add({sw: 1.0, zk: -1.0, zk1: 1.0}, 0.0, np.inf)   # sw >= z_{k-1}-z_k
             add({sw: 1.0, zk: 1.0, zk1: -1.0}, 0.0, np.inf)   # sw >= z_k-z_{k-1}
-    if config.OPT_CONFIG.get("terminal_holder") and low <= holder0 <= high:
-        terminal_low = max(lower_path[-1], holder0)
-        terminal_high = min(upper_path[-1], holder0)
+    terminal_target = config.OPT_CONFIG.get("terminal_inventory_m3")
+    if config.OPT_CONFIG.get("terminal_holder") and (terminal_target is not None or low <= holder0 <= high):
+        target = holder0 if terminal_target is None else float(terminal_target)
+        terminal_low = max(lower_path[-1], target)
+        terminal_high = min(upper_path[-1], target)
         if terminal_low > terminal_high:
             return {"status": "INFEASIBLE", "message": "安全边界与末端库存约束冲突"}
         add({off_s + n_h - 1: 1.0}, terminal_low, terminal_high)
@@ -997,6 +1011,17 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
         for g in range(n_g):
             coeffs[off_q + g * n_h + k] = -float(beta[g])
         add(coeffs, 0.0, 0.0)
+
+    terminal_cap = config.OPT_CONFIG.get("terminal_power_cap_mw")
+    if terminal_cap is not None:
+        add({off_p + i * n_h + n_h - 1: 1. for i in range(n_u)}, -np.inf, float(terminal_cap))
+    total_cap = config.OPT_CONFIG.get("total_power_cap_mw")
+    if total_cap is not None:
+        rate = _aggregate_ramp_groups(config)[1][1]
+        for k in range(n_h):
+            # 初始负荷过高时按合法爬坡逐步降至上限，不瞬间裁剪实际初态。
+            ceiling = max(float(total_cap), float(np.sum(initial_power)) - (k + 1) * rate)
+            add({off_p + i * n_h + k: 1. for i in range(n_u)}, -np.inf, ceiling)
 
     matrix = lil_matrix((len(rows), n_var))
     lower = np.empty(len(rows))
@@ -1099,9 +1124,19 @@ def validate_day(result: dict, avail: np.ndarray, holder0: float,
         problems.append("燃料与功率不守恒")
     if (lower_path > upper_path).any() or np.max(np.abs(balance)) > st or (holder < lower_path - st).any() or (holder > upper_path + st).any():
         problems.append("代理库存平衡或安全边界违规")
-    if (config.OPT_CONFIG["terminal_holder"] and low <= holder0 <= high
-            and abs(holder[-1] - holder0) > st):
+    terminal_target = config.OPT_CONFIG.get("terminal_inventory_m3")
+    if (config.OPT_CONFIG["terminal_holder"] and (terminal_target is not None or low <= holder0 <= high)
+            and abs(holder[-1] - (holder0 if terminal_target is None else terminal_target)) > st):
         problems.append("末端库存不一致")
+    terminal_cap = config.OPT_CONFIG.get("terminal_power_cap_mw")
+    if terminal_cap is not None and power[:, -1].sum() > terminal_cap + pt:
+        problems.append("末步负荷未留跨日可达裕度")
+    total_cap = config.OPT_CONFIG.get("total_power_cap_mw")
+    if total_cap is not None:
+        rate = _aggregate_ramp_groups(config)[1][1]
+        envelope = np.maximum(float(total_cap), np.sum(initial_power) - rate * np.arange(1, n + 1))
+        if (power.sum(axis=0) > envelope + pt).any():
+            problems.append("负荷超出声明的因果保守上限")
     return {"passed": not problems, "problems": problems,
             "power_balance_max_mw": float(np.max(np.abs(energy))),
             "holder_balance_max_m3": float(np.max(np.abs(balance))),
@@ -1432,6 +1467,49 @@ def optimize_rolling(resource_forecast: np.ndarray, prepared: PreparedData,
             "schedule": schedule, "summary": summary}
 
 
+def allocate_group_gas(power: np.ndarray, gas: np.ndarray, heat_rate: dict) -> dict:
+    """分组供气是控制量；在共享经验效率假设下闭合，不由总耗气强行回归唯一组负荷。"""
+    power, gas = np.asarray(power, float), np.asarray(gas, float)
+    beta = np.array([heat_rate["coefficients_mw_per_m3h"][g] for g in C.RESOURCE_NAMES])
+    if (power.ndim != 2 or power.shape[0] != 6 or gas.shape != (3, power.shape[1])
+            or not all(np.isfinite(x).all() for x in (power, gas, beta))
+            or (power < -1e-6).any() or (gas < -1e-6).any() or (beta <= 0.).any()):
+        raise ValueError("分组耗气分配输入无效")
+    small, total = power[:4].sum(axis=0), power.sum(axis=0)
+    if np.max(np.abs(total - beta @ gas)) > C.OPT_CONFIG["power_tolerance_mw"]:
+        raise ValueError("总耗气与总功率未闭合，禁止生成分组供气")
+    share = np.divide(small, total, out=np.zeros_like(total), where=total > 1e-9)
+    grouped = np.stack((gas * share, gas * (1. - share)))
+    generated = np.einsum("g,ugn->un", beta, grouped)
+    residual = generated - np.stack((small, total - small))
+    return {"group_gas_m3h": grouped,
+            "validation": {"passed": bool(np.max(np.abs(residual)) <= C.OPT_CONFIG["power_tolerance_mw"]),
+                "max_power_residual_mw": float(np.max(np.abs(residual))),
+                "basis": "controllable_group_allocation_shared_empirical_conversion",
+                "separate_group_efficiency_measured": False}}
+
+
+def daily_plan_config(holder: float, observed_gas, heat_rate: dict, config=C):
+    """发布时间只用当前已知耗气定上限；缺测时回退保守上限，不填造实际流量。"""
+    cfg = SimpleNamespace(**vars(config))
+    options = config.OPT_CONFIG
+    beta = np.array([heat_rate["coefficients_mw_per_m3h"][g] for g in C.RESOURCE_NAMES])
+    observed = np.asarray(observed_gas, float)
+    if observed.shape != (3,):
+        raise ValueError("每日耗气观测必须为三气种")
+    valid = bool(np.isfinite(observed).all() and (observed >= 0.).all())
+    power_cap = (float(np.clip(options["daily_observed_fuel_ratio"] * (observed @ beta),
+                              options["daily_base_power_cap_mw"], options["daily_max_power_cap_mw"]))
+                 if valid else float(options["daily_base_power_cap_mw"]))
+    target = float(options["daily_terminal_inventory_m3"])
+    cfg.OPT_CONFIG = {**options, "solver_time_limit_s": 2., "total_power_cap_mw": power_cap,
+                      "terminal_power_cap_mw": options["daily_terminal_power_cap_mw"],
+                      "terminal_inventory_m3": target, "planned_inventory_floor_m3": min(holder, target)}
+    return cfg, {"total_power_cap_mw": power_cap, "terminal_power_cap_mw": options["daily_terminal_power_cap_mw"],
+                 "terminal_inventory_m3": target, "observed_power_gas_available": valid,
+                 "scope": "A_B_C_proxy_validated_control; not_official_operating_limits"}
+
+
 def optimize_daily(prepared: PreparedData, origins: pd.DatetimeIndex,
                    resource_bundle: ResourceBundle, quick: bool = False,
                    use_final: bool = False) -> dict:
@@ -1472,11 +1550,11 @@ def optimize_daily(prepared: PreparedData, origins: pd.DatetimeIndex,
         return {"status": "BLOCKED_OPT", "schedule": None, "summary": {"reason": "NO_INITIAL_POWER"}}
     previous = np.r_[[first / 4.] * 4, [max(total - first, 0.) / 2.] * 2]
     prices, records, plans = load_prices(), [], []
-    cfg = SimpleNamespace(**vars(C))
-    cfg.OPT_CONFIG = {**C.OPT_CONFIG, "solver_time_limit_s": 5.}
     cap_vector = np.array([caps[g] for g in C.RESOURCE_NAMES])
     submitted_initial_holder = submitted_terminal_holder = None
     for issue, pos, avail in zip(issue_times, positions, forecast):
+        observed_gas = prepared.frame[["d_use_blast", "d_use_coke", "d_use_converter"]].iloc[pos].to_numpy(dtype=float)
+        cfg, control = daily_plan_config(holder, observed_gas, heat)
         day = issue + pd.Timedelta(minutes=C.STEP_MINUTES)
         price = _price_vector(prices, day, C.STEPS_PER_DAY)
         result = _solve_day(avail, price, holder, previous, cap_vector, heat, cfg)
@@ -1487,12 +1565,14 @@ def optimize_daily(prepared: PreparedData, origins: pd.DatetimeIndex,
             return {"status": "BLOCKED_OPT", "schedule": None,
                     "summary": {"reason": result.get("message", result["status"]), "failed_day": str(day)}}
         effective = pd.date_range(day, periods=C.STEPS_PER_DAY, freq=f"{C.STEP_MINUTES}min")
+        allocation = allocate_group_gas(result["power"], result["gas"], heat)
         published = effective[(effective >= grid[0]) & (effective <= grid[-1])]
         plans.append({"day": str(issue.date()), "issued_at": str(issue), "steps": C.STEPS_PER_DAY,
                       "effective_start": str(effective[0]), "effective_end": str(effective[-1]),
                       "published_steps": len(published),
                       "published_start": str(published[0]), "published_end": str(published[-1]),
                       "validation": result["validation"], "solver_status": result["status"],
+                      "control": control, "group_allocation": allocation["validation"],
                       "initial_holder_m3": holder, "terminal_holder_m3": float(result["holder"][-1])})
         for k in range(C.STEPS_PER_DAY):
             when = effective[k]
@@ -1521,6 +1601,15 @@ def optimize_daily(prepared: PreparedData, origins: pd.DatetimeIndex,
             "dispatch_mode": "daily_fixed", "daily_publications": len(plans), "daily_plans": plans,
             "publication_time": C.OPT_CONFIG["publication_time"], "publication_schedule_passed": True,
             "resource_publication_check": publication_check,
+            "daily_control_policy": "reserve140_terminal200_observed_fuel_cap240_to280",
+            "daily_control_parameters": {key: C.OPT_CONFIG[key] for key in (
+                "daily_terminal_inventory_m3", "daily_terminal_power_cap_mw", "daily_base_power_cap_mw",
+                "daily_max_power_cap_mw", "daily_observed_fuel_ratio")},
+            "proxy_execution_policy": C.OPT_CONFIG["execution_gas_mode"],
+            "group_allocation_passed": all(p["group_allocation"]["passed"] for p in plans),
+            "group_efficiency_basis": "shared_empirical_inferred; separate_group_efficiency_not_measured",
+            "holder1_control": {"inventory_used": False, "controlled_exchange_m3h": 0.,
+                                "absolute_safety_certified": False, "reason": "raw_unit_and_initial_volume_unidentified"},
             "plan_feasible": True, "plan_validation_passed": True, "physical_feasibility_certified": False,
             "forecast_uses_historical_holder": False, "planned_steps": len(schedule),
             "initial_holder_m3": submitted_initial_holder, "terminal_holder_m3": submitted_terminal_holder,

@@ -161,6 +161,16 @@ def validate_publication_contract(meta: dict, grid) -> dict:
                 problems.append("每日计划的生效边界与实际发布时间不一致")
             if plan.get("validation", {}).get("passed") is not True:
                 problems.append("每日计划缺少通过的约束核验")
+            if summary.get("daily_control_policy"):
+                control = plan.get("control", {})
+                limits = summary.get("daily_control_parameters", {})
+                cap = control.get("total_power_cap_mw", np.nan)
+                if (not limits.get("daily_base_power_cap_mw", np.inf) <= cap <= limits.get("daily_max_power_cap_mw", -np.inf)
+                        or control.get("terminal_power_cap_mw") != limits.get("daily_terminal_power_cap_mw")
+                        or control.get("terminal_inventory_m3") != limits.get("daily_terminal_inventory_m3")):
+                    problems.append("每日计划的保守负荷或末端状态与冻结控制参数不一致")
+                if plan.get("group_allocation", {}).get("passed") is not True:
+                    problems.append("每日计划缺少通过的分组供气守恒核验")
         resource = meta["resource"]
         ends = [resource["train_end"], resource.get("heat_rate", {}).get("calibration_end")]
         recorded = summary.get("resource_publication_check", {})
