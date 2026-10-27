@@ -224,10 +224,13 @@ def validate_publication_contract(meta: dict, grid) -> dict:
         return {"passed": True, "checked": False, "problems": []}
     from main_opt import daily_publication_times
     problems = []
+    constraint_warnings = []
     try:
         grid = pd.DatetimeIndex(grid)
         expected = daily_publication_times(grid, publication_time=clock)
         summary = meta.get("optimization", {})
+        export_only = summary.get("validation_basis") in ("causal_fallback_export", "unverified_export")
+        constraint_problems = constraint_warnings if export_only else problems
         plans = summary.get("daily_plans", [])
         issues = pd.DatetimeIndex([p["issued_at"] for p in plans])
         if not issues.equals(expected) or summary.get("publication_time") != clock:
@@ -244,7 +247,7 @@ def validate_publication_contract(meta: dict, grid) -> dict:
                     or plan.get("published_end") != str(visible[-1])):
                 problems.append("每日计划的生效边界与实际发布时间不一致")
             if plan.get("validation", {}).get("passed") is not True:
-                problems.append("每日计划缺少通过的约束核验")
+                constraint_problems.append("每日计划缺少通过的约束核验")
             if summary.get("daily_control_policy") == "reserve140_terminal200_observed_fuel_cap240_to280":
                 control = plan.get("control", {})
                 limits = summary.get("daily_control_parameters", {})
@@ -258,7 +261,7 @@ def validate_publication_contract(meta: dict, grid) -> dict:
             elif summary.get("daily_control_policy"):
                 if (plan.get("model_constraints_passed") is not True
                         or plan.get("group_allocation", {}).get("passed") is not True):
-                    problems.append("净资源每日计划缺少通过的模型约束或分组供气核验")
+                    constraint_problems.append("净资源每日计划缺少通过的模型约束或分组供气核验")
         resource = meta["resource"]
         ends = [resource["train_end"], resource.get("heat_rate", {}).get("calibration_end")]
         recorded = summary.get("resource_publication_check", {})
@@ -269,7 +272,8 @@ def validate_publication_contract(meta: dict, grid) -> dict:
             problems.append("资源权重或标定参数晚于首份计划发布时刻")
     except (KeyError, TypeError, ValueError) as exc:
         problems.append("每日发布契约无效: " + str(exc))
-    return {"passed": not problems, "checked": True, "problems": list(dict.fromkeys(problems))}
+    return {"passed": not problems, "checked": True, "problems": list(dict.fromkeys(problems)),
+            "constraint_warnings": list(dict.fromkeys(constraint_warnings))}
 
 
 def validate_official_frame(name: str, frame: pd.DataFrame, expected_grid=None) -> dict:

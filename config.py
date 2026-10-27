@@ -497,6 +497,20 @@ OPT_CONFIG = {
     "daily_base_power_cap_mw": 240.,
     "daily_max_power_cap_mw": 280.,
     "daily_observed_fuel_ratio": .8,
+    # 两柜独立路由：1#/2#/3# 高炉只进 30 万柜，4#/5# 只进 20 万柜；机组耗气视为
+    # 从两柜按各自库存平衡自由抽取，不预设固定分流比。初态低于安全区时允许在
+    # 声明步数内恢复到计划裕度，但恢复路径仍受容量与单管方向约束。
+    "holder_recovery_steps": 4,
+    "holder_inlet_split": "blast_furnace_group_13_vs_45",
+    # 因果净资源画像：只用最近同日时段中位数及最近若干步偏移；残差按可配置
+    # 分位预留，避免把未观测用户/放散全部当作可利用余气。
+    "net_supply_history_days": 28,
+    "net_supply_recent_steps": 8,
+    "net_supply_residual_quantile": 0.50,
+    # 经验净资源只覆盖已观测用户；首日没有测试期观测，额外留 15% 保守余量，
+    # 避免按历史发生量高估可发电煤气、导致低柜位被抽空。
+    "net_supply_safety_factor": 1.0,
+    "net_supply_first_issue_factor": 0.85,
     "price_file": "first_train/price.xlsx",
     "price_unit": "CNY_per_kWh",
 }

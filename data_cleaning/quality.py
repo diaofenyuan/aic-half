@@ -1077,7 +1077,15 @@ def _net_dispatch_check() -> dict:
         holder_units_verified=units, config=cfg)
     missing_initial = main_opt.solve_net_day(boundary, np.ones(8), {names[1]: 100000.}, np.zeros(6),
         [1e6, 1e5, 1e5], heat, holder_units_verified=units, config=cfg)
-    checks["safe_sum_cannot_hide_unsafe_holder"] = bad_initial["status"] == "BLOCKED_OPT"
+    # 初态在安全区外时，正式实现允许显式恢复，而不是把真实低柜位直接判死；
+    # 但恢复必须被记录，且末态回到各自安全区，不能用“两柜合计安全”掩盖单柜越界。
+    recovery_ok = (
+        bad_initial.get("status") != "BLOCKED_OPT"
+        and bad_initial.get("network_validation", {}).get("passed", False)
+        and bad_initial.get("holder_recovery", {}).get(names[0], {}).get("required", False)
+        and bad_initial["holders_m3"][-1, 0] >= 300000. * C.GAS_HOLDER["safe_low_ratio"] - 1.)
+    checks["safe_sum_cannot_hide_unsafe_holder"] = (
+        bad_initial["status"] in {"BLOCKED_OPT", "INFEASIBLE"} or recovery_ok)
     checks["missing_holder_not_invented"] = missing_initial["status"] == "BLOCKED_OPT"
     tampered = copy.deepcopy(result)
     tampered["holders_m3"][0] += [5000., -5000.]

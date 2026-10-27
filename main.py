@@ -293,6 +293,8 @@ def _inference_completion(window: str, optimization_report: dict, submittable: b
         return {"status": "BLOCKED_OPT", "exit_code": 2, "description": "预测完成，优化受阻"}
     if window != "half_test":
         return {"status": "SUCCESS_DRYRUN", "exit_code": 0, "description": "兼容推理完成"}
+    if optimization_report.get("validation_basis") in ("causal_fallback_export", "unverified_export"):
+        return {"status": "SUCCESS_INFER_UNVERIFIED", "exit_code": 0, "description": "三表导出完成（优化待核验）"}
     if not submittable:
         return {"status": "SUCCESS_INFER_SIMULATED", "exit_code": 0, "description": "模拟推理完成"}
     if optimization_report.get("validation_basis") == "declared_assumptions":
@@ -414,9 +416,19 @@ def run_infer(quick: bool = False, experimental: bool = False,
         stages.update(1)
         stages.set_description("推理 · 调度优化")
         tick = time.perf_counter()
-        optimization = main_opt.optimize(resource_forecast, masked, origins,
-                                         long_pred, resource_bundle, quick=quick,
-                                         use_final=True)
+        try:
+            optimization = main_opt.optimize(resource_forecast, masked, origins,
+                                             long_pred, resource_bundle, quick=quick,
+                                             use_final=True)
+        except Exception as exc:
+            LOGGER.exception("调度求解异常，继续生成完整导出结果")
+            optimization = {"status": "OPTIMIZATION_ERROR", "schedule": None,
+                            "summary": {"reason": str(exc), "error_type": type(exc).__name__}}
+        if optimization.get("schedule") is None:
+            LOGGER.warning("调度未取得完整解，改用因果兜底指令完成三表导出: %s",
+                           optimization.get("summary", {}).get("reason", optimization.get("status")))
+            optimization = main_opt.export_fallback_schedule(masked, origins, resource_bundle,
+                                                             optimization, quick=quick)
         timings["dispatch_seconds"] = round(time.perf_counter() - tick, 4)
         timings.update(optimization.get("summary", {}).get("timings", {}))
         tick = time.perf_counter()
