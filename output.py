@@ -205,15 +205,15 @@ def official_columns(kind: str) -> list[str]:
 
 
 def expected_result_grid(name: str, origins=None, quick: bool = False) -> pd.DatetimeIndex:
-    """优化生效时刻与长期表时间列一致，每日固定发布，不输出范围外尾部。"""
+    """预测表保留起报网格，优化表按业务发布对应的目标窗口覆盖。"""
     grid = (pd.date_range(C.OFFICIAL_EVAL_START, C.OFFICIAL_EVAL_END,
                           freq=f"{C.STEP_MINUTES}min")
             if origins is None else pd.DatetimeIndex(origins))
     if name == "opt_result.csv":
+        from main_opt import optimization_effective_grid
         if C.OPT_CONFIG["datetime_semantics"] != "target_time":
             raise ValueError("未实现的优化时间语义，禁止静默平移结果")
-        if quick:
-            grid = grid[:2 * C.STEPS_PER_DAY]
+        grid = optimization_effective_grid(grid, quick)
     return grid
 
 
@@ -229,7 +229,9 @@ def validate_publication_contract(meta: dict, grid) -> dict:
         grid = pd.DatetimeIndex(grid)
         expected = daily_publication_times(grid, publication_time=clock)
         summary = meta.get("optimization", {})
-        export_only = summary.get("validation_basis") in ("causal_fallback_export", "unverified_export")
+        export_only = summary.get("validation_basis") in ("causal_fallback_export", "unverified_export", "adopted_policy_fallback")
+        export_only = export_only or (summary.get("validation_basis") == "adopted_operating_policy"
+                                     and summary.get("constraint_validation_passed") is False)
         constraint_problems = constraint_warnings if export_only else problems
         plans = summary.get("daily_plans", [])
         issues = pd.DatetimeIndex([p["issued_at"] for p in plans])
@@ -399,10 +401,23 @@ def write_optimization(ctx: RunContext, schedule: pd.DataFrame | None) -> dict:
     if not check["passed"]:
         raise ValueError("; ".join(check["problems"]))
     ctx.optimization_grid = grid
+    from main_opt import _aggregate_ramp_groups, _planning_ramp_groups
+    submitted_load = reread[["opt_generator_1", "opt_generator_all"]].to_numpy(dtype=float)
+    difference = np.abs(np.diff(submitted_load, axis=0))
+    limits = np.array([limit for _, limit in _aggregate_ramp_groups(C)])
+    excess = difference - limits
+    ramp_audit = {"basis": C.OPT_CONFIG["ramp_time_base_source"],
+        "scope": "adjacent_submitted_rows; initial_state_checked_in_dispatch; not_official_evaluator",
+        "limit_mw_per_step": limits.tolist(),
+        "generation_limit_mw_per_step": [limit for _, limit in _planning_ramp_groups(C)],
+        "maximum_change_mw": difference.max(axis=0).tolist() if len(difference) else [0., 0.],
+        "violating_rows_with_numeric_tolerance": int((excess > C.OPT_CONFIG["power_tolerance_mw"]).any(axis=1).sum()),
+        "floating_boundary_rows": int(((excess > 0.).any(axis=1)
+            & ~(excess > C.OPT_CONFIG["power_tolerance_mw"]).any(axis=1)).sum())}
     return {"written": True, "rows": int(len(reread)), "columns": list(reread.columns),
             "generator_1_range": [float(g1.min()), float(g1.max())],
             "generator_all_range": [float(allp.min()), float(allp.max())],
-            "time_semantics": C.OPT_CONFIG["datetime_semantics"],
+            "time_semantics": C.OPT_CONFIG["datetime_semantics"], "ramp_audit": ramp_audit,
             "start": str(grid[0]), "end": str(grid[-1]), "partial": bool(ctx.quick)}
 
 
@@ -420,7 +435,7 @@ def _grid_spec(grid) -> dict | None:
 
 
 def validate_result_files(directory: Path, origins=None, quick: bool = False,
-                          require_optimization: bool = False) -> dict:
+                          require_optimization: bool = False, optimization_grid=None) -> dict:
     problems, checks = [], {}
     for name in ("s_result.csv", "l_result.csv", "opt_result.csv"):
         path = directory / name
@@ -430,7 +445,9 @@ def validate_result_files(directory: Path, origins=None, quick: bool = False,
             continue
         try:
             frame = pd.read_csv(path)
-            check = validate_official_frame(name, frame, expected_result_grid(name, origins, quick))
+            expected = (pd.DatetimeIndex(optimization_grid) if name == "opt_result.csv" and optimization_grid is not None
+                        else expected_result_grid(name, origins, quick))
+            check = validate_official_frame(name, frame, expected)
             checks[name] = check
             problems.extend(check["problems"])
         except (ValueError, TypeError, OSError) as exc:
@@ -487,7 +504,19 @@ def _check_inference_contract(directory: Path, meta: dict) -> dict:
                     literals[name] = getattr(C, name)
         archived = json.loads(json.dumps({name: literals.get(name) for name in _INFERENCE_SETTINGS}))
     current = inference_contract()
-    mismatches = [name for name in _INFERENCE_SETTINGS if archived.get(name) != current[name]]
+    optimizer_changed = archived.get("OPT_CONFIG") != current["OPT_CONFIG"]
+    # 冻结预测权重允许采用本项目已选定的调度口径；预测输入与清洗配方仍须逐项兼容。
+    optimizer_reconfigured = bool(optimizer_changed
+        and C.OPT_CONFIG.get("holder_state_mode") == "daily_observed"
+        and C.OPT_CONFIG.get("submission_validation_basis") == "adopted_operating_policy")
+    def setting_value(settings, name):
+        value = settings.get(name)
+        if name == "GAS_HOLDER" and isinstance(value, dict):
+            # 说明文字不影响数值语义；容量、边界和字段映射仍完整参与兼容检查。
+            return {key: item for key, item in value.items() if key != "note"}
+        return value
+    mismatches = [name for name in _INFERENCE_SETTINGS if setting_value(archived, name) != setting_value(current, name)
+                  and not (name == "OPT_CONFIG" and optimizer_reconfigured)]
     if mismatches:
         raise ValueError("归档推理设置与当前代码不兼容，禁止静默覆盖：" + ", ".join(mismatches))
     required = meta.get("required_components")
@@ -500,7 +529,28 @@ def _check_inference_contract(directory: Path, meta: dict) -> dict:
         for component, needed in components.items():
             if needed and not meta.get(name, {}).get(component):
                 raise ValueError(f"冻结归档缺少必要分量：{name}/{component}；不能自动重训或降级")
-    return {"passed": True, "legacy_source_checked": legacy, "required_components": required}
+    return {"passed": True, "legacy_source_checked": legacy, "required_components": required,
+            "optimization_policy_changed": optimizer_reconfigured,
+            "descriptive_metadata_changed": archived.get("GAS_HOLDER", {}).get("note") != current["GAS_HOLDER"].get("note"),
+            "optimization_policy_version": C.OPT_CONFIG.get("policy_version")}
+
+
+def load_optimization_reference(directory: Path):
+    """只读资源归档；opt 模式不加载或执行短期、长期网络。"""
+    from main_opt import ResourceBundle
+    directory = directory.resolve()
+    meta = json.loads((directory / C.MODEL_DIR / "model_meta.json").read_text(encoding="utf-8"))
+    if meta.get("role") != "final":
+        raise ValueError("opt 只能复用 final 角色归档")
+    compatibility = _check_inference_contract(directory, meta)
+    item = meta["resource"]
+    resource = ResourceBundle({}, {}, [], metrics=item.get("metrics", {}),
+        heat_rate=item["heat_rate"], final_heat_rate=item["heat_rate"],
+        gas_caps=item["gas_caps"], final_gas_caps=item["gas_caps"],
+        train_end=item["train_end"], final_train_end=item["train_end"],
+        selection=item.get("selection", {}), dispatch_selection=item.get("dispatch_selection", {}),
+        final_physical_validation=item.get("physical_validation", {}), final_net_supply=item.get("net_supply"))
+    return meta, resource, compatibility
 
 
 def load_final_models(directory: Path):
@@ -868,7 +918,7 @@ def build_zip(ctx: RunContext, submittable: bool, config=C) -> dict:
     if ctx.prediction_grid is None:
         raise ValueError("缺少当次输出时间契约，拒绝打包")
     origins = None if ctx.window == "half_test" else ctx.prediction_grid
-    if ctx.mode == "infer" and not (ctx.root / "opt_result.csv").is_file():
+    if ctx.mode in ("infer", "opt") and not (ctx.root / "opt_result.csv").is_file():
         # 推理包缺少必交优化表时不制造同名的不完整ZIP。
         return {"name": None, "path": None, "members": 0, "root_csv": [], "crc_ok": False,
             "submittable": False, "complete_result_set": False, "missing_result_files": ["opt_result.csv"],
@@ -883,7 +933,7 @@ def build_zip(ctx: RunContext, submittable: bool, config=C) -> dict:
         meta = json.loads((ctx.model_dir / "model_meta.json").read_text(encoding="utf-8"))
         readiness = submission_readiness({"summary": meta["optimization"],
             "schedule": pd.read_csv(ctx.root / "opt_result.csv")})
-        if (ctx.mode != "infer" or ctx.window != "half_test" or ctx.quick or ctx.experimental
+        if (ctx.mode not in ("infer", "opt") or ctx.window != "half_test" or ctx.quick or ctx.experimental
                 or not ctx.prediction_grid.equals(expected_result_grid("s_result.csv"))):
             raise ValueError("非完整正式测试运行，拒绝标记为可提交")
         if not readiness["passed"]:

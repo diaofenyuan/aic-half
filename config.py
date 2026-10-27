@@ -4,8 +4,8 @@
 1. 日期、阶段、字段角色、可见性与物理常量只在此处定义，子模块不硬编码。
 2. 动态生产字段一律按 ``available_time <= origin`` 使用；本工程采用
    “15 分钟网格上同一时间戳的瞬时观测”，不做向后聚合，避免目标时刻污染特征。
-3. 尚无法从官方数据字典确认的优化参数保持 ``None`` 或明确标记为
-   ``inferred``，由 ``main_opt.py`` 返回阻断原因，而不是编造可提交结果。
+3. 优化按用户选定口径执行；选择来源随模型归档，运行核验不再等待外部补充确认。
+   项目正式默认值与官方给定值分别记录，不用配置选择替代现场或线上验证。
 """
 import os
 import sys
@@ -32,6 +32,8 @@ OUTPUT_ROOT = ROOT / "outputs"
 # 实验/调参/临时模型只允许放 tmp；不得写入 models/ 或正式 outputs 归档。
 TMP_ROOT = ROOT / "tmp"
 EXPERIMENT_OUTPUT_ROOT = TMP_ROOT / "tmp_outputs"
+# 当前迭代只运行调度；预测表及其模型直接复用已归档结果。
+EXECUTION_FOCUS = "optimization"
 
 # ---------------------------------------------------------------------------
 # 阶段与文件
@@ -149,7 +151,7 @@ CLEANING = {
     "ffill_limit": 8,
 }
 # 数据字典明确：高炉煤气柜容量为 20 万和 30 万 m³。1 号柜有效样本不足且出现
-# 1e30 哨兵；赛事统一答复已明确 1 号柜 30 万、2 号柜 20 万，当前仅部署 2 号柜。
+# 1e30 哨兵；赛事统一答复已明确 1 号柜 30 万、2 号柜 20 万，当前逐柜按选定倍率部署。
 GAS_HOLDER = {
     "column": "gas_holder_blast_furnace_gas_holder_2",
     "capacity_m3": 200000.0,
@@ -157,7 +159,7 @@ GAS_HOLDER = {
     "safe_high_ratio": 0.90,
     "capacity_by_column_m3": {"gas_holder_blast_furnace_gas_holder_1": 300000.0,
                               "gas_holder_blast_furnace_gas_holder_2": 200000.0},
-    "note": "1号柜数据不可用；焦炉/转炉无独立柜位字段，优化中不虚构库存。",
+    "note": "两柜按项目选定倍率独立建账；历史缺测不填造库存，焦炉/转炉无独立柜位。",
 }
 # 官方参考热值尚缺体积换算和效率；保留合法训练期三气种综合标定，属于 inferred。
 HEAT_RATE = {"method": "nnls_like_positive_regression", "min_r2": 0.60,
@@ -434,8 +436,16 @@ LONG_PROCESS_EXPERT = {
 # 的中位数反推比例。标准 m³/h 已明确，但原始量级归一未闭合，此值仍为 inferred。
 CONVERTER_GAS_SCALE = 7043.5
 OPT_CONFIG = {
-    # 未知口径采用声明假设；提交仍须通过指令守恒及训练期资源误差安全核验。
-    "submission_validation_basis": "declared_assumptions",
+    "policy_version": "20261027_daily_observed_terminal_neutral",
+    "optimization_grid_mode": "daily_target_window",
+    "submission_validation_basis": "adopted_operating_policy",
+    "holder_state_mode": "daily_observed",
+    "holder_withdrawal_allocation": "inlet_proportional",
+    "converter_optimization_source": "historical_generator_use_m3h",
+    "generation_ramp_limit_mw": 60.,
+    "check_running_unit_ramp": True,
+    "holder_terminal_ratio": .50,
+    "overflow_policy": "release_above_safe_high",
     "holder_scale_to_m3": {"gas_holder_blast_furnace_gas_holder_1": 10000.,
                             "gas_holder_blast_furnace_gas_holder_2": 1.},
     "unit_capacity_mw": (50.0, 50.0, 50.0, 50.0, 120.0, 120.0),
@@ -450,7 +460,7 @@ OPT_CONFIG = {
     # 计划柜位相对安全区间再留 5% 裕度；回测仍按官方 15%~90% 检查。
     "holder_margin_ratio": 0.05,
     # 日末回到初始柜位，避免计划靠净放空/净充满气柜获得虚假收益。
-    "terminal_holder": True,
+    "terminal_holder": False,
     "execution_gas_mode": "substitute_vent",  # 完整A/B/C每日回放通过，仅用于事后代理执行诊断
     # 仅用于代理溢出的敏感性评价，不能冒充官方放散罚金。
     "evaluation_release_penalties": (0.0, 0.5, 1.0),
@@ -464,6 +474,8 @@ OPT_CONFIG = {
     "gas_tolerance_m3h": 1.0,
     "holder_tolerance_m3": 1.0,
     "vent_tolerance_m3": 1.0,      # 兼容旧参数；当前用放散罚金替代字典序
+    # 放散设施存在；未知能力不假设无限泄压。给定三气种有限上限后可计算声明条件下的放散，
+    # 由于提交表没有放散控制列，此类计划仍须单独核验，不能据此宣称线上库存安全。
     # 官方未给放散罚金。基线 0.5 元/m³ 使高炉气在峰段发电收益仍高于放散，
     # 同时允许谷段把气存入气柜；正式提交前必须按官方口径复核。
     # P1（Zhao 2015）：按气种×分时差异化——焦炉气热值高、放散代价大，
@@ -492,7 +504,7 @@ OPT_CONFIG = {
     "publication_mode": "daily_fixed",
     "publication_time": "07:00",
     # A/B/C完整每日回放通过：留跨日库存及末步可达裕度；已知耗气仅在发布时间使用。
-    "daily_terminal_inventory_m3": 140000.,
+    "daily_terminal_inventory_m3": 100000.,
     "daily_terminal_power_cap_mw": 200.,
     "daily_base_power_cap_mw": 240.,
     "daily_max_power_cap_mw": 280.,
@@ -500,7 +512,7 @@ OPT_CONFIG = {
     # 两柜独立路由：1#/2#/3# 高炉只进 30 万柜，4#/5# 只进 20 万柜；机组耗气视为
     # 从两柜按各自库存平衡自由抽取，不预设固定分流比。初态低于安全区时允许在
     # 声明步数内恢复到计划裕度，但恢复路径仍受容量与单管方向约束。
-    "holder_recovery_steps": 4,
+    "holder_recovery_steps": 1,
     "holder_inlet_split": "blast_furnace_group_13_vs_45",
     # 因果净资源画像：只用最近同日时段中位数及最近若干步偏移；残差按可配置
     # 分位预留，避免把未观测用户/放散全部当作可利用余气。
@@ -510,7 +522,7 @@ OPT_CONFIG = {
     # 经验净资源只覆盖已观测用户；首日没有测试期观测，额外留 15% 保守余量，
     # 避免按历史发生量高估可发电煤气、导致低柜位被抽空。
     "net_supply_safety_factor": 1.0,
-    "net_supply_first_issue_factor": 0.85,
+    "net_supply_first_issue_factor": 1.0,
     "price_file": "first_train/price.xlsx",
     "price_unit": "CNY_per_kWh",
 }

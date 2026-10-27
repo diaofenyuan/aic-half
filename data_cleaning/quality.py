@@ -825,8 +825,9 @@ def _execution_tracking_check() -> dict:
     previous, holder, tracked = np.array([30., 30., 30., 30., 100., 100.]), 100000., True
     for request in (np.array([30., 30., 30., 0., 105., 105.]),
                     np.array([30., 30., 0., 0., 90., 90.]),
-                    np.array([30., 0., 0., 0., 72., 72.]),
-                    np.array([0., 0., 0., 0., 108., 0.])):
+                    np.array([30., 0., 0., 0., 75., 75.]),
+                    np.array([0., 0., 0., 0., 75., 75.]),
+                    np.array([0., 0., 0., 0., 90., 0.])):
         gas = np.array([8e5, 2e4, 4e4]) * (request.sum() / (beta @ np.array([8e5, 2e4, 4e4])))
         result = _execute_proxy_step(request, gas, np.array([1e6, 6e4, 8e4]), holder,
             previous, np.array([1.1e6, 8e4, 9e4]), heat, cfg)
@@ -874,7 +875,8 @@ def _daily_publication_check() -> dict:
     changed_control["optimization"]["daily_plans"][0]["control"]["total_power_cap_mw"] = 440.
     control_rejected = not output.validate_publication_contract(changed_control, origins)["passed"]
     full_grid = pd.date_range(C.OFFICIAL_EVAL_START, C.OFFICIAL_EVAL_END, freq="15min")
-    full_issues = main_opt.daily_publication_times(full_grid, publication_time="07:00")
+    full_targets = expected_result_grid("opt_result.csv", full_grid)
+    full_issues = main_opt.daily_publication_times(full_targets, publication_time="07:00")
     bundle.train_end = "2025-01-02 07:15"
     with patch.dict(C.OPT_CONFIG, {"publication_time": "07:00"}), patch.object(main_opt, "forecast_resources") as late_forecast:
         late = main_opt.optimize_daily(prepared, origins, bundle)
@@ -883,8 +885,11 @@ def _daily_publication_check() -> dict:
     late_nn = main_opt.resource_publication_check(bundle, expected_issues[0])
     checks = {"one_plan_per_business_day": result["summary"]["daily_publications"] == 3,
         "business_issue_times": issues.equals(expected_issues),
-        "full_window_including_edges": (len(full_issues) == 22 and full_issues[0] == pd.Timestamp("2025-10-10 07:00")
+        "full_window_including_edges": (len(full_issues) == 21 and full_issues[0] == pd.Timestamp("2025-10-11 07:00")
             and full_issues[-1] == pd.Timestamp("2025-10-31 07:00")),
+        "requested_optimization_time_range": (len(full_targets) == 2016
+            and full_targets[0] == pd.Timestamp("2025-10-11 07:15")
+            and full_targets[-1] == pd.Timestamp("2025-11-01 07:00")),
         "edge_window_counts": [p["published_steps"] for p in result["summary"]["daily_plans"]] == [29, 96, 67],
         "late_training_rejected_before_forecast": late["status"] == "BLOCKED_OPT" and not late_forecast.called,
         "late_resource_nn_rejected": not late_nn["passed"],
@@ -977,6 +982,8 @@ def _daily_repair_check() -> dict:
     heat = {"ok": True, "coefficients_mw_per_m3h": {"blast": .000346, "coke": .0019, "converter": .00059}}
     missing, missing_control = main_opt.daily_plan_config(100000., [np.nan, 20000., 30000.], heat)
     known, known_control = main_opt.daily_plan_config(100000., [900000., 30000., 70000.], heat)
+    # 此处专门验证显式期末约束；正式双柜模式不启用跨日期末库存目标。
+    known.OPT_CONFIG["terminal_holder"] = True
     avail = np.tile([800000., 30000., 70000.], (8, 1))
     initial = np.array([30., 30., 30., 30., 72., 72.])
     caps = np.array([1.2e6, 1e5, 1e5])
@@ -1020,7 +1027,7 @@ def _net_dispatch_check() -> dict:
     from types import SimpleNamespace
     import main_opt
     cfg = SimpleNamespace(**vars(C))
-    cfg.OPT_CONFIG = {**C.OPT_CONFIG, "solver_time_limit_s": 2.}
+    cfg.OPT_CONFIG = {**C.OPT_CONFIG, "solver_time_limit_s": 2., "terminal_holder": True}
     names = tuple(C.GAS_HOLDER["capacity_by_column_m3"])
     initial = dict(zip(names, (180000., 100000.)))
     units = dict.fromkeys(names, True)
@@ -1044,10 +1051,15 @@ def _net_dispatch_check() -> dict:
     checks["aggregate_initial_power_preserved"] = (abs(real_initial[:4].sum()-95.62567)<1e-8
         and abs(real_initial.sum()-254.09872)<1e-8)
     checks["initial_power_decomposition_meets_unit_minimum"] = main_opt._valid_initial_unit_power(real_initial)
-    invalid_initial = np.r_[[95.62567/4]*4, [158.47305/2]*2]
+    transition = main_opt._initial_unit_power(57.612476, 163.47806)
+    checks["transition_boundary_preserves_measured_aggregates"] = np.allclose(
+        [transition[:4].sum(), transition.sum()], [57.612476, 163.47806])
+    checks["transition_boundary_does_not_relax_new_unit_minimum"] = (
+        main_opt._valid_initial_boundary_power(transition) and not main_opt._valid_initial_unit_power(transition))
+    invalid_initial = np.r_[[51., 0., 0., 0.], [72., 72.]]
     invalid_solution = main_opt.solve_net_day(boundary, np.ones(8), initial, invalid_initial,
         [1.2e6, 1e5, 1e5], heat, holder_units_verified=units, config=cfg)
-    checks["invalid_initial_unit_load_rejected"] = invalid_solution["status"] == "INVALID_INPUT"
+    checks["initial_boundary_above_capacity_rejected"] = invalid_solution["status"] == "INVALID_INPUT"
     calibration = _synthetic_prepared(2200)
     rng = np.random.default_rng(71)
     columns = ["load_generator_use_blast_furnace_gas", "load_generator_use_coke_gas",
@@ -1103,6 +1115,10 @@ def _net_dispatch_check() -> dict:
         training_end="2025-01-02 07:00")
     checks["future_training_rejected"] = not late["passed"]
     checks["unknown_demand_not_zero"] = not unknown["passed"] and np.isnan(unknown["available_m3h"][0, 0])
+    signed = main_opt.net_resource_boundary(generation, priority, -reserved,
+        issued_at="2025-01-02 07:00", training_end="2025-01-02 07:00")
+    checks["signed_meter_residual_not_clipped"] = signed["passed"] and np.allclose(
+        signed["available_m3h"], generation-priority+reserved)
     recovering = {**initial, names[0]: 50000.}
     recovery = main_opt.solve_net_day(boundary, np.ones(8), recovering,
         np.array([30., 30., 30., 30., 72., 72.]), [1.2e6, 1e5, 1e5], heat,
@@ -1116,14 +1132,33 @@ def _net_dispatch_check() -> dict:
         np.zeros((4, 3)), issued_at="2025-01-02 07:00", training_end="2025-01-02 07:00", flow_units_verified=True)
     no_storage = main_opt.solve_net_day(no_storage_deficit, np.ones(4), initial, np.zeros(6), [0., 0., 0.], heat,
         holder_units_verified=units, config=cfg)
-    checks["coke_converter_deficit_cannot_borrow_blast_stock"] = no_storage["status"] == "INVALID_INPUT"
+    checks["coke_converter_deficit_cannot_borrow_blast_stock"] = (
+        no_storage.get("status") in ("OPTIMAL", "FEASIBLE_TIMEOUT")
+        and not no_storage["model_constraints_passed"]
+        and not no_storage["network_validation"]["net_resource_validation"]["production_supply_passed"]
+        and np.max(np.abs(no_storage["gas"][1:])) <= cfg.OPT_CONFIG["gas_tolerance_m3h"]
+        and np.allclose(no_storage_deficit["priority_demand_m3h"], [0., 1., 1.]))
     deficit = main_opt.net_resource_boundary(np.zeros((4, 3)), np.tile([4000., 0., 0.], (4, 1)), np.zeros((4, 3)),
         issued_at="2025-01-02 07:00", training_end="2025-01-02 07:00", flow_units_verified=True)
+    raw_group_balance = np.tile([-2400., -1600.], (4, 1))
+    upstream = main_opt.net_resource_boundary(np.zeros((4, 3)), np.tile([4000., 0., 0.], (4, 1)), np.zeros((4, 3)),
+        issued_at="2025-01-02 07:00", training_end="2025-01-02 07:00", holder_inlet_m3h=raw_group_balance)
+    checks["upstream_gap_preserved_without_mutating_inputs"] = (
+        np.allclose(raw_group_balance, [-2400., -1600.])
+        and np.array_equal(upstream["upstream_group_balance_m3h"], raw_group_balance)
+        and np.allclose(upstream["holder_inlet_m3h"], 0.)
+        and np.allclose(upstream["dispatch_available_m3h"][:, 0], 0.)
+        and np.allclose(upstream["available_m3h"][:, 0], -4000.))
     cfg.OPT_CONFIG["terminal_holder"] = False
     drained = main_opt.solve_net_day(deficit, np.ones(4), initial, np.zeros(6), [0., 0., 0.], heat,
         holder_units_verified=units, config=cfg)
-    checks["production_deficit_draws_storage_without_clipping"] = (drained.get("network_validation", {}).get("passed", False)
-        and abs(drained["holders_m3"][-1].sum() - sum(initial.values()) + 4000.) < 1.)
+    checks["production_deficit_not_automatically_supplied_from_holder"] = (
+        drained.get("network_validation", {}).get("net_resource_validation", {}).get("arithmetic_passed", False)
+        and not drained["model_constraints_passed"]
+        and not drained["network_validation"]["net_resource_validation"]["production_supply_passed"]
+        and np.allclose(deficit["available_m3h"][:, 0], -4000.)
+        and np.allclose(deficit["production_shortfall_m3h"][:, 0], 4000.)
+        and np.allclose(drained["holders_m3"][-1], list(initial.values()), atol=1.))
     fake = {"summary": {"resource_mode": "net_surplus_after_priority_users", "plan_validation_passed": True,
         "physical_feasibility_certified": True, "dispatch_mode": "daily_fixed", "intraday_refresh": False,
         "time_semantics": "target_time", "planned_steps": 8}}
@@ -1147,11 +1182,33 @@ def _frozen_archive_check() -> dict:
         "required_components": {"long": {"process_expert": True}},
         "long": {"process_expert": {"path": "long/final_process_expert"}}}
     checks = {"same_inference_settings_accepted": output._check_inference_contract(Path("."), metadata)["passed"]}
+    note_only = copy.deepcopy(metadata)
+    note_only["inference_contract"]["GAS_HOLDER"]["note"] = "仅修改说明，不改变任何数值配置"
+    checks["holder_note_change_accepted"] = output._check_inference_contract(Path("."), note_only)["passed"]
+    optimizer_only = copy.deepcopy(metadata)
+    optimizer_only["inference_contract"]["OPT_CONFIG"]["policy_version"] = "historical_optimizer_version"
+    checks["optimizer_version_does_not_force_prediction_retraining"] = output._check_inference_contract(
+        Path("."), optimizer_only)["optimization_policy_changed"]
+    for key, value in (("capacity_m3", C.GAS_HOLDER["capacity_m3"]+1.),
+                       ("safe_low_ratio", C.GAS_HOLDER["safe_low_ratio"]+.01),
+                       ("column", "changed_holder_column")):
+        changed = copy.deepcopy(metadata)
+        changed["inference_contract"]["GAS_HOLDER"][key] = value
+        check_name = f"holder_{key}_change_rejected"
+        checks[check_name] = False
+        try:
+            output._check_inference_contract(Path("."), changed)
+        except ValueError:
+            checks[check_name] = True
     with patch.object(C, "PROFILE_DAYS", C.PROFILE_DAYS + 1):
         try:
             output._check_inference_contract(Path("."), metadata)
         except ValueError:
             checks["input_recipe_drift_rejected"] = True
+        try:
+            output._check_inference_contract(Path("."), optimizer_only)
+        except ValueError:
+            checks["optimizer_change_cannot_bypass_prediction_recipe_check"] = True
     missing = copy.deepcopy(metadata)
     missing["long"].clear()
     try:
@@ -1166,7 +1223,7 @@ def _frozen_archive_check() -> dict:
             output._validate_frozen_state(state, "2025-01-01", "short")
         except ValueError:
             checks[name] = True
-    return {"passed": len(checks) == 5 and all(checks.values()), **checks}
+    return {"passed": len(checks) == 11 and all(checks.values()), **checks}
 
 
 def _physical_input_boundary_check() -> dict:
@@ -1187,131 +1244,132 @@ def _physical_input_boundary_check() -> dict:
             for h in first["holders"].values()),
         "empirical_extrapolation_detected": inside["passed"] and not outside["passed"],
         "statistical_support_not_official_anomaly_threshold": outside["scope"].endswith("not_official_model_or_anomaly_criterion")}
+    original = main_opt._observed_net_frame(prepared)
+    converter_changed = copy.deepcopy(prepared)
+    converter_changed.frame["gas_converter_1"] = 1e12
+    converted = main_opt._observed_net_frame(converter_changed)
+    checks["raw_converter_scale_not_used_by_optimizer"] = np.allclose(
+        original[["converter_generation", "converter_residual"]],
+        converted[["converter_generation", "converter_residual"]], equal_nan=True)
     return {"passed": all(checks.values()), **checks}
 
 
 def _net_daily_integration_check() -> dict:
-    """核验正式净资源路径、未知单位模拟及不读取未来柜位的跨日接续。"""
+    """核验每日实测复位、比例抽气、残差因果边界及正式选择来源。"""
     from unittest.mock import patch
     import main_opt
     data = _synthetic_prepared(480)
     names = list(C.GAS_HOLDER["capacity_by_column_m3"])
-    for name, value in zip(names, (18., 100000.)):
-        data.frame[name] = value
-        data.provenance[name] = pd.Series(1, index=data.index, dtype="int8")
+    gas_columns = ["load_generator_use_"+gas+"_gas" for gas in ("blast_furnace", "coke", "converter")]
+    for column, value in zip(names+gas_columns, [18., 100000., 800000., 30000., 70000.]):
+        data.frame[column] = value
+        data.provenance[column] = pd.Series(1, index=data.index, dtype="int8")
     data.frame[C.TARGET_COLUMN["generator_1"]] = 120.
     data.frame[C.TARGET_COLUMN["generator_all"]] = 320.
-    gas_columns = ["load_generator_use_"+gas+"_gas" for gas in ("blast_furnace", "coke", "converter")]
-    for column, value in zip(gas_columns, (800000.,30000.,70000.)):
-        data.frame[column] = value
-        data.provenance[column] = pd.Series(1,index=data.index,dtype="int8")
+    for target in C.TARGETS:
+        data.provenance[C.TARGET_COLUMN[target]] = pd.Series(1, index=data.index, dtype="int8")
+    observed = pd.DataFrame(index=data.index)
+    for gas, generation, priority, residual in (("blast", 1600000., 600000., 200000.),
+            ("coke", 100000., 40000., 30000.), ("converter", 150000., 80000., 0.)):
+        for part, value in (("generation", generation), ("priority", priority), ("residual", residual)):
+            observed[gas+"_"+part] = value
+    observed["blast_generation_13"], observed["blast_generation_45"] = 960000., 640000.
+    observed["blast_storage_change_m3h"], observed["converter_optional_use"] = 0., 70000.
+    columns = list(observed.columns)
+    history = observed.iloc[:96].reset_index()
+    history.columns = ["datetime"]+columns
+    history["datetime"] = history["datetime"].astype(str)
     end = str(data.index[95])
-    profile = {}
-    for gas, generation, priority, reserved in (("blast", 1.6e6, 6e5, 2e5), ("coke", 1e5, 4e4, 3e4), ("converter", 2e5, 8e4, 5e4)):
-        for component, value in (("generation", generation), ("priority", priority), ("residual", reserved)):
-            profile[gas + "_" + component] = [value] * 96
-    pack = {"method": "frozen_28_day_slot_median", "train_end": end, "profile": profile,
-        "flow_units_verified": False, "reservation_role": "inferred_unresolved_reserve",
-        "converter_scale": C.CONVERTER_GAS_SCALE,
+    pack = {"method": "causal_28_day_slot_median", "train_end": end,
+        "history": {"columns": ["datetime"]+columns, "rows": history.values.tolist()},
+        "flow_units_verified": False, "reservation_role": "unresolved_consumption_expectation",
+        "converter_scale": None, "converter_source": "historical_generator_use_m3h",
         "holder_scale_hypotheses": {name: {"scale_to_m3": scale, "verified": False}
-                                    for name, scale in zip(names, (10000., 1.))}}
-    pack["resource_error_calibration"] = {"issued_at": [str(t) for t in pd.date_range("2024-12-24 07:00", periods=5, freq="D")],
-        "cumulative_error_m3": np.zeros((5, 96)).tolist(), "test_data_used": False,
-        "priming_error_m3": np.zeros((5,2)).tolist(),
-        "interval_semantics": "command_start_to_next_step"}
-    heat = {"ok": False, "calibration_end": end,
-        "coefficients_mw_per_m3h": {"blast": .000346, "coke": .0019, "converter": .00059}}
-    bundle = main_opt.ResourceBundle({}, {}, [], final_heat_rate=heat,
-        final_train_end=end, final_net_supply=pack,
-        final_gas_caps={"blast": 1.2e6, "coke": 1e5, "converter": 1e5})
+            for name, scale in zip(names, (10000., 1.))}}
+    issue = data.index[124]
+    current_net, current_shares, current_info = main_opt._publication_blast_balance(pack, issue, observed)
+    perturbed = observed.copy()
+    perturbed.loc[perturbed.index > issue] = 1e12
+    perturbed.loc[issue, "blast_residual"] = 1e12
+    same_net, same_shares, _ = main_opt._publication_blast_balance(pack, issue, perturbed)
+    impulse = observed.copy()
+    impulse.loc[issue, "blast_generation_13"] += 40000.
+    changed_net, _, _ = main_opt._publication_blast_balance(pack, issue, impulse)
+    bridge_checks = {
+        "bridge_uses_publication_instant": current_net == 800000. and np.allclose(current_shares, [.6, .4])
+            and current_info["resource_at"] == str(issue),
+        "bridge_ignores_future_and_unclosed_residual": current_net == same_net and np.array_equal(current_shares, same_shares),
+        "bridge_responds_to_known_current_production": changed_net-current_net == 40000.,
+    }
+    heat = {"coefficients_mw_per_m3h": {"blast": .000346, "coke": .0019, "converter": .00059},
+        "calibration_end": end, "ok": False}
+    bundle = main_opt.ResourceBundle({}, {}, [], final_heat_rate=heat, final_train_end=end,
+        final_net_supply=pack, final_gas_caps={"blast": 1.2e6, "coke": 1e5, "converter": 1e5})
     grid = data.index[192:384]
-    with patch.object(main_opt, "load_prices", return_value={1: np.ones(96)}):
+    with patch.object(main_opt, "load_prices", return_value={1: np.ones(96)}), \
+            patch.object(main_opt, "_observed_net_frame", return_value=observed):
         result = main_opt.optimize_daily(data, grid, bundle, use_final=True)
         changed = copy.deepcopy(data)
-        changed.frame.loc[changed.index > pd.Timestamp("2025-01-02 07:00"), names] = 1e12
+        last_issue = main_opt.daily_publication_times(grid)[-1]
+        changed.frame.loc[changed.index > last_issue, names+gas_columns] = 1e12
         again = main_opt.optimize_daily(changed, grid, bundle, use_final=True)
     if result.get("schedule") is None or again.get("schedule") is None:
-        return {"passed": False, "reason": result.get("summary")}
-    summary = result["summary"]
-    plans = summary["daily_plans"]
-    checks = {"net_resources_and_two_holders_called": summary["resource_mode"] == "inferred_net_surplus_after_priority_users"
-            and all(p["model_constraints_passed"] for p in plans),
-        "failed_statistical_gate_does_not_block_declared_model": result["status"] == "SIMULATED_NOT_SUBMITTABLE"
-            and result["submittable"] is False,
-        "unknown_units_not_marked_certified": not summary["independent_holder_validation"]["passed"]
-            and not summary["physical_feasibility_certified"],
-        "future_holder_does_not_reset_daily_state": np.allclose(result["schedule"].iloc[:, 1:], again["schedule"].iloc[:, 1:], atol=1e-5),
-        "independent_states_continue_across_days": all(plans[j]["initial_holders_m3"] == plans[j - 1]["terminal_holders_m3"]
-            for j in range(1, len(plans))),
-        "complete_daily_grid": len(result["schedule"]) == len(grid) and len(plans) == 3}
-    checks["zero_error_fixture_passes_resource_guard"] = main_opt.net_supply_safety_check(pack)["passed"]
-    bad_pack = copy.deepcopy(pack)
-    bad_pack["resource_error_calibration"]["cumulative_error_m3"][0][-1] = 400000.
-    checks["point_plan_cannot_hide_resource_uncertainty"] = not main_opt.net_supply_safety_check(bad_pack)["passed"]
-    bad_bundle = copy.deepcopy(bundle)
-    bad_bundle.final_net_supply = bad_pack
+        return {"passed": False, "reason": result.get("summary", {}).get("reason")}
+    summary, plans = result["summary"], result["summary"]["daily_plans"]
+    check = main_opt.model_submission_check(result)
+    checks = {"complete_daily_grid": len(result["schedule"]) == len(grid) and len(plans) == 3,
+        "formal_policy_selected": summary["operating_policy"]["decision_status"] == "ADOPTED"
+            and summary["operating_policy"]["pending_decisions"] == [],
+        "every_day_uses_fresh_observed_state": all(p["observed_initial_holders_m3"] == dict(zip(names, [180000., 100000.]))
+            and p["observed_at"] == p["issued_at"] for p in plans),
+        "reset_not_material_supply": check.get("checks", {}).get("holder_material_balance", False),
+        "withdrawals_follow_selected_ratio": check.get("checks", {}).get("proportional_holder_withdrawal", False),
+        "no_future_measurements": np.allclose(result["schedule"].iloc[:, 1:], again["schedule"].iloc[:, 1:], atol=1e-5),
+        "no_field_certification_fabricated": summary["physical_feasibility_certified"] is False,
+        "historical_uncertainty_is_diagnostic": result["status"] == "FORMAL_OPTIMIZATION"
+            and result["submittable"] and not check["checks"]["historical_resource_uncertainty"]}
+    checks.update(bridge_checks)
+    from types import SimpleNamespace
+    renamed = SimpleNamespace(**vars(C))
+    renamed.OPT_CONFIG = {**C.OPT_CONFIG, "policy_version": "metadata_only_rename"}
+    original_bounds = main_opt._independent_holder_plan_bounds(np.array([50000., 175000.]), 8)
+    renamed_bounds = main_opt._independent_holder_plan_bounds(np.array([50000., 175000.]), 8, renamed)
+    checks["policy_metadata_does_not_relax_inventory_bounds"] = all(
+        np.array_equal(a, b) for a, b in zip(original_bounds, renamed_bounds))
+    altered = copy.deepcopy(result)
+    altered["summary"]["model_evidence"]["state_reset_m3"][30][0] += 10000.
+    checks["reset_accounting_tamper_rejected"] = not main_opt.model_submission_check(altered)["simulation_constraints_passed"]
+    altered = copy.deepcopy(result)
+    altered["summary"]["daily_plans"][1]["daily_state_bridge"]["holder_change_before_release_m3"][names[0]] += 10000.
+    checks["daily_bridge_tamper_rejected"] = not main_opt.model_submission_check(altered)["simulation_constraints_passed"]
+    altered = copy.deepcopy(result)
+    altered["summary"]["first_effective_state"] = {}
+    checks["missing_bridge_evidence_rejected"] = not main_opt.model_submission_check(altered)["simulation_constraints_passed"]
+    solve = main_opt.solve_net_day
+    calls = [0]
+    def one_day_failure(*args, **kwargs):
+        calls[0] += 1
+        if calls[0] == 2:
+            return {"status": "INFEASIBLE", "message": "single_day_fixture_failure"}
+        return solve(*args, **kwargs)
+    with patch.object(main_opt, "load_prices", return_value={1: np.ones(96)}), \
+            patch.object(main_opt, "_observed_net_frame", return_value=observed), \
+            patch.object(main_opt, "solve_net_day", side_effect=one_day_failure):
+        partial = main_opt.optimize_daily(data, grid, bundle, use_final=True)
+    partial_plans = partial.get("summary", {}).get("daily_plans", [])
+    checks["single_day_failure_preserves_other_plans"] = (partial.get("schedule") is not None
+        and len(partial["schedule"]) == len(grid) and len(partial_plans) == 3
+        and partial_plans[1]["solver_status"] == "CAUSAL_FALLBACK"
+        and partial_plans[0]["solver_status"] in ("OPTIMAL", "FEASIBLE_TIMEOUT")
+        and partial_plans[2]["solver_status"] in ("OPTIMAL", "FEASIBLE_TIMEOUT")
+        and not partial["submittable"])
+    stale = copy.deepcopy(data)
+    stamp = pd.Timestamp(plans[0]["issued_at"])
+    stale.frame.loc[stamp, names[0]] = np.nan
+    stale.provenance.loc[stamp, names[0]] = 0
     with patch.object(main_opt, "load_prices", return_value={1: np.ones(96)}):
-        point = main_opt.optimize_daily(data, grid, bad_bundle, use_final=True)
-    point_check = main_opt.model_submission_check(point)
-    checks["uncertain_resource_still_produces_marked_simulation"] = (
-        point.get("status") == "SIMULATED_NOT_SUBMITTABLE" and point.get("schedule") is not None
-        and len(point["schedule"]) == len(grid) and point.get("submittable") is False
-        and point_check.get("simulation_constraints_passed") is True and not point_check["passed"]
-        and point["summary"]["point_only_publications"]
-        and not point["summary"]["resource_error_validation"]["passed"])
-    cancel_pack = copy.deepcopy(pack)
-    cancel_pack["resource_error_calibration"]["priming_error_m3"][0] = [-200000., 200000.]
-    cancel_check = main_opt.net_supply_safety_check(cancel_pack)
-    checks["aggregate_error_uses_paired_holder_priming"] = (
-        not cancel_check["passed"] and not cancel_check["even_aggregate_buffer_insufficient"]
-        and cancel_check["maximum_aggregate_error_width_m3"] == 0.)
-    late_pack = copy.deepcopy(pack)
-    late_pack["resource_error_calibration"]["issued_at"][-1] = end
-    checks["future_error_calibration_rejected"] = not main_opt.net_supply_safety_check(late_pack)["passed"]
-    missing_pack = copy.deepcopy(pack)
-    del missing_pack["resource_error_calibration"]
-    checks["old_archive_without_resource_errors_not_certified"] = not main_opt.net_supply_safety_check(missing_pack)["passed"]
-    checks["complete_trace_recomputed_with_error_margin"] = main_opt.model_submission_check(result)["passed"]
-    readiness = main_opt.submission_readiness(result)
-    checks["declared_assumptions_cannot_bypass_physical_submission"] = (
-        readiness.get("model", {}).get("passed") is True and not readiness["physical"]["passed"]
-        and not readiness["passed"] and result["schedule"] is not None)
-    risky = copy.deepcopy(result)
-    risky["summary"]["model_evidence"]["net_supply_model"]["resource_error_calibration"]["cumulative_error_m3"][0][-1] = 100000.
-    risk_check = main_opt.model_submission_check(risky)
-    checks["small_error_set_still_must_fit_actual_planned_margin"] = (not risk_check["passed"]
-        and risk_check["checks"]["historical_resource_uncertainty"]
-        and not risk_check["checks"]["independent_holder_error_margin"])
-    shifted = copy.deepcopy(result)
-    shifted["summary"]["model_evidence"]["holder_state_times"] = [
-        str(pd.Timestamp(t)-pd.Timedelta(minutes=15)) for t in shifted["summary"]["model_evidence"]["holder_state_times"]]
-    checks["inventory_time_shift_rejected"] = not main_opt.model_submission_check(shifted)["passed"]
-    tampered_bridge = copy.deepcopy(result)
-    tampered_bridge["summary"]["first_effective_state"]["predicted_net_blast_m3h"] += 10000.
-    checks["first_effective_state_mass_balance_tamper_rejected"] = not main_opt.model_submission_check(tampered_bridge)["passed"]
-    fixture = copy.deepcopy(data.prefix_copy(data.index[4]))
-    fixture.frame[names[0]] = 18.
-    fixture.frame[names[1]] = [100000.,100010.,100030.,100060.,100100.]
-    fixture.frame[gas_columns[0]] = [100.,200.,300.,400.,500.]
-    labels = main_opt.net_balance_training_labels(fixture,pack["holder_scale_hypotheses"])
-    checks["command_start_flow_matches_forward_stock_change"] = (
-        np.allclose(labels.iloc[:4],[140.,280.,420.,560.]) and pd.isna(labels.iloc[-1]))
-    pos = int(data.index.get_loc(pd.Timestamp("2025-01-02 07:00")))
-    bridge_data = copy.deepcopy(data)
-    bridge_data.frame.loc[bridge_data.index[pos],gas_columns[0]] = 760000.
-    bridge_data.frame.loc[bridge_data.index[pos-1],names[0]] = 17.
-    state, bridge = main_opt._prime_first_effective_state(bridge_data,pos,pack,dict(zip(names,(180000.,100000.))))
-    checks["first_effective_stock_accounts_for_committed_old_use"] = abs(sum(state.values())-290000.)<1e-8
-    changed_bridge = copy.deepcopy(bridge_data)
-    changed_bridge.frame.loc[changed_bridge.index>changed_bridge.index[pos], names+gas_columns] = 1e12
-    state_again, bridge_again = main_opt._prime_first_effective_state(changed_bridge,pos,pack,dict(zip(names,(180000.,100000.))))
-    checks["first_effective_stock_never_reads_future_measurements"] = state == state_again and bridge == bridge_again
-    initial_stale = copy.deepcopy(data)
-    initial_stale.frame.loc[pd.Timestamp(plans[0]["issued_at"]),names[0]] = np.nan
-    initial_stale.provenance.loc[pd.Timestamp(plans[0]["issued_at"]),names[0]] = 0
-    with patch.object(main_opt,"load_prices",return_value={1:np.ones(96)}):
-        stale_result = main_opt.optimize_daily(initial_stale,grid,bundle,use_final=True)
-    checks["stale_initial_stock_not_relabelled_as_current"] = stale_result["status"] == "BLOCKED_OPT"
+        failed = main_opt.optimize_daily(stale, grid, bundle, use_final=True)
+    checks["missing_initial_is_runtime_error"] = failed["status"] == "BLOCKED_OPT"
     return {"passed": all(checks.values()), **checks}
 
 

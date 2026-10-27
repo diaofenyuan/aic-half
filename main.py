@@ -1,6 +1,6 @@
 """半决赛唯一日常入口：python main.py
 
-默认 infer 按已冻结配方重训，对正式半决赛测试窗口生成预测与优化结果；
+当前默认 opt 仅生成调度，短期与长期预测表及模型原样复用；
 run 保留历史 21 天时序回测。测试标签为空，不计算测试集本地分数；
 当次结果能否提交由窗口、运行范围和优化核验共同判定。
 """
@@ -152,21 +152,25 @@ def run_verify(directory: Path | None = None) -> int:
             if not span:
                 raise ValueError("缺少可验证的输出时间契约")
             origins = pd.date_range(span[0], span[1], freq=f"{C.STEP_MINUTES}min")
+        opt_grid = output.expected_result_grid("opt_result.csv", origins, quick)
+        legacy_grid = origins[:2*C.STEPS_PER_DAY] if quick else origins
+        if (contract.get("optimization_grid_mode") is None
+                and contract.get("optimization") == output._grid_spec(legacy_grid)):
+            opt_grid = legacy_grid
         if meta.get("schema_version", 1) >= 2:
             if spec != output._grid_spec(origins):
                 problems.append("模型元数据中的预测覆盖契约不一致")
             opt_spec = contract.get("optimization")
             if (directory / "opt_result.csv").is_file():
-                if opt_spec != output._grid_spec(output.expected_result_grid("opt_result.csv", origins, quick)):
+                if opt_spec != output._grid_spec(opt_grid):
                     problems.append("模型元数据中的优化覆盖契约不一致")
                 if contract.get("optimization_time_semantics") != C.OPT_CONFIG["datetime_semantics"]:
                     problems.append("优化时间语义与当前实现不一致")
-                publication = output.validate_publication_contract(meta,
-                    output.expected_result_grid("opt_result.csv", origins, quick))
+                publication = output.validate_publication_contract(meta, opt_grid)
                 problems.extend(publication["problems"])
             elif opt_spec is not None:
                 problems.append("缺少元数据中声明的优化结果")
-        coverage = output.validate_result_files(directory, origins, quick)
+        coverage = output.validate_result_files(directory, origins, quick, optimization_grid=opt_grid)
         problems.extend(coverage["problems"])
     except (ValueError, KeyError, TypeError, OSError) as exc:
         print(json.dumps({"directory": str(directory), "passed": False,
@@ -180,7 +184,12 @@ def run_verify(directory: Path | None = None) -> int:
         problems.append("运行范围不是完整正式 half_test，不能声明可提交")
     if declared_submittable and not readiness["passed"]:
         problems.append("运行摘要声称可提交，但声明口径下的逐步约束核验未通过")
-    if meta.get("optimization", {}).get("model_evidence") and not readiness.get("model", {}).get("simulation_constraints_passed", False):
+    export_only = meta.get("optimization", {}).get("validation_basis") in ("causal_fallback_export", "unverified_export", "adopted_policy_fallback")
+    export_only = export_only or (meta.get("optimization", {}).get("validation_basis") == "adopted_operating_policy"
+        and meta["optimization"].get("constraint_validation_passed") is False)
+    if (meta.get("optimization", {}).get("model_evidence")
+            and not readiness.get("model", {}).get("simulation_constraints_passed", False)
+            and not (export_only and not declared_submittable)):
         problems.append("已有优化表未通过点预测模型硬约束核验: " + "; ".join(readiness["problems"]))
     zip_paths = [directory / name for name in {C.MOCK_ZIP_NAME, C.FORMAL_ZIP_NAME}
                  if (directory / name).is_file()]
@@ -293,13 +302,113 @@ def _inference_completion(window: str, optimization_report: dict, submittable: b
         return {"status": "BLOCKED_OPT", "exit_code": 2, "description": "预测完成，优化受阻"}
     if window != "half_test":
         return {"status": "SUCCESS_DRYRUN", "exit_code": 0, "description": "兼容推理完成"}
+    if optimization_report.get("validation_basis") in ("adopted_operating_policy", "adopted_policy_fallback"):
+        return {"status": "FORMAL_INFER_COMPLETE", "exit_code": 0, "description": "正式调度口径导出完成"}
     if optimization_report.get("validation_basis") in ("causal_fallback_export", "unverified_export"):
-        return {"status": "SUCCESS_INFER_UNVERIFIED", "exit_code": 0, "description": "三表导出完成（优化待核验）"}
+        return {"status": "SUCCESS_INFER_UNVERIFIED", "exit_code": 0, "description": "三表导出完成（含约束检查结果）"}
     if not submittable:
         return {"status": "SUCCESS_INFER_SIMULATED", "exit_code": 0, "description": "模拟推理完成"}
     if optimization_report.get("validation_basis") == "declared_assumptions":
         return {"status": "READY_WITH_ASSUMPTIONS", "exit_code": 0, "description": "完整推理完成（采用声明假设）"}
     return {"status": "SUCCESS_INFER", "exit_code": 0, "description": "推理完成"}
+
+
+def run_opt(quick: bool = False, experimental: bool = False, reuse_run: Path | None = None) -> int:
+    """只生成新调度，预测CSV和预测模型原样复用，不执行预测训练或推理。"""
+    import filecmp
+    import shutil
+    started = time.time()
+    if reuse_run is None:
+        candidates = [p for p in sorted(C.OUTPUT_ROOT.glob("*"), reverse=True) if p.is_dir()
+            and all((p/name).is_file() for name in ("s_result.csv", "l_result.csv", f"{C.MODEL_DIR}/model_meta.json"))]
+        if not candidates:
+            raise ValueError("没有完整预测归档，请通过 --reuse-run 指定已有运行")
+        reuse_run = candidates[0]
+    reuse_run = reuse_run.resolve()
+    meta, resource, compatibility = output.load_optimization_reference(reuse_run)
+    ctx = output.begin_run(C, mode="opt", experimental=quick or experimental, quick=quick)
+    _setup_logger(ctx.log_path)
+    LOGGER.info("仅优化运行目录: %s；预测表复用: %s", ctx.root, reuse_run)
+    summary = {"run_id": ctx.run_id, "mode": "OPT_ONLY", "status": "FAILED", "competition_stage": "SEMIFINAL",
+        "execution_focus": "optimization", "training_performed": False, "prediction_performed": False,
+        "quick": quick, "experimental": bool(quick or experimental), "reused_models_from": str(reuse_run),
+        "archive_compatibility": compatibility, "errors": []}
+    try:
+        prepared = prepare_data(C, include_inference=True)
+        origins, window = _inference_window(prepared)
+        ctx.window, ctx.prediction_grid = window, origins
+        for name in ("s_result.csv", "l_result.csv"):
+            frame = pd.read_csv(reuse_run / name)
+            check = output.validate_official_frame(name, frame, origins)
+            if not check["passed"]:
+                raise ValueError("复用预测表无效: " + "; ".join(check["problems"]))
+            shutil.copyfile(reuse_run / name, ctx.root / name)
+        opt_grid = output.expected_result_grid("opt_result.csv", origins, quick)
+        first_issue = main_opt.daily_publication_times(opt_grid)[0]
+        publication = main_opt.resource_publication_check(resource, first_issue, use_final=True)
+        if not publication["passed"]:
+            raise ValueError("冻结资源参数晚于首份发布时间: " + "; ".join(publication["problems"]))
+        training = prepare_data(C).prefix_copy(first_issue)
+        # 调度口径已改变时只重建轻量历史统计，不重训任何负荷预测器。
+        resource.final_net_supply = main_opt.fit_net_supply(training)
+        resource.final_net_supply["policy_version"] = C.OPT_CONFIG["policy_version"]
+        resource.final_train_end = str(training.index[-1])
+        masked = prepared.masked_copy(origins[0], origins[-1]+pd.Timedelta(minutes=C.STEP_MINUTES))
+        try:
+            optimization = main_opt.optimize(None, masked, origins, None, resource, quick=quick, use_final=True)
+        except Exception as exc:
+            LOGGER.exception("调度求解异常，转入完整导出兜底")
+            optimization = {"status": "OPTIMIZATION_ERROR", "schedule": None, "summary": {"reason": str(exc)}}
+        if optimization.get("schedule") is None:
+            optimization = main_opt.export_fallback_schedule(masked, origins, resource, optimization, quick=quick)
+        report = output.write_optimization(ctx, optimization["schedule"])
+        report["validation_basis"] = optimization["summary"].get("validation_basis")
+        source = output.write_source_snapshot(ctx, C)
+        shutil.copytree(reuse_run / C.MODEL_DIR, ctx.model_dir, dirs_exist_ok=True)
+        prediction_models = [p for span in ("short", "long")
+            for p in (reuse_run / C.MODEL_DIR / span).rglob("*") if p.is_file()]
+        model_reuse_identical = bool(prediction_models) and all(filecmp.cmp(p,
+            ctx.model_dir / p.relative_to(reuse_run / C.MODEL_DIR), shallow=False) for p in prediction_models)
+        if not model_reuse_identical:
+            raise ValueError("复用预测模型的文件内容不一致，停止组包")
+        # 预测契约保留复用归档的来源；本次优化参数另记，避免把新调度口径写成旧预测的来源。
+        meta.setdefault("inference_contract", output.inference_contract())
+        meta.update(source=source, optimization_contract=output.inference_contract()["OPT_CONFIG"], optimization=optimization["summary"],
+            run={"mode": "opt", "quick": quick, "experimental": bool(quick or experimental),
+                 "prediction_performed": False})
+        meta["resource"].update(net_supply=resource.final_net_supply, train_end=resource.final_train_end)
+        meta["output_contract"].update(prediction=output._grid_spec(origins),
+            optimization=output._grid_spec(ctx.optimization_grid),
+            optimization_publication_time=C.OPT_CONFIG["publication_time"],
+            optimization_time_semantics=C.OPT_CONFIG["datetime_semantics"],
+            optimization_grid_mode=C.OPT_CONFIG["optimization_grid_mode"], window=window)
+        (ctx.model_dir / "model_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        coverage = output.validate_result_files(ctx.root, origins, quick, require_optimization=True)
+        check = _inference_submission_check(window, optimization, quick=quick, experimental=experimental,
+                                             coverage=coverage, source=source)
+        packed = output.build_zip(ctx, submittable=check["passed"], config=C)
+        constraints_ok = optimization["summary"].get("constraint_validation_passed", optimization.get("submittable", False))
+        completion = ("OPT_COMPLETE" if check["passed"] else
+            "OPT_EXPERIMENT_COMPLETE" if constraints_ok else "OPT_COMPLETE_WITH_CONSTRAINT_FAILURES")
+        summary.update(status=completion, window=window, origins=len(origins),
+            optimization=report, optimization_summary=optimization["summary"], source=source, zip=packed,
+            output_root=str(ctx.root), submittable=check["passed"], submission_check=check,
+            upload_ready=packed["complete_result_set"] and packed["crc_ok"],
+            prediction_files_identical=all((ctx.root/name).read_bytes() == (reuse_run/name).read_bytes()
+                for name in ("s_result.csv", "l_result.csv")),
+            prediction_models_identical=model_reuse_identical, prediction_model_files=len(prediction_models),
+            duration_seconds=round(time.time()-started, 2))
+        output.write_report(ctx, summary)
+        print(f"仅优化完成: {ctx.root}\n预测训练/推理: 已关闭\n开始时间: {report['start']}\n结束时间: {report['end']}"
+              f"\n三表齐全: {packed['complete_result_set']}\n本地可提交: {check['passed']}"
+              f"\n逐日兜底: {len(optimization['summary'].get('fallback_publications', []))}"
+              f"\n结果包: {packed['path']}")
+        return 0
+    except Exception as exc:
+        LOGGER.exception("仅优化运行失败")
+        summary["errors"].append(str(exc))
+        output.write_report(ctx, summary)
+        return 1
 
 
 def run_infer(quick: bool = False, experimental: bool = False,
@@ -333,7 +442,7 @@ def run_infer(quick: bool = False, experimental: bool = False,
             pd.Timestamp(C.TRAIN_END), origins[0] - pd.Timedelta(minutes=C.STEP_MINUTES)))
         LOGGER.info("训练白名单: %s .. %s；半决赛测试输入仅用于冻结模型推理",
                     training.index[0], training.index[-1])
-        first_issue = main_opt.daily_publication_times(origins, quick=quick)[0]
+        first_issue = main_opt.daily_publication_times(output.expected_result_grid("opt_result.csv", origins, quick))[0]
         resource_training = training.prefix_copy(min(training.index[-1], first_issue))
         LOGGER.info("每日%s发布；资源训练截止=%s，首份计划发布=%s",
                     C.OPT_CONFIG["publication_time"], resource_training.index[-1], first_issue)
@@ -1132,9 +1241,9 @@ def _fit_calibration_prefixes(ctx, summary, prepared, specs, templates, spans=("
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="AIC 半决赛煤气发电预测与优化")
-    parser.add_argument("command", nargs="?", default="infer",
-                        choices=("run", "infer", "doctor", "self-check", "verify"),
-                        help="默认 infer 执行半决赛测试推理；run 执行历史回测")
+    parser.add_argument("command", nargs="?", default="opt" if C.EXECUTION_FOCUS == "optimization" else "infer",
+                        choices=("opt", "run", "infer", "doctor", "self-check", "verify"),
+                        help="默认 opt 只优化调度，预测表直接复用；infer 为完整预测入口")
     parser.add_argument("--run-dir", type=Path, help="verify 指定选定运行或实验结果目录")
     parser.add_argument("--quick", action="store_true", help="单折、低迭代的开发模式")
     progress_args = parser.add_mutually_exclusive_group()
@@ -1144,11 +1253,15 @@ def main(argv: list[str] | None = None) -> int:
                                help="关闭进度条，仅保留日志")
     parser.set_defaults(progress=None)
     parser.add_argument("--experiment", action="store_true", help="全量开发实验写入 tmp/tmp_outputs")
-    parser.add_argument("--reuse-run", type=Path, help="infer复用已归档的正式模型")
+    parser.add_argument("--reuse-run", type=Path, help="opt复用预测表及资源参数；infer复用完整模型")
     args = parser.parse_args(argv)
     C.PROGRESS_ENABLED = args.progress
-    if args.reuse_run and args.command != "infer":
-        parser.error("--reuse-run 只用于 infer")
+    if args.reuse_run and args.command not in ("infer", "opt"):
+        parser.error("--reuse-run 只用于 infer / opt")
+    if args.command == "opt" or (args.command == "infer" and C.EXECUTION_FOCUS == "optimization"):
+        return run_opt(quick=args.quick, experimental=args.experiment, reuse_run=args.reuse_run)
+    if args.command == "run" and C.EXECUTION_FOCUS == "optimization":
+        parser.error("当前专注优化，负荷预测训练已关闭；使用 opt 执行调度")
     if args.command == "doctor":
         return run_doctor()
     if args.command == "infer":

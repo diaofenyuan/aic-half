@@ -46,6 +46,16 @@ def daily_publication_times(origins, quick: bool = False, publication_time: str 
     return issued.unique().sort_values()
 
 
+def optimization_effective_grid(origins, quick: bool = False):
+    """正式测试按当日07:00发布的目标窗口输出，历史回归夹具保持原网格。"""
+    grid = pd.DatetimeIndex(origins)
+    official = pd.date_range(C.OFFICIAL_EVAL_START, C.OFFICIAL_EVAL_END, freq=f"{C.STEP_MINUTES}min")
+    if C.OPT_CONFIG.get("optimization_grid_mode") == "daily_target_window" and grid.equals(official):
+        hour, minute = map(int, C.OPT_CONFIG["publication_time"].split(":"))
+        grid = grid + pd.Timedelta(hours=hour, minutes=minute+C.STEP_MINUTES)
+    return grid[:2*C.STEPS_PER_DAY] if quick else grid
+
+
 def resource_publication_check(bundle, first_issue, use_final: bool = False) -> dict:
     """资源权重、耗气转换及网络必须在最早发布时刻前冻结，复用旧包同样检查。"""
     end = bundle.final_train_end if use_final else bundle.train_end
@@ -110,6 +120,8 @@ def physical_submission_check(optimization: dict) -> dict:
                                and str(summary.get("time_semantics", "")).startswith(
                                    C.OPT_CONFIG["datetime_semantics"])),
     }
+    if "production_supply" in summary:
+        checks["production_supply"] = summary["production_supply"].get("passed") is True
     descriptions = {
         "net_resource_boundary": "可用气仍为历史耗气代理包络，未核验扣除优先生产用户后的净资源边界",
         "net_material_balance": "缺少覆盖全部计划时段的净资源守恒与流量单位核验",
@@ -122,6 +134,7 @@ def physical_submission_check(optimization: dict) -> dict:
         "holder_mapping": "气柜列、容量与实际库存映射缺少核验依据",
         "converter_units": "转炉煤气单位与换算缺少核验依据",
         "priority_user_supply": "优先生产用户全时段供气约束缺少核验依据",
+        "production_supply": "本次调度存在未满足的生产需求或推测预留量",
     }
     for name in ("gas_to_power", "holder_mapping", "converter_units", "priority_user_supply"):
         item = evidence.get(name, {})
@@ -200,6 +213,7 @@ def model_submission_check(optimization: dict, config=C) -> dict:
         gt, pt, st = [config.OPT_CONFIG[key] for key in ("gas_tolerance_m3h", "power_tolerance_mw", "holder_tolerance_m3")]
         # 放散未出现在提交指令中，不能靠本地自由放散变量证明线上柜位安全。
         checks["submitted_controls_only"] = bool(np.max(np.abs(vent)) <= gt)
+        names = list(config.GAS_HOLDER["capacity_by_column_m3"])
         capacity = np.array(list(config.GAS_HOLDER["capacity_by_column_m3"].values()))
         recovery = np.zeros(2, dtype=int)
         safety = np.ones(2, dtype=bool)
@@ -215,20 +229,43 @@ def model_submission_check(optimization: dict, config=C) -> dict:
         checks["historical_resource_uncertainty"] = uncertainty["passed"]
         checks["independent_holder_error_margin"] = False
         residual = available-gas-vent
-        residual[:, 0] -= np.diff(stock, axis=0).sum(axis=1)/.25
+        shortfall = np.asarray(evidence.get("production_shortfall_m3h", np.zeros_like(available)), float)
+        valid_shortfall = bool(shortfall.shape == available.shape and np.isfinite(shortfall).all()
+            and (shortfall >= -gt).all()
+            and np.allclose(shortfall, np.maximum(-available, 0.), atol=gt, rtol=0.))
+        priority_shortfall = np.asarray(evidence.get("priority_shortfall_m3h", shortfall), float)
+        checks["production_supply"] = bool(valid_shortfall and priority_shortfall.shape == shortfall.shape
+            and np.isfinite(priority_shortfall).all() and np.max(priority_shortfall) <= 1e-6)
+        if valid_shortfall:
+            residual += shortfall
+        resets = np.asarray(evidence.get("state_reset_m3", np.zeros((n, 2))), float)
+        if resets.shape != (n, 2) or not np.isfinite(resets).all():
+            raise ValueError("每日复位差额轨迹缺失或形状错误")
+        changes = np.diff(stock, axis=0)-resets
+        residual[:, 0] -= changes.sum(axis=1)/.25
+        if evidence.get("optional_nonstorage"):
+            residual[:, 1:] = np.minimum(residual[:, 1:], 0.)
         inlet = evidence.get("holder_inlet_m3h")
         exchange = evidence.get("holder_exchange_m3h")
         if inlet is not None and exchange is not None:
             inlet, exchange = np.asarray(inlet, float), np.asarray(exchange, float)
-            holder_gas = inlet - exchange
+            release = np.asarray(evidence.get("holder_release_m3h", np.zeros((n, 2))), float)
+            if release.shape != (n, 2) or not np.isfinite(release).all():
+                raise ValueError("逐柜放散轨迹形状错误或非有限")
+            holder_gas = inlet - exchange-release
             cap = np.asarray(list(config.GAS_HOLDER["capacity_by_column_m3"].values()), float)
             checks["holder_material_balance"] = bool(inlet.shape == (n, 2) and exchange.shape == (n, 2)
                 and np.isfinite(inlet).all() and np.isfinite(exchange).all()
-                and np.max(np.abs(np.diff(stock, axis=0)/.25 - exchange)) <= gt
-                and np.max(np.abs(inlet-holder_gas-exchange)) <= gt
+                and np.max(np.abs(changes/.25 - exchange)) <= gt
+                and np.max(np.abs(inlet-holder_gas-release-exchange)) <= gt
                 and np.max(np.abs(holder_gas.sum(axis=1)-gas[:, 0])) <= gt
-                and (inlet >= -gt).all() and (holder_gas >= -gt).all()
+                and (holder_gas >= -gt).all() and (release >= -gt).all()
+                and np.max(np.abs(release.sum(axis=1)-vent[:, 0])) <= gt
                 and (np.abs(exchange) <= cap[None, :]/.25 + gt).all())
+            if config.OPT_CONFIG.get("overflow_policy") == "release_above_safe_high":
+                at_upper = np.abs(stock[1:]-cap[None, :]*config.GAS_HOLDER["safe_high_ratio"]) <= st
+                checks["submitted_controls_only"] = bool((vent[:, 1:] <= gt).all()
+                    and ((release <= gt) | at_upper).all() and checks["holder_material_balance"])
         checks["net_mass_balance"] = bool(np.max(np.abs(residual)) <= gt
             and (gas >= -gt).all() and (vent >= -gt).all() and checks.get("holder_material_balance", True))
         schedule = optimization.get("schedule")
@@ -242,12 +279,30 @@ def model_submission_check(optimization: dict, config=C) -> dict:
         on = power > pt
         checks["unit_load_bounds"] = bool((power >= -pt).all() and (power <= caps+pt).all()
             and (power[on] >= np.broadcast_to(config.OPT_CONFIG["min_load_ratio"]*caps, power.shape)[on]-pt).all())
-        checks["initial_unit_load_bounds"] = _valid_initial_unit_power(previous, config)
+        checks["initial_boundary_capacity"] = _valid_initial_boundary_power(previous, config)
         path = np.vstack((previous, power))
         checks["aggregate_ramp"] = all(np.max(np.abs(np.diff(path[:, indices].sum(axis=1)))) <= limit+pt
             for indices, limit in _aggregate_ramp_groups(config))
+        checks["generation_ramp_margin"] = all(np.max(np.abs(np.diff(path[:, indices].sum(axis=1)))) <= limit+pt
+            for indices, limit in _planning_ramp_groups(config))
+        if config.OPT_CONFIG.get("check_running_unit_ramp"):
+            continuing = (path[:-1] > pt) & (path[1:] > pt)
+            step_limit = caps * config.OPT_CONFIG["ramp_fraction_per_min"] * config.STEP_MINUTES
+            checks["running_unit_ramp"] = bool((np.abs(np.diff(path, axis=0))[continuing]
+                <= np.broadcast_to(step_limit, (n, 6))[continuing]+pt).all())
         checks["gas_power_consistency"] = bool((beta > 0.).all() and np.max(np.abs(power.sum(axis=1)-gas@beta)) <= pt)
         plans = summary.get("daily_plans", [])
+        if summary.get("holder_state_mode") == "daily_observed":
+            checks["daily_observed_reset"] = bool(plans and all(
+                plan.get("observed_at") == plan.get("issued_at")
+                and isinstance(plan.get("observed_initial_holders_m3"), dict)
+                and set(plan["observed_initial_holders_m3"]) == set(config.GAS_HOLDER["capacity_by_column_m3"])
+                and plan.get("daily_state_bridge", {}).get("future_observations_used") is False
+                for plan in plans))
+            ratios = np.asarray(evidence.get("holder_allocation_shares"), float)
+            checks["proportional_holder_withdrawal"] = bool(ratios.shape == (n, 2)
+                and np.isfinite(ratios).all() and np.allclose(ratios.sum(axis=1), 1.)
+                and np.max(np.abs(holder_gas - gas[:, :1]*ratios)) <= gt)
         checks["daily_publication_and_plan_validation"] = bool(plans and summary.get("dispatch_mode") == "daily_fixed"
             and summary.get("intraday_refresh") is False and summary.get("daily_publications") == len(plans)
             and sum(p.get("published_steps", 0) for p in plans) == n
@@ -260,14 +315,33 @@ def model_submission_check(optimization: dict, config=C) -> dict:
             and priming.get("issued_at") == plans[0].get("issued_at")
             and priming.get("first_effective_holders_m3") == plans[0].get("initial_holders_m3"))
         if checks["first_instruction_state_primed_causally"]:
-            names = list(config.GAS_HOLDER["capacity_by_column_m3"])
             before_bridge = np.asarray([priming["initial_holders_m3"][name] for name in names],float)
             after_bridge = np.asarray([priming["first_effective_holders_m3"][name] for name in names],float)
             bridge_flow = float(priming["predicted_net_blast_m3h"])-float(priming["previous_blast_use_m3h"])
+            released = sum(priming.get("automatic_release_m3", {}).values())
             checks["first_instruction_stock_balance"] = bool(np.isfinite(before_bridge).all() and np.isfinite(after_bridge).all()
-                and np.isfinite(bridge_flow) and abs((after_bridge-before_bridge).sum()-bridge_flow*config.STEP_MINUTES/60.) <= st
+                and np.isfinite(bridge_flow) and abs((after_bridge-before_bridge).sum()+released-bridge_flow*config.STEP_MINUTES/60.) <= st
                 and (before_bridge >= -st).all() and (before_bridge <= capacity+st).all()
                 and (after_bridge >= -st).all() and (after_bridge <= capacity+st).all())
+        if config.OPT_CONFIG.get("holder_state_mode") == "daily_observed":
+            bridge_validity = []
+            for plan in plans:
+                bridge = plan.get("daily_state_bridge") or {}
+                before = np.array([bridge.get("initial_holders_m3", {}).get(name, np.nan) for name in names])
+                after = np.array([bridge.get("first_effective_holders_m3", {}).get(name, np.nan) for name in names])
+                change = np.array([bridge.get("holder_change_before_release_m3", {}).get(name, np.nan) for name in names])
+                released = np.array([bridge.get("automatic_release_m3", {}).get(name, np.nan) for name in names])
+                bridge_validity.append(bool(bridge.get("future_observations_used") is False
+                    and bridge.get("inventory_was_clipped") is False
+                    and bridge.get("first_effective_at") == plan.get("effective_start")
+                    and bridge.get("issued_at") == plan.get("issued_at")
+                    and bridge.get("first_effective_holders_m3") == plan.get("initial_holders_m3")
+                    and np.isfinite([before, after, change, released]).all()
+                    and (np.abs(after-before-change+released) <= st).all()
+                    and (before >= -st).all() and (before <= capacity+st).all()
+                    and (after >= capacity*config.GAS_HOLDER["safe_low_ratio"]-st).all()
+                    and (after <= capacity*config.GAS_HOLDER["safe_high_ratio"]+st).all()))
+            checks["every_daily_state_bridge"] = bool(bridge_validity and all(bridge_validity))
         if uncertainty["passed"] and plans and optimization.get("schedule") is not None:
             lo, hi = np.asarray(uncertainty["lower_error_m3"]), np.asarray(uncertainty["upper_error_m3"])
             times = pd.DatetimeIndex(pd.to_datetime(optimization["schedule"].datetime))
@@ -284,8 +358,11 @@ def model_submission_check(optimization: dict, config=C) -> dict:
         scales = defaults.get("holder_scales", {})
         checks["assumptions_explicit"] = bool(set(scales) == set(config.GAS_HOLDER["capacity_by_column_m3"])
             and all(np.isfinite(v.get("scale_to_m3", np.nan)) and v["scale_to_m3"] > 0. for v in scales.values())
-            and defaults.get("reservation_role") and np.isfinite(defaults.get("converter_scale", np.nan))
-            and defaults["converter_scale"] > 0. and defaults.get("field_safety_certified") is False)
+            and defaults.get("reservation_role")
+            and ((defaults.get("converter_source") or "").startswith("historical_generator_use_m3h")
+                 or (defaults.get("converter_scale") is not None
+                     and np.isfinite(defaults["converter_scale"]) and defaults["converter_scale"] > 0.))
+            and defaults.get("field_safety_certified") is False)
         checks["net_resource_boundary"] = summary.get("resource_mode") == "inferred_net_surplus_after_priority_users"
         schedule = optimization.get("schedule")
         checks["schedule_present"] = schedule is not None
@@ -316,6 +393,15 @@ def model_submission_check(optimization: dict, config=C) -> dict:
 
 def submission_readiness(optimization: dict, config=C) -> dict:
     physical = physical_submission_check(optimization)
+    if config.OPT_CONFIG.get("submission_validation_basis") == "adopted_operating_policy":
+        model = model_submission_check(optimization, config)
+        diagnostics = {"historical_resource_uncertainty", "independent_holder_error_margin"}
+        problems = [name for name in model["problems"] if name not in diagnostics]
+        return {"passed": not problems and model["simulation_constraints_passed"],
+            "simulation_passed": model["simulation_constraints_passed"], "validation_basis": "adopted_operating_policy",
+            "model": model, "physical": physical, "problems": problems, "warnings": [],
+            "diagnostics": {name: model.get("checks", {}).get(name) for name in diagnostics},
+            "field_safety_certified": False}
     if config.OPT_CONFIG.get("submission_validation_basis") != "declared_assumptions":
         return {"passed": physical["passed"], "validation_basis": "strict_physical", "physical": physical,
                 "problems": physical["problems"], "warnings": []}
@@ -343,19 +429,19 @@ def net_resource_boundary(generation, priority_demand, inferred_reservation, *,
                           forecast_method=None) -> dict:
     """先保生产，再给发电和气柜分配余量；推测预留量不回写为用户实测需求。
 
-    两柜进气按官方高炉分组路由单独给出；机组耗气仍由共享母管总耗气表示，
-    逐柜出口在 MILP 内由独立库存平衡决定，不在这里预设固定分流比。
+    上游余气按高炉分组进入两柜；发电抽气采用已选的当期进气比例。
+    生产用户在管网侧扣减，缺口不默认由气柜补给。
     """
     inputs = [np.asarray(x, dtype=float) for x in (generation, priority_demand, inferred_reservation)]
     shape = inputs[0].shape
     if len(shape) != 2 or shape[1] != len(C.RESOURCE_NAMES) or shape[0] == 0 or any(x.shape != shape for x in inputs):
         raise ValueError("发生量、已知用户和推测预留量必须为同形状的[时段,三气种]数组")
     problems = []
-    if any(not np.isfinite(x).all() or (x < 0.).any() for x in inputs):
-        problems.append("发生量或生产需求缺测、非有限或为负；不得补零构造净资源")
+    if any(not np.isfinite(x).all() for x in inputs) or any((x < 0.).any() for x in inputs[:2]):
+        problems.append("发生量或生产需求为负，或资源边界存在缺测及非有限值；不得补零构造净资源")
     inlet = None
     if holder_inlet_m3h is not None:
-        inlet = np.asarray(holder_inlet_m3h, dtype=float)
+        inlet = np.asarray(holder_inlet_m3h, dtype=float).copy()
         if inlet.shape != (shape[0], len(C.GAS_HOLDER["capacity_by_column_m3"])) or not np.isfinite(inlet).all():
             problems.append("两柜高炉进气路由缺测、形状错误或含非有限值")
             inlet = None
@@ -366,17 +452,33 @@ def net_resource_boundary(generation, priority_demand, inferred_reservation, *,
     except (TypeError, ValueError):
         problems.append("净资源模型训练截止或发布时间无效")
     net = inputs[0] - inputs[1] - inputs[2]
+    # 生产用户默认在上游管网扣减；缺口独立保留，不能默认由气柜补给用户。
+    # 负净量仍是诊断真值，零值仅表示本步没有可分配给发电的新增预算。
+    shortfall = np.maximum(-net, 0.)
+    priority_shortfall = np.maximum(inputs[1]-inputs[0], 0.)
+    upstream_inlet = inlet.copy() if inlet is not None else None
+    if inlet is not None:
+        inlet[net[:, 0] < 0.] = 0.
+        if (inlet < 0.).any():
+            problems.append("上游用户扣减后存在负的逐柜进气；不能默认用户直接抽取柜内煤气")
     return {"passed": not problems, "problems": problems, "available_m3h": net,
             "generation_m3h": inputs[0], "priority_demand_m3h": inputs[1],
             "inferred_reservation_m3h": inputs[2], "training_end": str(training_end),
             "issued_at": str(issued_at), "flow_units_verified": flow_units_verified is True,
+            "dispatch_available_m3h": net + shortfall,
+            "production_shortfall_m3h": shortfall,
+            "priority_shortfall_m3h": priority_shortfall,
+            "reservation_unfunded_m3h": np.maximum(shortfall-priority_shortfall, 0.),
+            "production_supply_passed": bool(np.isfinite(shortfall).all() and not (shortfall > 1e-6).any()),
             "resource_mode": "inferred_net_surplus_after_priority_users",
             "reservation_role": "inferred_users_and_unresolved_balance_reserve; not_observed_user_truth",
             "negative_net_rows_by_gas": {g: int((net[:, i] < 0.).sum()) for i, g in enumerate(C.RESOURCE_NAMES)},
             "holder_discharge_included": False, "mixed_station_boundary": "inlet_deducted_once",
+            "priority_user_topology": "upstream_pipeline_default; direct_holder_use_exceptions_not_assumed",
+            "upstream_group_balance_m3h": upstream_inlet,
             "holder_inlet_m3h": inlet,
             "holder_inlet_basis": ("blast_furnace_1_3_to_30e4_holder; blast_furnace_4_5_to_20e4_holder; "
-                                   "generator_withdrawal_shared_by_independent_balances"
+                                   "generator_withdrawal_inlet_proportional; priority_users_upstream"
                                    if inlet is not None else "unavailable"),
             "forecast_components": forecast_components or {},
             "forecast_method": forecast_method or "declared_net_supply"}
@@ -387,7 +489,8 @@ def validate_net_dispatch(boundary: dict, result: dict, initial_holders: dict,
     """逐柜守恒及独立安全；两柜总库存合规不能抵消其中一柜越界。"""
     names = tuple(config.GAS_HOLDER["capacity_by_column_m3"])
     problems = list(boundary.get("problems", []))
-    available = np.asarray(boundary["available_m3h"], dtype=float)
+    signed_available = np.asarray(boundary["available_m3h"], dtype=float)
+    available = np.asarray(boundary.get("dispatch_available_m3h", signed_available), dtype=float)
     n = len(available)
     initial = np.array([initial_holders.get(name, np.nan) for name in names], dtype=float)
     levels = np.asarray(result.get("holders_m3", []), dtype=float)
@@ -410,9 +513,19 @@ def validate_net_dispatch(boundary: dict, result: dict, initial_holders: dict,
     stock_residual = levels - previous - dt * reconstructed
     material_residual = available - gas.T - vent.T
     material_residual[:, 0] -= reconstructed.sum(axis=1)
+    if boundary.get("optional_nonstorage"):
+        material_residual[:, 1:] = np.minimum(material_residual[:, 1:], 0.)
     expected = (np.asarray(boundary["generation_m3h"]) - np.asarray(boundary["priority_demand_m3h"])
                 - np.asarray(boundary["inferred_reservation_m3h"]))
-    boundary_consistent = bool(expected.shape == available.shape and np.allclose(expected, available, atol=gt, rtol=0.))
+    shortfall = np.asarray(boundary.get("production_shortfall_m3h", np.zeros_like(available)), float)
+    expected_shortfall = np.maximum(-signed_available, 0.)
+    boundary_consistent = bool(expected.shape == available.shape and shortfall.shape == available.shape
+        and np.allclose(expected, signed_available, atol=gt, rtol=0.)
+        and np.allclose(shortfall, expected_shortfall, atol=gt, rtol=0.)
+        and np.allclose(available, signed_available + shortfall, atol=gt, rtol=0.))
+    known_deficit = np.asarray(boundary["priority_shortfall_m3h"], float)
+    production_deficit = known_deficit if boundary.get("optional_nonstorage") else np.maximum(known_deficit, shortfall)
+    production_ok = bool(boundary_consistent and not (production_deficit > 1e-6).any())
     allocation = result.get("holder_columns") == list(names)
     exchange_consistent = bool((np.abs(exchange - reconstructed) <= st).all())
     routing = bool((withdrawal >= -gt).all() and (release >= -gt).all()
@@ -426,8 +539,9 @@ def validate_net_dispatch(boundary: dict, result: dict, initial_holders: dict,
         low, high = capacity * config.GAS_HOLDER["safe_low_ratio"], capacity * config.GAS_HOLDER["safe_high_ratio"]
         initial_inside = bool(low - st <= initial[i] <= high + st)
         recovery = max(1, min(int(config.OPT_CONFIG.get("holder_recovery_steps", 4)), n))
-        start = 0 if initial_inside else recovery
-        inside = bool(((levels[start:, i] >= low - st) & (levels[start:, i] <= high + st)).all()) if start < n else True
+        start = 0 if initial_inside else recovery - 1
+        inside = bool(((levels[start:, i] >= low - st) & (levels[start:, i] <= high + st)).all()
+            and (path >= -st).all() and (path <= capacity + st).all())
         margin = capacity * config.OPT_CONFIG["holder_margin_ratio"]
         planned_low, planned_high = _independent_holder_plan_bounds(initial, n, config)
         planned = bool(((levels[:, i] >= planned_low[i] - st) & (levels[:, i] <= planned_high[i] + st)).all())
@@ -449,16 +563,24 @@ def validate_net_dispatch(boundary: dict, result: dict, initial_holders: dict,
         if not holders[name]["passed"]:
             problems.append(f"{name}独立安全、单位或库存守恒未通过")
     nonnegative = bool((gas >= -gt).all() and (vent >= -gt).all())
-    if np.max(np.abs(vent)) > gt:
+    automatic_release_ok = bool(config.OPT_CONFIG.get("overflow_policy") == "release_above_safe_high"
+        and (vent[1:] <= gt).all()
+        and all((np.abs(levels[release[:, j] > gt, j]-config.GAS_HOLDER["capacity_by_column_m3"][name]
+             *config.GAS_HOLDER["safe_high_ratio"]) <= st).all() for j, name in enumerate(names)))
+    if np.max(np.abs(vent)) > gt and not automatic_release_ok:
         problems.append("提交路径依赖未提交的放散控制")
     closed = bool((np.abs(material_residual) <= gt).all() and nonnegative and boundary_consistent
                   and routing and exchange_consistent and boundary.get("passed") is True)
     if not closed:
         problems.append("扣除生产需求后，发电、放散与两柜交换不守恒")
+    if not production_ok:
+        problems.append("生产需求或推测预留存在未满足量；零发电预算不代表生产已获供气")
     flow_verified = boundary.get("flow_units_verified") is True
-    net_check = {"passed": bool(closed and flow_verified), "arithmetic_passed": closed,
+    net_check = {"passed": bool(closed and flow_verified and production_ok), "arithmetic_passed": closed,
         "rows": n, "balance_max_m3h": float(np.abs(material_residual).max()),
         "flow_units_verified": flow_verified, "inferred_demand_is_observed": False,
+        "production_supply_passed": production_ok,
+        "production_shortfall_m3": (shortfall.sum(axis=0) * dt).tolist(),
         "holder_routing_passed": routing, "holder_exchange_consistent": exchange_consistent,
         "withdrawal_matches_submitted_gas": bool((np.abs(withdrawal.sum(axis=1) - gas[0]) <= gt).all())}
     if not flow_verified:
@@ -483,14 +605,16 @@ def solve_net_day(boundary: dict, price, initial_holders: dict, initial_power,
         return {"status": "BLOCKED_OPT", "message": "净资源边界或两柜初始库存、单位未通过；不虚构未知库存"}
     if any(config.OPT_CONFIG.get(key) is not None for key in ("terminal_inventory_m3", "planned_inventory_floor_m3")):
         return {"status": "BLOCKED_OPT", "message": "单柜库存目标不能直接用于两柜，须分别定义约束"}
-    available = np.asarray(boundary["available_m3h"], dtype=float)
+    available = np.asarray(boundary.get("dispatch_available_m3h", boundary["available_m3h"]), dtype=float)
     prices = np.asarray(price, dtype=float)
     if prices.shape != (len(available),):
         return {"status": "BLOCKED_OPT", "message": "净资源时段与电价长度不一致"}
     result = _solve_day(available, prices, float(initial.sum()), np.asarray(initial_power, dtype=float),
                         np.asarray(caps, dtype=float), heat_rate, config, conserve_all_gases=True,
                         independent_holders=initial_holders,
-                        holder_inlet=boundary.get("holder_inlet_m3h"))
+                        holder_inlet=boundary.get("holder_inlet_m3h"),
+                        holder_shares=boundary.get("holder_allocation_shares"),
+                        optional_nonstorage=boundary.get("optional_nonstorage", False))
     if result["status"] not in ("OPTIMAL", "FEASIBLE_TIMEOUT"):
         return result
     result["network_validation"] = validate_net_dispatch(boundary, result, initial_holders, holder_units_verified, config)
@@ -500,7 +624,7 @@ def solve_net_day(boundary: dict, price, initial_holders: dict, initial_power,
         for h in network["independent_holder_validation"].get("holders", {}).values())
     if not model_constraints:
         return {"status": "INVALID_SOLUTION", "message": str(result["network_validation"])}
-    result["model_constraints_passed"] = model_constraints
+    result["model_constraints_passed"] = bool(model_constraints and network["net_resource_validation"]["production_supply_passed"])
     result["resource_mode"] = boundary["resource_mode"]
     result["physical_feasibility_certified"] = False
     result["topology_basis"] = ("blast_furnace_1_3_to_30e4_holder; blast_furnace_4_5_to_20e4_holder; "
@@ -644,12 +768,13 @@ def _calibrate_net_error(prepared, observed, scales):
         times = pd.date_range(issue+pd.Timedelta(minutes=C.STEP_MINUTES), periods=96, freq="15min")
         actual = net_proxy.reindex(times).to_numpy(float)
         initial_states = stock.reindex([issue-pd.Timedelta(minutes=C.STEP_MINUTES),issue,times[0]]).to_numpy(float)
-        past = observed.loc[issue-pd.Timedelta(days=28):issue]
+        past = observed.loc[issue-pd.Timedelta(days=28):issue].copy()
+        past.loc[past.index >= issue, "blast_residual"] = np.nan
         if not len(past) or not np.isfinite(actual).all() or not np.isfinite(initial_states).all():
             continue
         profile = past.groupby(past.index.hour*4+past.index.minute//15).median().reindex(range(96)).fillna(past.median())
         slots = times.hour*4+times.minute//15
-        prediction = (profile.blast_generation-profile.blast_priority-profile.blast_residual.clip(lower=0.)).to_numpy()[slots]
+        prediction = (profile.blast_generation-profile.blast_priority-profile.blast_residual).to_numpy()[slots]
         if np.isfinite(prediction).all():
             paths.append(np.cumsum((actual-prediction)*(C.STEP_MINUTES/60.)).tolist())
             issues.append(str(issue))
@@ -700,11 +825,18 @@ def _net_supply_history(pack: dict, observed: pd.DataFrame | None = None,
         lower = pd.Timestamp(pack["train_end"])
         upper = pd.Timestamp(issue) if issue is not None else observed.index.max()
         columns = [c for c in frame.columns if c in observed]
-        extra = observed.loc[(observed.index >= lower) & (observed.index < upper), columns].copy()
+        extra = observed.loc[(observed.index >= lower) & (observed.index <= upper), columns].copy()
+        # 当刻瞬时过程量可见；依赖下一柜位的残差必须等下一采样点才闭合。
+        delayed = [c for c in ("blast_residual", "blast_net_label", "blast_storage_change_m3h") if c in extra]
+        extra.loc[extra.index >= upper, delayed] = np.nan
         if len(extra):
             extra.index.name = "datetime"
             frame = pd.concat([frame, extra], axis=0).sort_index()
             frame = frame[~frame.index.duplicated(keep="last")]
+    if issue is not None:
+        upper = pd.Timestamp(issue)
+        frame = frame.loc[(frame.index >= upper-pd.Timedelta(days=C.OPT_CONFIG["net_supply_history_days"]))
+                          & (frame.index <= upper)]
     return frame
 
 
@@ -718,16 +850,19 @@ def fit_net_supply(prepared: PreparedData) -> dict:
     """
     prepared.require_training_data()
     _, ledger = physical_gas_ledger(prepared, len(prepared.index) - 1)
-    observed, unknown = pd.DataFrame(index=prepared.index), {}
+    observed, unknown, priority_columns = pd.DataFrame(index=prepared.index), {}, {}
     for gas, item in ledger.items():
         generation_columns = item["generation_columns"]
         users = item["priority_user_columns"] + [item["mixed_station_column"]]
         present = [c for c in users if prepared.observed_values([c])[c].notna().any()]
+        priority_columns[gas] = present
         unknown[gas] = [c for c in users if c not in present]
         generation = prepared.observed_values(generation_columns).sum(axis=1, min_count=len(generation_columns))
-        if gas == "converter":
-            generation *= C.CONVERTER_GAS_SCALE
         priority = prepared.observed_values(present).sum(axis=1, min_count=len(present))
+        if gas == "converter":
+            optional = prepared.observed_values(["load_generator_use_converter_gas"]).iloc[:, 0]
+            observed["converter_optional_use"] = optional
+            generation = priority + optional
         observed[gas + "_generation"] = generation
         observed[gas + "_priority"] = priority
 
@@ -740,9 +875,7 @@ def fit_net_supply(prepared: PreparedData) -> dict:
                       if np.isfinite(maximum) and maximum > 0. and maximum * 10. ** exponent <= capacity]
         default = C.OPT_CONFIG.get("holder_scale_to_m3", {}).get(name)
         scale = default if default is not None else (max(candidates) if candidates else None)
-        if scale is not None and np.isfinite(maximum) and maximum * scale > capacity:
-            scale = max(candidates) if candidates else None
-        scales[name] = {"scale_to_m3": scale, "status": "declared_default_inferred", "verified": False,
+        scales[name] = {"scale_to_m3": scale, "status": "adopted_project_mapping", "verified": False,
             "raw_max_in_training_prefix": maximum if np.isfinite(maximum) else None,
             "capacity_m3": capacity,
             "source": "official_capacity_and_legal_raw_prefix; not_sensor_unit_proof"}
@@ -773,7 +906,7 @@ def fit_net_supply(prepared: PreparedData) -> dict:
         column = gas + "_residual"
         series = recent[column].groupby(slots).quantile(quantile).reindex(range(96))
         residual_high[column] = series.fillna(float(recent[column].quantile(quantile))).tolist()
-    history_columns = (["blast_generation_13", "blast_generation_45", "blast_storage_change_m3h"]
+    history_columns = (["blast_generation_13", "blast_generation_45", "blast_storage_change_m3h", "converter_optional_use"]
         + [gas + "_" + part for gas in C.RESOURCE_NAMES for part in ("generation", "priority", "residual")])
     history_columns = [c for c in history_columns if c in recent]
     history_frame = recent[history_columns].reset_index()
@@ -782,13 +915,14 @@ def fit_net_supply(prepared: PreparedData) -> dict:
     for _, row in history_frame.iterrows():
         history_rows.append([str(row["datetime"])] + [
             None if not np.isfinite(float(row[c])) else float(row[c]) for c in history_columns])
-    pack = {"method": "causal_component_slot_profile_q75", "train_end": str(prepared.index[-1]),
+    pack = {"method": "causal_28_day_slot_median", "train_end": str(prepared.index[-1]),
         "profile": {column: [float(v) if np.isfinite(v) else None for v in profile[column]]
                     for column in profile},
         "residual_high": residual_high,
         "history": {"columns": ["datetime"] + history_columns, "rows": history_rows},
         "observed_rows": {column: int(recent[column].notna().sum()) for column in recent},
-        "unknown_users": unknown, "converter_scale": C.CONVERTER_GAS_SCALE,
+        "unknown_users": unknown, "priority_columns": priority_columns, "converter_scale": None,
+        "converter_source": "historical_generator_use_m3h; raw_converter_generation_not_used",
         "flow_units_verified": False, "holder_scale_hypotheses": scales,
         "holder_inlet_basis": C.OPT_CONFIG["holder_inlet_split"],
         "reservation_role": "inferred_unobserved_users_vent_inventory_and_meter_reserve; not_observed_user_truth",
@@ -800,7 +934,7 @@ def fit_net_supply(prepared: PreparedData) -> dict:
     return pack
 
 
-def _observed_net_frame(prepared: PreparedData) -> pd.DataFrame:
+def _observed_net_frame(prepared: PreparedData, pack: dict | None = None) -> pd.DataFrame:
     """按训练画像同一口径构造测试期已观测前缀，供每日因果更新使用。
 
     只允许调用方把 `issued_at` 之前的行并入；这里保留全窗口以便一次性构造，
@@ -819,16 +953,27 @@ def _observed_net_frame(prepared: PreparedData) -> pd.DataFrame:
                       "gas_into_gas_mixed_converter"),
     }
     for gas, (generation_columns, user_columns, mixed) in specifications.items():
-        present = [c for c in (*user_columns, mixed) if c in prepared.frame
-                   and prepared.observed_values([c])[c].notna().any()]
+        if pack is not None:
+            # 字段白名单由合法训练前缀确定；未来首次出现的用户列不能改变过去的资源画像。
+            present = pack.get("priority_columns", {}).get(gas)
+            if present is None:
+                unavailable = set(pack.get("unknown_users", {}).get(gas, []))
+                prefix = prepared.observed_values((*user_columns, mixed)).loc[:pd.Timestamp(pack["train_end"])]
+                present = [c for c in (*user_columns, mixed) if c not in unavailable and prefix[c].notna().any()]
+        else:
+            present = [c for c in (*user_columns, mixed) if c in prepared.frame
+                       and prepared.observed_values([c])[c].notna().any()]
         generation = prepared.observed_values(generation_columns).sum(axis=1, min_count=len(generation_columns))
-        if gas == "converter":
-            generation = generation * C.CONVERTER_GAS_SCALE
         priority = prepared.observed_values(present).sum(axis=1, min_count=len(present))
+        if gas == "converter":
+            optional = prepared.observed_values(["load_generator_use_converter_gas"]).iloc[:, 0]
+            observed["converter_optional_use"] = optional
+            generation = priority + optional
         observed[gas + "_generation"] = generation
         observed[gas + "_priority"] = priority
     names = list(C.GAS_HOLDER["capacity_by_column_m3"])
-    scales = [C.OPT_CONFIG.get("holder_scale_to_m3", {}).get(name) for name in names]
+    scales = [(pack or {}).get("holder_scale_hypotheses", {}).get(name, {}).get("scale_to_m3",
+        C.OPT_CONFIG.get("holder_scale_to_m3", {}).get(name)) for name in names]
     stock = prepared.observed_values(names).mul(scales, axis=1)
     storage_change = (stock.shift(-1) - stock).sum(axis=1, min_count=2) / (C.STEP_MINUTES / 60.)
     observed["blast_storage_change_m3h"] = storage_change
@@ -848,16 +993,14 @@ def _observed_net_frame(prepared: PreparedData) -> pd.DataFrame:
 
 def forecast_net_supply(pack: dict, issued_at, observed: pd.DataFrame | None = None) -> dict:
 
-    """因果净资源预测：同日时段画像 + 最近偏移 + 残差高分位。
+    """因果净资源预测：分时画像、近期偏移及已闭合历史的分时残差中位数。
 
-    高炉进气按 1#/2#/3# 与 4#/5# 分组拆分；机组总耗气仍作为一个共享抽气量，
-    两柜出口由独立库存平衡在 MILP 内决定。残差取高分位，避免把历史平均
-    未观测用户全部当作可利用余气。
+    用户耗气先在管网侧扣减；余气按高炉分组进入两柜，发电按进气比例抽取。
     """
     issue = pd.Timestamp(issued_at)
     effective = pd.date_range(issue + pd.Timedelta(minutes=C.STEP_MINUTES), periods=96, freq="15min")
     slots = effective.hour * 4 + effective.minute // 15
-    if pack.get("method") != "causal_component_slot_profile_q75":
+    if pack.get("method") not in ("causal_component_slot_profile_q75", "causal_28_day_slot_median"):
         # 兼容旧冻结画像：旧方法仍按原口径运行，但不作为新方案默认。
         blocks = []
         for component in ("generation", "priority", "residual"):
@@ -881,11 +1024,19 @@ def forecast_net_supply(pack: dict, issued_at, observed: pd.DataFrame | None = N
     for gas in C.RESOURCE_NAMES:
         generation = _causal_component_forecast(history, gas + "_generation", slots, recent_steps=recent_steps)
         priority = _causal_component_forecast(history, gas + "_priority", slots, recent_steps=recent_steps)
-        residual_mid = _causal_component_forecast(history, gas + "_residual", slots, recent_steps=recent_steps)
-        residual_high = _causal_component_forecast(history, gas + "_residual", slots, quantile=quantile,
-                                                   recent_steps=recent_steps)
-        residual_mid = np.maximum(residual_mid, 0.)
-        residual_high = np.maximum(residual_high, 0.)
+        residual_history = history[gas + "_residual"].dropna()
+        by_slot = residual_history.groupby(_slot_numbers(residual_history.index)).median().reindex(range(96))
+        by_slot = by_slot.fillna(float(residual_history.median()))
+        residual_mid = by_slot.reindex(slots).to_numpy(float)
+        residual_high = residual_mid.copy()
+        if gas == "converter":
+            optional_column = "converter_optional_use"
+            if optional_column not in history:
+                history[optional_column] = history["converter_generation"]-history["converter_priority"]-history["converter_residual"]
+            optional = np.maximum(_causal_component_forecast(history, optional_column, slots,
+                recent_steps=recent_steps), 0.)
+            generation, residual_mid, residual_high = priority + optional, np.zeros(96), np.zeros(96)
+        # 残差包含计量差额，保留合法历史中位数的符号，避免悄悄改变平衡期望。
         mid = generation - priority - residual_mid
         low = generation - priority - residual_high
         components[gas] = {"generation_m3h": generation, "priority_m3h": priority,
@@ -897,7 +1048,7 @@ def forecast_net_supply(pack: dict, issued_at, observed: pd.DataFrame | None = N
     generation_45 = _causal_component_forecast(history, "blast_generation_45", slots, recent_steps=recent_steps)
     total_blast = generation_13 + generation_45
     share_13 = np.divide(generation_13, total_blast, out=np.full(len(slots), 0.6), where=total_blast > 0.)
-    share_13 = np.clip(share_13, 0.50, 0.70)
+    share_13 = np.clip(share_13, 0., 1.)
 
     generation = np.column_stack((total_blast,
         components["coke"]["generation_m3h"], components["converter"]["generation_m3h"]))
@@ -910,19 +1061,7 @@ def forecast_net_supply(pack: dict, issued_at, observed: pd.DataFrame | None = N
         generation[:, 0] *= float(C.OPT_CONFIG.get("net_supply_first_issue_factor", 1.0))
     priority = np.column_stack([components[gas]["priority_m3h"] for gas in C.RESOURCE_NAMES])
     reservation = np.column_stack([components[gas]["residual_high_m3h"] for gas in C.RESOURCE_NAMES])
-    # 无储气的气种只能先分配可供给的生产需求。分别保留请求量及供给缺口，
-    # 防止独立预测的需求高于发生量时，把负净量直接送入发电求解器。
-    for index in (1, 2):
-        gas = C.RESOURCE_NAMES[index]
-        requested_priority = priority[:, index].copy()
-        requested_reservation = reservation[:, index].copy()
-        priority[:, index] = np.minimum(requested_priority, generation[:, index])
-        remainder = np.maximum(generation[:, index] - priority[:, index], 0.)
-        reservation[:, index] = np.minimum(requested_reservation, remainder)
-        components[gas].update(
-            priority_shortfall_m3h=requested_priority - priority[:, index],
-            reservation_unfunded_m3h=requested_reservation - reservation[:, index])
-    # 两柜进气之和必须等于净资源边界中的高炉可用量，否则逐柜守恒会与总量矛盾。
+    # 用户先由上游管网供气；不足量在边界中单列，不默认为气柜向用户补气。
     available_blast = generation[:, 0] - priority[:, 0] - reservation[:, 0]
     inlet_total = np.maximum(available_blast, 0.)
     inlet = np.column_stack((inlet_total * share_13, inlet_total * (1. - share_13)))
@@ -930,6 +1069,12 @@ def forecast_net_supply(pack: dict, issued_at, observed: pd.DataFrame | None = N
         training_end=pack["train_end"], flow_units_verified=pack["flow_units_verified"],
         holder_inlet_m3h=inlet, forecast_method=pack["method"])
     boundary["model"] = pack["method"]
+    boundary["optional_nonstorage"] = True
+    boundary["holder_allocation_shares"] = np.column_stack((share_13, 1.-share_13))
+    for index, gas in enumerate(C.RESOURCE_NAMES):
+        if index:
+            components[gas].update(priority_shortfall_m3h=boundary["priority_shortfall_m3h"][:, index],
+                reservation_unfunded_m3h=boundary["reservation_unfunded_m3h"][:, index])
     boundary["forecast_components"] = {
         gas: {key: [float(v) for v in value] for key, value in item.items()}
         for gas, item in components.items()}
@@ -938,7 +1083,37 @@ def forecast_net_supply(pack: dict, issued_at, observed: pd.DataFrame | None = N
     return boundary
 
 
-def _prime_first_effective_state(prepared, position, pack, initial, observed=None):
+def _publication_blast_balance(pack, issued_at, observed=None):
+    """桥接时段从发布同刻开始；已知瞬时发生量、用户量优先于下一时刻预测。"""
+    issue = pd.Timestamp(issued_at)
+    history = _net_supply_history(pack, observed=observed, issue=issue)
+    if history is None or history.empty:
+        raise ValueError("发布时刻之前缺少净资源历史，不能构造桥接库存")
+    slot = int(issue.hour*4+issue.minute//15)
+    row = history.reindex([issue]).iloc[0]
+    values, inferred = {}, []
+    for name in ("blast_generation_13", "blast_generation_45", "blast_priority"):
+        value = row.get(name, np.nan)
+        if not np.isfinite(value):
+            value = _causal_component_forecast(history, name, np.array([slot]),
+                recent_steps=C.OPT_CONFIG["net_supply_recent_steps"])[0]
+            inferred.append(name)
+        values[name] = float(value)
+    residual = history["blast_residual"].dropna()
+    same_slot = residual.loc[_slot_numbers(residual.index)==slot]
+    reservation = float(same_slot.median() if len(same_slot) else residual.median())
+    generation = values["blast_generation_13"]+values["blast_generation_45"]
+    if not np.isfinite([*values.values(), reservation]).all() or generation<=0.:
+        raise ValueError("发布同刻的发生、用户或历史残差不可用，不能填造桥接供气")
+    shares = np.array([values["blast_generation_13"], values["blast_generation_45"]])/generation
+    net = generation-values["blast_priority"]-reservation
+    return float(max(net, 0.)), shares, {"resource_at": str(issue), "inferred_components": inferred,
+        "upstream_signed_balance_m3h": float(net), "upstream_demand_shortfall_m3h": float(max(-net, 0.)),
+        "residual_m3h": reservation, "residual_role": "closed_history_slot_median; inferred",
+        "integration_assumption": "publication_instant_flow_held_constant_until_first_instruction"}
+
+
+def _prime_first_effective_state(prepared, position, pack, initial, observed=None, committed_blast_use=None):
     """首条指令生效前仍执行既有耗气；只按发布时刻已知量推进这一个时段。
 
     允许首条指令前的实测柜位已在安全区外，但必须在容量内；不把越界初值裁成
@@ -947,6 +1122,8 @@ def _prime_first_effective_state(prepared, position, pack, initial, observed=Non
     names = list(C.GAS_HOLDER["capacity_by_column_m3"])
     issue = prepared.index[position]
     old_gas = prepared.observed_values(["load_generator_use_blast_furnace_gas"]).iloc[position, 0]
+    if committed_blast_use is not None:
+        old_gas = float(committed_blast_use)
     if not np.isfinite(old_gas) or old_gas < 0.:
         raise ValueError("首条优化指令生效前缺少当前已知高炉耗气，不能构造桥接库存")
     boundary = forecast_net_supply(pack, issue, observed=observed)
@@ -961,42 +1138,43 @@ def _prime_first_effective_state(prepared, position, pack, initial, observed=Non
     basis = "causal_net_forecast_and_observed_committed_use; inferred_holder_inlet_split"
     pair = prepared.observed_values(names).iloc[max(position - 1, 0):position + 1]
     scales = np.array([pack["holder_scale_hypotheses"][n]["scale_to_m3"] for n in names], float)
-    if len(pair) == 2 and pair.notna().all().all() and pair.index[1] - pair.index[0] == pd.Timedelta(minutes=C.STEP_MINUTES):
+    measured_use = prepared.observed_values(["load_generator_use_blast_furnace_gas"]).iloc[position, 0]
+    bridge_resource = None
+    if (np.isfinite(measured_use) and len(pair) == 2 and pair.notna().all().all()
+            and pair.index[1] - pair.index[0] == pd.Timedelta(minutes=C.STEP_MINUTES)):
         # 只外推指令生效前的一步供需差；不把早前柜位变化配给未来新指令。
         allocation = pair.diff().iloc[-1].to_numpy(float) * scales
+        if committed_blast_use is not None:
+            shares = np.asarray(boundary["holder_allocation_shares"], float)[0]
+            allocation += (float(measured_use)-old_gas)*(C.STEP_MINUTES/60.)*shares
         volume = float(allocation.sum())
         net = old_gas + volume / (C.STEP_MINUTES / 60.)
         basis = "latest_complete_observed_holder_drift_persistence; inferred_one_step_state"
     else:
-        if inlet is not None:
-            weights = np.asarray(inlet[0], float)
-            weights = np.maximum(weights, 0.) if volume >= 0. else np.maximum(-weights, 0.)
-        else:
-            weights = capacity.copy()
-        if not np.isfinite(weights).all() or weights.sum() <= 0.:
-            weights = capacity.copy()
-        weights = weights / weights.sum()
-        room = capacity - states if volume >= 0. else states
-        desired = volume * weights
-        allocation = np.minimum(desired, room) if volume >= 0. else -np.minimum(-desired, room)
-        remaining = volume - allocation.sum()
-        if abs(remaining) > C.OPT_CONFIG["holder_tolerance_m3"]:
-            free = room - np.abs(allocation)
-            if free.sum() <= C.OPT_CONFIG["holder_tolerance_m3"]:
-                raise ValueError("指令生效前的既有耗气无法在气柜容量内维持")
-            extra = remaining * free / free.sum()
-            allocation = allocation + extra
+        net, shares, bridge_resource = _publication_blast_balance(pack, issue, observed=observed)
+        allocation = (net-old_gas)*shares*(C.STEP_MINUTES/60.)
+        volume = float(allocation.sum())
+        basis = "publication_timestamp_observed_components_and_closed_residual; inferred_net_balance"
     after = states + allocation
-    if (after < -C.OPT_CONFIG["holder_tolerance_m3"]).any() or (after > capacity + C.OPT_CONFIG["holder_tolerance_m3"]).any():
-        raise ValueError("首条指令生效前的一步库存预测越过气柜容量")
+    release = np.maximum(after-high, 0.)
+    if C.OPT_CONFIG.get("overflow_policy") == "release_above_safe_high":
+        after = after-release
+    else:
+        release[:] = 0.
+    capacity_passed = bool((after >= -C.OPT_CONFIG["holder_tolerance_m3"]).all()
+        and (after <= capacity+C.OPT_CONFIG["holder_tolerance_m3"]).all())
     inside_safe = bool(((states >= low - C.OPT_CONFIG["holder_tolerance_m3"]) & (states <= high + C.OPT_CONFIG["holder_tolerance_m3"])).all())
     after_safe = bool(((after >= low - C.OPT_CONFIG["holder_tolerance_m3"]) & (after <= high + C.OPT_CONFIG["holder_tolerance_m3"])).all())
     return dict(zip(names, after.tolist())), {"issued_at": str(issue),
         "first_effective_at": str(issue + pd.Timedelta(minutes=C.STEP_MINUTES)),
         "interval_semantics": "command_start_to_next_step", "previous_blast_use_m3h": float(old_gas),
         "predicted_net_blast_m3h": net, "initial_holders_m3": dict(initial),
+        "automatic_release_m3": dict(zip(names, release.tolist())),
+        "holder_change_before_release_m3": dict(zip(names, allocation.tolist())),
+        "bridge_resource": bridge_resource,
         "first_effective_holders_m3": dict(zip(names, after.tolist())),
         "initial_inside_safe_band": inside_safe, "first_effective_inside_safe_band": after_safe,
+        "capacity_passed": capacity_passed, "inventory_was_clipped": False,
         "holder_inlet_basis": boundary.get("holder_inlet_basis", "unavailable"),
         "basis": basis, "future_observations_used": False, "field_safety_certified": False}
 
@@ -1048,6 +1226,19 @@ def dispatch_readiness(bundle: ResourceBundle, prepared: PreparedData, first_iss
     audit = physical_input_audit(prepared, first_issue)
     heat = bundle.final_heat_rate if use_final else bundle.heat_rate
     publication = resource_publication_check(bundle, first_issue, use_final)
+    if C.OPT_CONFIG.get("submission_validation_basis") == "adopted_operating_policy":
+        beta = [heat.get("coefficients_mw_per_m3h", {}).get(g, np.nan) for g in C.RESOURCE_NAMES]
+        raw = prepared.observed_values(list(C.GAS_HOLDER["capacity_by_column_m3"])).reindex([pd.Timestamp(first_issue)])
+        checks = {"training_before_first_issue": publication["passed"],
+            "positive_gas_power_coefficients": bool(np.isfinite(beta).all() and min(beta) > 0.),
+            "fresh_independent_initials": bool(raw.notna().all(axis=None)),
+            "resource_statistics_available": bool(bundle.final_net_supply if use_final else bundle.models)}
+        return {"passed": all(checks.values()), "checks": checks,
+            "blocked_items": [name for name, valid in checks.items() if not valid],
+            "problems": [name for name, valid in checks.items() if not valid],
+            "resource_publication_check": publication, "input_audit": audit,
+            "policy_version": C.OPT_CONFIG["policy_version"], "decision_status": "ADOPTED", "pending_decisions": [],
+            "resource_target_semantics": "inferred_net_surplus_after_priority_users", "field_safety_certified": False}
     physical = bundle.final_physical_validation if use_final else bundle.physical_validation
     ledger = physical.get("priority_user_supply", {}).get("gas_ledger", {})
     checks = {"training_before_first_issue": publication["passed"],
@@ -1777,6 +1968,13 @@ def _aggregate_ramp_groups(config=C):
             (np.arange(len(units)), float(units.sum() * fraction))]
 
 
+def _planning_ramp_groups(config=C):
+    groups = _aggregate_ramp_groups(config)
+    return [(indices, min(limit, float(config.OPT_CONFIG.get("generation_ramp_limit_mw", limit)))
+             if len(indices) == len(config.OPT_CONFIG["unit_capacity_mw"]) else limit)
+            for indices, limit in groups]
+
+
 def _valid_initial_unit_power(power, config=C):
     values = np.asarray(power, float)
     caps = np.asarray(config.OPT_CONFIG["unit_capacity_mw"], float)
@@ -1784,6 +1982,15 @@ def _valid_initial_unit_power(power, config=C):
     return bool(values.shape == caps.shape and np.isfinite(values).all()
         and (values >= -tolerance).all() and (values <= caps+tolerance).all()
         and ((values <= tolerance) | (values >= caps*config.OPT_CONFIG["min_load_ratio"]-tolerance)).all())
+
+
+def _valid_initial_boundary_power(power, config=C):
+    """历史边界可能处于启停过渡；最低开机负荷约束只施加于新发布指令。"""
+    values = np.asarray(power, float)
+    caps = np.asarray(config.OPT_CONFIG["unit_capacity_mw"], float)
+    tolerance = config.OPT_CONFIG["power_tolerance_mw"]
+    return bool(values.shape == caps.shape and np.isfinite(values).all()
+        and (values >= -tolerance).all() and (values <= caps+tolerance).all())
 
 
 def _initial_unit_power(first, total, config=C):
@@ -1809,24 +2016,82 @@ def _initial_unit_power(first, total, config=C):
                 feasible = True
                 break
         if not feasible:
-            raise ValueError("初始聚合负荷无法分解为满足额定容量和最低开机负荷的组合")
-    if not _valid_initial_unit_power(values, config):
-        raise ValueError("机组初态分解未通过逐台负荷核验")
+            # 保留历史实测聚合量，不能因稳态组合空档而改成全停初态。
+            if aggregate > units[indices].sum()+tolerance:
+                raise ValueError("初始聚合负荷超过组内容量")
+            count = max(1, int(np.ceil(aggregate/units[indices[0]])))
+            values[indices[:count]] = aggregate/count
+    if not _valid_initial_boundary_power(values, config):
+        raise ValueError("机组初始边界超出额定容量")
     return values
+
+
+def _dispatch_initial_state(prepared, position, heat_rate, config=C):
+    """首发缺少同刻负荷时仅用已观测耗气估计；陈旧标签只提供历史分配参考。"""
+    issue = prepared.index[position]
+    columns = [config.TARGET_COLUMN[name] for name in config.TARGETS]
+    history = prepared.observed_values(columns).iloc[:position+1].dropna()
+    if history.empty:
+        raise ValueError("首发之前没有可用聚合负荷历史")
+    last = history.iloc[-1].to_numpy(float)
+    observed_at = history.index[-1]
+    gas_columns = ["load_generator_use_blast_furnace_gas", "load_generator_use_coke_gas",
+                   "load_generator_use_converter_gas"]
+    gas = prepared.observed_values(gas_columns).iloc[position].to_numpy(float)
+    beta = np.array([heat_rate["coefficients_mw_per_m3h"][g] for g in config.RESOURCE_NAMES])
+    basis = "same_timestamp_observed_aggregate_load"
+    first, total = last
+    if observed_at != issue:
+        if np.isfinite(gas).all() and (gas >= 0.).all() and np.isfinite(beta).all() and (beta > 0.).all():
+            recent = history.loc[issue-pd.Timedelta(days=28):]
+            ratios = (recent.iloc[:, 0]/recent.iloc[:, 1]).replace([np.inf, -np.inf], np.nan).dropna()
+            ratios = ratios[(ratios >= 0.) & (ratios <= 1.)]
+            share = float(ratios.median()) if len(ratios) else float(first/total) if total > 0. else 0.
+            total = float(gas@beta)
+            big_capacity = float(sum(config.OPT_CONFIG["unit_capacity_mw"][4:]))
+            first = float(np.clip(total*share, max(0., total-big_capacity),
+                                  min(total, sum(config.OPT_CONFIG["unit_capacity_mw"][:4]))))
+            basis = "same_timestamp_gas_empirical_power_and_legal_history_group_share; inferred"
+        else:
+            raise ValueError("首发负荷已陈旧且同刻耗气缺测，不能将陈旧标签当作当前机组状态")
+    power = _initial_unit_power(first, total, config)
+    return power, {"basis": basis, "issued_at": str(issue), "load_observed_at": str(observed_at),
+        "load_age_minutes": float((issue-observed_at).total_seconds()/60.),
+        "raw_observed_aggregate_mw": last.tolist(), "adopted_aggregate_mw": [float(first), float(total)],
+        "gas_observed_at": str(issue) if np.isfinite(gas).all() else None,
+        "initial_unit_power_mw": power.tolist(), "steady_unit_bounds_passed": _valid_initial_unit_power(power, config),
+        "actual_unit_switch_states_observed": False, "future_observations_used": False}
 
 
 def _allocate_aggregate_power(budget: float, previous: np.ndarray, config=C,
                               requested_power: np.ndarray | None = None):
     """回退与事后执行共用组合分配，硬约束冲突时返回失败，不放宽爬坡。"""
     units = np.asarray(config.OPT_CONFIG["unit_capacity_mw"], dtype=float)
-    groups = _aggregate_ramp_groups(config)
+    groups = _planning_ramp_groups(config)
     first_limit, total_limit = groups[0][1], groups[1][1]
     first_previous, total_previous = float(previous[:4].sum()), float(previous.sum())
+    if requested_power is not None and _valid_initial_unit_power(requested_power, config):
+        requested = np.asarray(requested_power, float)
+        continuing = (requested > config.OPT_CONFIG["power_tolerance_mw"]) & (previous > config.OPT_CONFIG["power_tolerance_mw"])
+        unit_ramp = units*config.OPT_CONFIG["ramp_fraction_per_min"]*config.STEP_MINUTES
+        # 原指令能够执行时保持单机分配，避免无意义的组内重排破坏下一步爬坡。
+        if (requested.sum() <= budget+1e-8
+                and all(abs((requested-previous)[indices].sum()) <= limit+1e-8 for indices, limit in groups)
+                and (not config.OPT_CONFIG.get("check_running_unit_ramp")
+                     or (np.abs(requested-previous)[continuing] <= unit_ramp[continuing]+1e-8).all())):
+            return requested.copy()
     best = None
     for mask in range(1 << len(units)):
         on = np.array([(mask >> i) & 1 for i in range(len(units))], dtype=bool)
         lower = np.where(on, units * config.OPT_CONFIG["min_load_ratio"], 0.)
         upper = np.where(on, units, 0.)
+        if config.OPT_CONFIG.get("check_running_unit_ramp"):
+            continuing = on & (previous > config.OPT_CONFIG["power_tolerance_mw"])
+            unit_ramp = units * config.OPT_CONFIG["ramp_fraction_per_min"] * config.STEP_MINUTES
+            lower[continuing] = np.maximum(lower[continuing], previous[continuing]-unit_ramp[continuing])
+            upper[continuing] = np.minimum(upper[continuing], previous[continuing]+unit_ramp[continuing])
+            if (lower > upper + 1e-8).any():
+                continue
         first_low = max(float(lower[:4].sum()), first_previous - first_limit)
         first_high = min(float(upper[:4].sum()), first_previous + first_limit)
         total_low = max(first_low + float(lower[4:].sum()), total_previous - total_limit)
@@ -1861,7 +2126,8 @@ def _independent_holder_plan_bounds(initial, steps, config=C):
     margin = config.OPT_CONFIG["holder_margin_ratio"]
     lower = np.repeat((capacity * (config.GAS_HOLDER["safe_low_ratio"] + margin))[:, None], steps, axis=1)
     upper = np.repeat((capacity * (config.GAS_HOLDER["safe_high_ratio"] - margin))[:, None], steps, axis=1)
-    if steps:
+    recovery = max(1, min(int(config.OPT_CONFIG.get("holder_recovery_steps", 1)), steps))
+    if steps and config.OPT_CONFIG.get("holder_state_mode") != "daily_observed":
         lower[:, 0] = np.minimum(lower[:, 0], initial)
         upper[:, 0] = np.maximum(upper[:, 0], initial)
         safe_low = capacity * config.GAS_HOLDER["safe_low_ratio"]
@@ -1901,7 +2167,9 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
                initial_power: np.ndarray, caps: np.ndarray, heat_rate: dict,
                config=C, *, conserve_all_gases: bool = False,
                independent_holders: dict | None = None,
-               holder_inlet: np.ndarray | None = None) -> dict:
+               holder_inlet: np.ndarray | None = None,
+               holder_shares: np.ndarray | None = None,
+               optional_nonstorage: bool = False) -> dict:
     """确定性 MILP；净资源要求三气种完全守恒，包络模式保留既有代理语义。"""
     n_h = len(price)
     units = config.OPT_CONFIG["unit_capacity_mw"]
@@ -1930,7 +2198,7 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
     invalid_negative = (avail[:, 1:] < 0).any() if conserve_all_gases else (avail < 0).any()
     if (n_h == 0 or avail.shape != (n_h, n_g) or np.asarray(initial_power).shape != (n_u,)
             or np.asarray(caps).shape != (n_g,) or not np.isfinite(initial_power).all()
-            or not _valid_initial_unit_power(initial_power, config)
+            or not _valid_initial_boundary_power(initial_power, config)
             or not np.isfinite(caps).all() or (np.asarray(caps) < 0).any()
             or not np.isfinite(beta).all() or (beta <= 0.).any()
             or not np.isfinite(avail).all() or not np.isfinite(price).all()
@@ -1951,7 +2219,7 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
     off_sw = off_dd + n_s * n_h
     off_direction = off_sw + n_u * n_h
     # 逐柜抽气/放散变量：提交仍只有三个气种总量，内部按两柜独立平衡分配。
-    off_eq = off_direction + (n_h if independent_holders is not None else 0)
+    off_eq = off_direction + (n_s * n_h if independent_holders is not None else 0)
     off_ev = off_eq + (n_s * n_h if independent_holders is not None else 0)
     n_var = off_ev + (n_s * n_h if independent_holders is not None else 0)
     lb = np.zeros(n_var)
@@ -1966,8 +2234,15 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
         for k in range(n_h):
             ub[off_q + g * n_h + k] = caps[g]
     if conserve_all_gases:
-        # 提交只包含耗气与负荷，不靠未提交的自由放散变量构造可行性。
-        ub[off_v:off_s] = 0.
+        # 官方允许放散，但能力未知时不能假定无限泄压；仅使用显式声明的逐气种上限。
+        vent_limits = config.OPT_CONFIG.get("vent_capacity_m3h")
+        if vent_limits is None:
+            vent_caps = np.zeros(n_g)
+        else:
+            vent_caps = np.asarray([vent_limits.get(g, np.nan) for g in C.RESOURCE_NAMES], float)
+            if not np.isfinite(vent_caps).all() or (vent_caps < 0.).any():
+                return {"status": "INVALID_INPUT", "message": "放散能力上限必须有限非负，未知能力不能当作无限泄压"}
+        ub[off_v:off_s] = np.repeat(vent_caps, n_h)
     for j in range(n_s):
         for k in range(n_h):
             idx = j * n_h + k
@@ -1976,19 +2251,19 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
             ub[off_du + idx] = storage_caps[j]
             ub[off_dd + idx] = storage_caps[j]
     if independent_holders is not None:
-        ub[off_direction:off_eq] = 1.
-        integrality[off_direction:off_eq] = 1
+        # 逐柜只有一个有符号净交换量，方向由其符号唯一确定；无需额外整数变量。
+        ub[off_direction:off_eq] = 0.
         if holder_inlet is None:
             # 旧冻结画像没有高炉分组路由信息；仍按两柜容量比例拆分总进气。
-            # 净资源为负时保留负号，表示生产缺口由气柜库存补充，而不是把缺口抹成零。
+            # 上游生产缺口已在边界中独立记录，不能以气柜库存证明用户得到供气。
             weights = storage_caps / storage_caps.sum()
             inlet = np.asarray(avail, float)[:, 0:1] * weights[None, :]
         else:
             inlet = np.asarray(holder_inlet, float)
-            if inlet.shape != (n_h, n_s) or not np.isfinite(inlet).all() or (inlet < 0.).any():
+            if inlet.shape != (n_h, n_s) or not np.isfinite(inlet).all():
                 return {"status": "INVALID_INPUT", "message": "气柜进气拆分无效"}
         ub[off_eq:off_ev] = caps[0]
-        ub[off_ev:] = caps[0]
+        ub[off_ev:] = vent_caps[0] if conserve_all_gases else caps[0]
     for i in range(n_u):
         for k in range(n_h):
             ub[off_sw + i * n_h + k] = 1.0
@@ -2011,7 +2286,7 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
                 for k in range(n_h):
                     add({off_z + i * n_h + k: 1.0,
                          off_z + (i + 1) * n_h + k: -1.0}, 0.0, np.inf)
-    for group, cap in _aggregate_ramp_groups(config):
+    for group, cap in _planning_ramp_groups(config):
         for k in range(n_h):
             delta = {off_p + int(i) * n_h + k: 1.0 for i in group}
             if k > 0:
@@ -2020,6 +2295,21 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
             else:
                 prev = float(np.asarray(initial_power)[group].sum())
                 add(delta, prev - cap, prev + cap)
+    if config.OPT_CONFIG.get("check_running_unit_ramp"):
+        for i, unit in enumerate(units):
+            limit = unit * config.OPT_CONFIG["ramp_fraction_per_min"] * config.STEP_MINUTES
+            for k in range(n_h):
+                delta = {off_p+i*n_h+k: 1., off_z+i*n_h+k: unit}
+                reverse = {off_p+i*n_h+k: -1., off_z+i*n_h+k: unit}
+                if k:
+                    delta.update({off_p+i*n_h+k-1: -1., off_z+i*n_h+k-1: unit})
+                    reverse.update({off_p+i*n_h+k-1: 1., off_z+i*n_h+k-1: unit})
+                    add(delta, -np.inf, limit+2*unit)
+                    add(reverse, -np.inf, limit+2*unit)
+                else:
+                    prior_on = float(initial_power[i] > config.OPT_CONFIG["power_tolerance_mw"])
+                    add(delta, -np.inf, limit+unit*(2-prior_on)+initial_power[i])
+                    add(reverse, -np.inf, limit+unit*(2-prior_on)-initial_power[i])
     for k in range(n_h):
         if independent_holders is None:
             coeffs = {off_s + j * n_h + k: 1.0 for j in range(n_s)}
@@ -2044,6 +2334,12 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
                 add(coeffs, rhs, rhs)
             add({off_eq + j * n_h + k: 1.0 for j in range(n_s)} | {off_q + 0 * n_h + k: -1.0}, 0., 0.)
             add({off_ev + j * n_h + k: 1.0 for j in range(n_s)} | {off_v + 0 * n_h + k: -1.0}, 0., 0.)
+            if holder_shares is not None:
+                ratios = np.asarray(holder_shares, float)
+                if ratios.shape != (n_h, n_s) or not np.isfinite(ratios).all() or (ratios < 0.).any() or not np.allclose(ratios.sum(axis=1), 1.):
+                    return {"status": "INVALID_INPUT", "message": "逐柜进气分摊比例无效"}
+                for j in range(n_s):
+                    add({off_eq+j*n_h+k: 1., off_q+k: -float(ratios[k,j])}, 0., 0.)
         # 气柜可提供的最大瞬时流量：不得超过当前库存高于下限的部分。
         draw = {off_q + 0 * n_h + k: 1.0, off_v + 0 * n_h + k: 1.0}
         if k > 0:
@@ -2054,7 +2350,7 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
     for g in (1, 2):
         for k in range(n_h):
             add({off_q + g * n_h + k: 1.0, off_v + g * n_h + k: 1.0},
-                float(avail[k, g]) if conserve_all_gases else -np.inf, float(avail[k, g]))
+                float(avail[k, g]) if conserve_all_gases and not optional_nonstorage else -np.inf, float(avail[k, g]))
     for j in range(n_s):
         pref_low = storage_caps[j] * float(config.OPT_CONFIG["holder_pref_low_ratio"])
         pref_high = storage_caps[j] * float(config.OPT_CONFIG["holder_pref_high_ratio"])
@@ -2063,16 +2359,8 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
             add({off_s + idx: 1.0, off_dd + idx: 1.0}, pref_low, np.inf)
             add({off_s + idx: 1.0, off_du + idx: -1.0}, -np.inf, pref_high)
             if independent_holders is not None:
-                # 单管进出：d=1 表示净进气，d=0 表示净抽气。
-                # 净交换 = 进气 - 抽气 - 放散；两柜各自方向，不再共享方向变量。
-                # 方向大 M 用该柜容量而非当日耗气上限，否则资源为零时会把
-                # “库存补生产缺口”误判为不可行。
-                pipe_cap = float(max(storage_caps[j], caps[0], 1.0))
-                net_flow = {off_eq + idx: 1., off_ev + idx: 1.,
-                            off_direction + k: pipe_cap}
-                # d=1: 抽气+放散 <= 进气；d=0: 抽气+放散 >= 进气。
-                add(net_flow, -np.inf, float(inlet[k, j]) + pipe_cap)
-                add(net_flow, float(inlet[k, j]), np.inf)
+                # 净交换的符号已确定逐柜流向，保留原管道流量包络即可。
+                pipe_cap = float(max(storage_caps[j] / (config.STEP_MINUTES / 60.), caps[0], 1.0))
                 # 单步净交换不超过管道容量。
                 add({off_eq + idx: 1., off_ev + idx: 1.},
                     float(inlet[k, j]) - pipe_cap, float(inlet[k, j]) + pipe_cap)
@@ -2110,11 +2398,16 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
         add(coeffs, 0.0, 0.0)
 
     terminal_cap = config.OPT_CONFIG.get("terminal_power_cap_mw")
+    terminal_blast = config.OPT_CONFIG.get("terminal_blast_flow_m3h")
+    if terminal_blast is not None:
+        if not np.isfinite(terminal_blast) or not 0. <= terminal_blast <= caps[0]:
+            return {"status": "INVALID_INPUT", "message": "末步高炉耗气目标必须有限且处于耗气上限内"}
+        add({off_q+n_h-1: 1.}, float(terminal_blast), float(terminal_blast))
     if terminal_cap is not None:
         add({off_p + i * n_h + n_h - 1: 1. for i in range(n_u)}, -np.inf, float(terminal_cap))
     total_cap = config.OPT_CONFIG.get("total_power_cap_mw")
     if total_cap is not None:
-        rate = _aggregate_ramp_groups(config)[1][1]
+        rate = _planning_ramp_groups(config)[1][1]
         for k in range(n_h):
             # 初始负荷过高时按合法爬坡逐步降至上限，不瞬间裁剪实际初态。
             ceiling = max(float(total_cap), float(np.sum(initial_power)) - (k + 1) * rate)
@@ -2148,6 +2441,9 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
             pen = float(table.get(gas_name, {}).get(tou[k], base))
             objective[off_v + g * n_h + k] = 0.25 * pen
     objective[off_q:off_v] = 1e-8
+    if optional_nonstorage:
+        # 同等发电收益下优先使用高炉气，把高热值气留给生产；不设置最低耗气或固定配额。
+        objective[off_q+n_h:off_v] += 1e-6
     # GPF：柜位贴偏好带，避免顶到安全边界。
     hold_pen = float(config.OPT_CONFIG["holder_penalty_cny_per_m3"])
     objective[off_du:off_dd] = 0.25 * hold_pen
@@ -2175,6 +2471,10 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
             "holder_dev": holder_dev,
             "objective": float(solution.fun),
             "mip_gap": getattr(solution, "mip_gap", None)}
+    if conserve_all_gases:
+        result["vent_capacity_m3h"] = dict(zip(C.RESOURCE_NAMES, vent_caps.tolist()))
+        result["vent_capacity_basis"] = ("declared_unverified_limit" if config.OPT_CONFIG.get("vent_capacity_m3h") is not None
+                                        else "unknown_capacity_not_assumed; not_official_zero_release_rule")
     aggregate_config = config
     if independent_holders is not None:
         aggregate_config = SimpleNamespace(**vars(config))
@@ -2193,7 +2493,8 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
             storage_formulation="independent_variables_in_joint_milp")
     result["validation"] = validate_day(result, avail, holder0, initial_power, caps, heat_rate, aggregate_config,
                                           conserve_all_gases=conserve_all_gases,
-                                          allow_outside_initial=independent_holders is not None)
+                                          allow_outside_initial=independent_holders is not None,
+                                          optional_nonstorage=optional_nonstorage)
     if heat_rate.get("operating_domain"):
         result["domain_validation"] = gas_power_domain_check(gas, heat_rate, config)
     if not result["validation"]["passed"]:
@@ -2204,7 +2505,7 @@ def _solve_day(avail: np.ndarray, price: np.ndarray, holder0: float,
 def validate_day(result: dict, avail: np.ndarray, holder0: float,
                  initial_power: np.ndarray, caps: np.ndarray, heat_rate: dict,
                  config=C, *, conserve_all_gases: bool = False,
-                 allow_outside_initial: bool = False) -> dict:
+                 allow_outside_initial: bool = False, optional_nonstorage: bool = False) -> dict:
     """按调用方声明的包络或净资源语义核验，不签发真实气网安全结论。"""
     power, gas, vent, holder = (np.asarray(result[k], dtype=float)
                                for k in ("power", "gas", "vent", "holder"))
@@ -2236,8 +2537,8 @@ def validate_day(result: dict, avail: np.ndarray, holder0: float,
     energy = power.sum(axis=0) - beta @ gas
     delta = np.diff(np.column_stack([initial_power, power]), axis=1)
     problems = []
-    if not _valid_initial_unit_power(initial_power, config):
-        problems.append("初始单机负荷越界或低于最低开机负荷")
+    if not _valid_initial_boundary_power(initial_power, config):
+        problems.append("初始单机边界超出额定容量")
     if (power < -pt).any() or (power > units[:, None] + pt).any():
         problems.append("功率越界")
     if ((power > pt) & (power < units[:, None] * config.OPT_CONFIG["min_load_ratio"] - pt)).any():
@@ -2249,7 +2550,7 @@ def validate_day(result: dict, avail: np.ndarray, holder0: float,
         problems.append("耗气或代理释放越界")
     if (gas[1:] + vent[1:] > avail[:, 1:].T + gt).any():
         problems.append("无柜气种超出资源包络")
-    if conserve_all_gases and (np.abs(gas[1:] + vent[1:] - avail[:, 1:].T) > gt).any():
+    if conserve_all_gases and not optional_nonstorage and (np.abs(gas[1:] + vent[1:] - avail[:, 1:].T) > gt).any():
         problems.append("无柜气种净资源未全部分配至发电或放散")
     if np.max(np.abs(energy)) > pt:
         problems.append("燃料与功率不守恒")
@@ -2262,9 +2563,12 @@ def validate_day(result: dict, avail: np.ndarray, holder0: float,
     terminal_cap = config.OPT_CONFIG.get("terminal_power_cap_mw")
     if terminal_cap is not None and power[:, -1].sum() > terminal_cap + pt:
         problems.append("末步负荷未留跨日可达裕度")
+    terminal_blast = config.OPT_CONFIG.get("terminal_blast_flow_m3h")
+    if terminal_blast is not None and (not np.isfinite(terminal_blast) or abs(gas[0, -1]-terminal_blast)>gt):
+        problems.append("末步高炉耗气未满足声明的跨日续接目标")
     total_cap = config.OPT_CONFIG.get("total_power_cap_mw")
     if total_cap is not None:
-        rate = _aggregate_ramp_groups(config)[1][1]
+        rate = _planning_ramp_groups(config)[1][1]
         envelope = np.maximum(float(total_cap), np.sum(initial_power) - rate * np.arange(1, n + 1))
         if (power.sum(axis=0) > envelope + pt).any():
             problems.append("负荷超出声明的因果保守上限")
@@ -2644,12 +2948,61 @@ def daily_plan_config(holder: float, observed_gas, heat_rate: dict, config=C):
                  "scope": "A_B_C_proxy_validated_control; not_official_operating_limits"}
 
 
+def _fallback_net_day(boundary, price, initial, previous, caps, heat, config=C):
+    """单日求解失败时保留合法机组指令，库存及供气失败按实际推演记录。"""
+    names = list(config.GAS_HOLDER["capacity_by_column_m3"])
+    capacities = np.array([config.GAS_HOLDER["capacity_by_column_m3"][name] for name in names])
+    available = np.asarray(boundary.get("dispatch_available_m3h", boundary["available_m3h"]), float)
+    inlet = np.asarray(boundary["holder_inlet_m3h"], float)
+    ratios = np.asarray(boundary["holder_allocation_shares"], float)
+    beta = np.array([heat["coefficients_mw_per_m3h"][g] for g in C.RESOURCE_NAMES])
+    state = np.array([initial[name] for name in names], float)
+    initial_power = previous.copy()
+    records = {key: [] for key in ("power", "gas", "vent", "holders", "withdrawal", "release", "exchange")}
+    dt = config.STEP_MINUTES/60.
+    for k, supplied in enumerate(available):
+        budget = np.minimum(np.maximum(supplied, 0.), caps)
+        room = np.min(np.divide(state-capacities*config.GAS_HOLDER["safe_low_ratio"], ratios[k],
+            out=np.full(2, np.inf), where=ratios[k] > 1e-9))/dt
+        budget[0] = min(caps[0], max(0., supplied[0]+room))
+        wanted = float(budget@beta)
+        power = _allocate_aggregate_power(wanted, previous, config)
+        power = previous.copy() if power is None else power
+        mix = budget.copy()
+        if mix@beta <= 0.:
+            mix = np.array([1., 0., 0.])
+        gas = mix*float(power.sum())/float(mix@beta)
+        withdrawal = ratios[k]*gas[0]
+        raw_state = state+(inlet[k]-withdrawal)*dt
+        release_volume = np.maximum(raw_state-capacities*config.GAS_HOLDER["safe_high_ratio"], 0.)
+        next_state = raw_state-release_volume
+        release = release_volume/dt
+        vent = np.array([release.sum(), 0., 0.])
+        for key, value in (("power", power), ("gas", gas), ("vent", vent), ("holders", next_state),
+                           ("withdrawal", withdrawal), ("release", release), ("exchange", (next_state-state)/dt)):
+            records[key].append(value.copy())
+        state, previous = next_state, power
+    result = {"status": "CAUSAL_FALLBACK", "power": np.array(records["power"]).T,
+        "gas": np.array(records["gas"]).T, "vent": np.array(records["vent"]).T,
+        "holders_m3": np.array(records["holders"]), "holder_columns": names,
+        "holder_withdrawal_m3h": np.array(records["withdrawal"]),
+        "holder_release_m3h": np.array(records["release"]), "holder_inlet_m3h": inlet,
+        "holder_exchange_m3h": np.array(records["exchange"]), "model_constraints_passed": False,
+        "holder_recovery": {name: {"initial_m3": initial[name], "initial_was_clipped": False} for name in names},
+        "validation": {"passed": False, "problems": ["当日MILP无解，已生成因果兜底指令"]}}
+    result["network_validation"] = validate_net_dispatch(boundary, result, initial,
+        dict.fromkeys(names, False), config)
+    result["validation"]["problems"].extend(result["network_validation"]["problems"])
+    return result
+
+
 def optimize_net_daily(prepared, grid, issue_times, positions, resource_bundle, readiness):
     """净资源和两柜实际接入每日链路；单位及需求假设未确认时仍明确标为模拟。"""
     pack, heat = resource_bundle.final_net_supply, resource_bundle.final_heat_rate
     uncertainty = net_supply_safety_check(pack)
     # 历史误差超出缓冲时保留完整点预测模拟，不把它当成误差集合通过或物理认证。
-    use_error_margin = bool(uncertainty["passed"])
+    adopted = C.OPT_CONFIG.get("holder_state_mode") == "daily_observed"
+    use_error_margin = bool(uncertainty["passed"] and not adopted)
     names = list(C.GAS_HOLDER["capacity_by_column_m3"])
     initial, initialization = {}, {}
     for name in names:
@@ -2669,14 +3022,13 @@ def optimize_net_daily(prepared, grid, issue_times, positions, resource_bundle, 
             "observed_age_minutes": float((issue_times[0] - raw.index[-1]).total_seconds() / 60.),
             "state_role": "inferred_volume_under_unverified_sensor_scale; not_measured_m3"}
     try:
-        previous = _initial_unit_power(_last_level(prepared, "generator_1", int(positions[0])),
-            _last_level(prepared, "generator_all", int(positions[0])))
+        previous, unit_initialization = _dispatch_initial_state(prepared, int(positions[0]), heat)
     except ValueError as exc:
         return {"status": "BLOCKED_OPT", "schedule": None, "summary": {"reason": str(exc)}}
     caps = np.array([resource_bundle.final_gas_caps[gas] for gas in C.RESOURCE_NAMES])
     units_verified = {name: pack["holder_scale_hypotheses"][name]["verified"] is True for name in names}
     try:
-        observed_net = _observed_net_frame(prepared)
+        observed_net = _observed_net_frame(prepared, pack)
         holder, priming = _prime_first_effective_state(prepared, int(positions[0]), pack, initial,
                                                        observed=observed_net)
     except ValueError as exc:
@@ -2684,11 +3036,25 @@ def optimize_net_daily(prepared, grid, issue_times, positions, resource_bundle, 
     prices, plans, records, stock_paths = load_prices(), [], [], []
     submitted_initial = submitted_previous_power = None
     submitted_available, submitted_gas, submitted_vent, submitted_power = [], [], [], []
-    submitted_inlet, submitted_exchange = [], []
+    submitted_inlet, submitted_exchange, submitted_shortfall, submitted_priority, submitted_resets, submitted_ratios, submitted_release = [], [], [], [], [], [], []
     resource_seconds = milp_seconds = max_net_error = 0.
     point_only_days = []
     max_stock_error = dict.fromkeys(names, 0.)
     for day_number, (issue, pos) in enumerate(zip(issue_times, positions)):
+        innovation = np.zeros(len(names))
+        day_priming = priming if day_number == 0 else None
+        observed_initial = dict(initial) if day_number == 0 else None
+        if adopted and day_number:
+            raw = prepared.observed_values(names).iloc[int(pos)].to_numpy(float)
+            scales = np.array([C.OPT_CONFIG["holder_scale_to_m3"][name] for name in names])
+            if not np.isfinite(raw).all():
+                return {"status": "BLOCKED_OPT", "schedule": None,
+                    "summary": {"reason": f"{issue}缺少同刻两柜观测，不能按每日实测复位", "failed_issue": str(issue)}}
+            observed_initial = dict(zip(names, (raw*scales).tolist()))
+            reset, day_priming = _prime_first_effective_state(prepared, int(pos), pack, observed_initial,
+                observed=observed_net, committed_blast_use=float(result["gas"][0, -1]))
+            innovation = np.array([reset[name]-holder[name] for name in names])
+            holder = reset
         tick = time.perf_counter()
         boundary = forecast_net_supply(pack, issue, observed=observed_net)
         resource_seconds += time.perf_counter() - tick
@@ -2702,12 +3068,18 @@ def optimize_net_daily(prepared, grid, issue_times, positions, resource_bundle, 
         cfg.OPT_CONFIG.update(total_power_cap_mw=None, terminal_power_cap_mw=None,
             terminal_inventory_m3=None, planned_inventory_floor_m3=None,
             holder_error_lower_m3=lower_error.tolist(), holder_error_upper_m3=upper_error.tolist(),
-            terminal_inventory_by_holder_m3={names[0]: float(np.clip(holder[names[0]],
+            terminal_inventory_by_holder_m3=({name: float(C.GAS_HOLDER["capacity_by_column_m3"][name]
+                * C.OPT_CONFIG["holder_terminal_ratio"]) for name in names} if adopted else {names[0]: float(np.clip(holder[names[0]],
                 first_capacity * (C.GAS_HOLDER["safe_low_ratio"] + C.OPT_CONFIG["holder_margin_ratio"]),
                 first_capacity * (C.GAS_HOLDER["safe_high_ratio"] - C.OPT_CONFIG["holder_margin_ratio"]))),
-                                            names[1]: C.OPT_CONFIG["daily_terminal_inventory_m3"]})
+                                            names[1]: C.OPT_CONFIG["daily_terminal_inventory_m3"]}))
         control.update(total_power_cap_mw=None, terminal_power_cap_mw=None,
             scope="official_unit_capacity_and_aggregate_ramp; no_proxy_power_cap")
+        if adopted:
+            # 末步保持预测供需平衡，减少利用窗口边界突增抽气造成的跨日跳变。
+            cfg.OPT_CONFIG["terminal_blast_flow_m3h"] = float(np.clip(boundary["available_m3h"][-1, 0], 0., caps[0]))
+            control["terminal_blast_flow_m3h"] = cfg.OPT_CONFIG["terminal_blast_flow_m3h"]
+            control["terminal_flow_basis"] = "same_issue_final_slot_net_blast_forecast"
         first = issue + pd.Timedelta(minutes=C.STEP_MINUTES)
         tariff = _price_vector(prices, first, C.STEPS_PER_DAY)
         tick = time.perf_counter()
@@ -2724,9 +3096,11 @@ def optimize_net_daily(prepared, grid, issue_times, positions, resource_bundle, 
             point_only_days.append(str(issue))
         milp_seconds += time.perf_counter() - tick
         if result["status"] not in ("OPTIMAL", "FEASIBLE_TIMEOUT"):
-            return {"status": "BLOCKED_OPT", "schedule": None, "summary": {
-                "reason": result.get("message", result["status"]), "failed_issue": str(issue),
-                "dispatch_readiness": readiness, "initialization": initialization}}
+            failed_reason = result.get("message", result["status"])
+            LOGGER = logging.getLogger("aic-half")
+            LOGGER.warning("%s当日求解失败，仅该窗口采用因果兜底，保留其他窗口结果: %s", issue, failed_reason)
+            result = _fallback_net_day(boundary, tariff, holder, previous, caps, heat, cfg)
+            result["solver_failure"] = failed_reason
         allocation = allocate_group_gas(result["power"], result["gas"], heat)
         if not allocation["validation"]["passed"]:
             return {"status": "BLOCKED_OPT", "schedule": None, "summary": {"reason": "分组气电不守恒"}}
@@ -2740,12 +3114,22 @@ def optimize_net_daily(prepared, grid, issue_times, positions, resource_bundle, 
             submitted_initial = dict(zip(names, levels[first_k - 1] if first_k else [holder[name] for name in names]))
             submitted_previous_power = (result["power"][:, first_k - 1] if first_k else previous).tolist()
         stock_paths.extend(levels[selected].tolist())
+        resets = np.zeros((C.STEPS_PER_DAY, len(names)))
+        resets[0] = innovation
+        submitted_resets.extend(resets[selected].tolist())
+        submitted_ratios.extend(np.asarray(boundary.get("holder_allocation_shares",
+            np.tile([.6, .4], (C.STEPS_PER_DAY, 1))))[selected].tolist())
         submitted_available.extend(np.asarray(boundary["available_m3h"])[selected].tolist())
+        submitted_shortfall.extend(np.asarray(boundary.get("production_shortfall_m3h",
+            np.zeros_like(boundary["available_m3h"])))[selected].tolist())
+        submitted_priority.extend(np.asarray(boundary.get("priority_shortfall_m3h",
+            np.zeros_like(boundary["available_m3h"])))[selected].tolist())
         inlet_source = boundary.get("holder_inlet_m3h")
         if inlet_source is None:
             inlet_source = result.get("holder_inlet_m3h")
         submitted_inlet.extend(np.asarray(inlet_source)[selected].tolist())
         submitted_exchange.extend(np.asarray(result["holder_exchange_m3h"])[selected].tolist())
+        submitted_release.extend(np.asarray(result["holder_release_m3h"])[selected].tolist())
         submitted_gas.extend(result["gas"][:, selected].T.tolist())
         submitted_vent.extend(result["vent"][:, selected].T.tolist())
         submitted_power.extend(result["power"][:, selected].T.tolist())
@@ -2758,10 +3142,13 @@ def optimize_net_daily(prepared, grid, issue_times, positions, resource_bundle, 
             "published_steps": len(published), "published_start": str(published[0]), "published_end": str(published[-1]),
             "validation": result["validation"], "solver_status": result["status"],
             "objective": result.get("objective"), "mip_gap": result.get("mip_gap"),
+            "solver_failure": result.get("solver_failure"),
             "network_validation": network, "model_constraints_passed": result["model_constraints_passed"],
             "empirical_domain": result.get("domain_validation"),
             "group_allocation": allocation["validation"], "control": control,
             "initial_holders_m3": dict(holder), "terminal_holders_m3": dict(zip(names, levels[-1].tolist())),
+            "observed_initial_holders_m3": observed_initial, "daily_state_bridge": day_priming,
+            "reset_innovation_m3": innovation.tolist(), "observed_at": str(issue),
             "holder_recovery": result["holder_recovery"], "resource_mode": boundary["resource_mode"],
             "nonstorage_demand_shortfall": {gas: {
                 "priority_shortfall_m3": float(np.sum(component.get("priority_shortfall_m3h", [])) * C.STEP_MINUTES / 60.),
@@ -2818,39 +3205,73 @@ def optimize_net_daily(prepared, grid, issue_times, positions, resource_bundle, 
             "dispatch_readiness": readiness, "daily_publications": len(plans), "daily_plans": plans,
             "resource_error_validation": uncertainty,
             "point_only_publications": point_only_days,
+            "fallback_publications": [plan["issued_at"] for plan in plans if plan["solver_status"] == "CAUSAL_FALLBACK"],
             "uncertainty_scope": "unverified_when_point_only; historical_error_not_a_certificate",
-            "initialization": initialization, "planned_steps": len(schedule), "plan_validation_passed": True,
+            "initialization": initialization, "planned_steps": len(schedule),
+            "plan_validation_passed": all(plan["model_constraints_passed"] for plan in plans),
+            "production_supply": {"passed": not bool((np.asarray(submitted_priority) > 1e-6).any()),
+                "unserved_m3_by_gas": dict(zip(C.RESOURCE_NAMES,
+                    (np.asarray(submitted_shortfall).sum(axis=0) * C.STEP_MINUTES / 60.).tolist())),
+                "known_priority_shortfall_m3_by_gas": dict(zip(C.RESOURCE_NAMES,
+                    (np.asarray(submitted_priority).sum(axis=0) * C.STEP_MINUTES / 60.).tolist())),
+                "unfunded_expected_residual_m3_by_gas": dict(zip(C.RESOURCE_NAMES,
+                    (np.maximum(np.asarray(submitted_shortfall)-np.asarray(submitted_priority), 0.).sum(axis=0) * C.STEP_MINUTES / 60.).tolist())),
+                "original_demand_preserved": True, "shortfall_is_extra_supply": False},
             "first_effective_state": priming,
             "inventory_interval_semantics": "command_start_to_next_step",
-            "unit_initialization": {"basis": "feasible_group_decomposition_inferred; actual_unit_switch_states_unknown",
-                "initial_unit_power_mw": _initial_unit_power(_last_level(prepared, "generator_1", int(positions[0])),
-                    _last_level(prepared, "generator_all", int(positions[0]))).tolist()},
-            "group_allocation_passed": True, "plan_feasible": True, "physical_feasibility_certified": False,
+            "unit_initialization": unit_initialization,
+            "group_allocation_passed": True, "plan_feasible": all(plan["model_constraints_passed"] for plan in plans),
+            "physical_feasibility_certified": False,
             "forecast_uses_historical_holder": False, "physical_validation": physical,
-            "independent_holder_validation": {"passed": False, "model_constraints_passed": True, "rows": len(grid), "holders": holders},
+            "independent_holder_validation": {"passed": False,
+                "model_constraints_passed": all(plan["model_constraints_passed"] for plan in plans), "rows": len(grid), "holders": holders},
             "net_resource_validation": {"passed": False, "arithmetic_passed": True, "rows": len(grid),
                 "balance_max_m3h": max_net_error, "flow_units_verified": False},
             "planned_metrics": metrics, "planned_revenue_cny": metrics["generation_revenue_cny"],
             "planned_generation_mwh": metrics["generation_mwh"],
             "time_semantics": "target_time; daily instructions issued before the first effective timestamp",
-            "coverage_basis": "same_datetime_as_long_forecast", "replay_complete": False,
+            "coverage_basis": "daily_release_target_window", "replay_complete": False,
             "realized_net_resource_revenue_cny": None, "evidence_gaps_block_simulation": False,
             "simulation_assumptions": {"net_supply": pack["reservation_role"], "holder_units": "inferred_decimal_magnitude_hypotheses",
-                "topology": "shared_blast_header_without_opposite_exchange; exchange_limits_unprovided",
+                "topology": "independent_net_balances_with_inferred_demand_split; pipe_flow_limits_unverified",
                 "gas_to_power": "shared_positive_empirical_conversion; holdout_metrics_retained"},
             "model_evidence": {"holders_m3": paths.tolist(), "available_m3h": submitted_available,
                 "holder_inlet_m3h": submitted_inlet, "holder_exchange_m3h": submitted_exchange,
+                "holder_release_m3h": submitted_release,
                 "holder_state_times": [str(t) for t in pd.date_range(grid[0], periods=len(grid)+1, freq="15min")],
-                "net_supply_model": pack,
+                "net_supply_model": pack, "state_reset_m3": submitted_resets,
+                "holder_allocation_shares": submitted_ratios, "optional_nonstorage": adopted,
                 "gas_m3h": submitted_gas, "vent_m3h": submitted_vent, "unit_power_mw": submitted_power,
+                "production_shortfall_m3h": submitted_shortfall,
+                "priority_shortfall_m3h": submitted_priority,
                 "previous_unit_power_mw": submitted_previous_power,
                 "coefficients_mw_per_m3h": heat["coefficients_mw_per_m3h"],
                 "declared_defaults": {"holder_scales": pack["holder_scale_hypotheses"],
-                    "converter_scale": pack["converter_scale"], "reservation_role": pack["reservation_role"],
+                    "converter_scale": pack["converter_scale"], "converter_source": pack.get("converter_source"),
+                    "reservation_role": pack["reservation_role"],
                     "gas_to_power": "positive_empirical_inferred", "field_safety_certified": False}},
             "timings": {"resource_inference_seconds": round(resource_seconds, 4), "milp_seconds": round(milp_seconds, 4)}}}
+    answer["summary"]["holder_state_mode"] = C.OPT_CONFIG.get("holder_state_mode", "continuous")
+    answer["summary"]["operating_policy"] = {"version": C.OPT_CONFIG.get("policy_version"),
+        "decision_status": "ADOPTED", "source": "user_selected_20261027; not_official_evaluator_specification",
+        "holder_units": C.OPT_CONFIG["holder_scale_to_m3"],
+        "withdrawal_allocation": C.OPT_CONFIG.get("holder_withdrawal_allocation"),
+        "residual": "causal_previous_28_days_slot_median; unresolved_consumption_expectation",
+        "priority_user_topology": "upstream_pipeline_default; usually_no_direct_holder_gas; exceptions_not_prohibited",
+        "converter_source": "historical_generator_use_m3h; no_raw_generation_multiplier",
+        "planning_band": [.20, .85], "safety_band": [.15, .90],
+        "generation_ramp_limit_mw": C.OPT_CONFIG.get("generation_ramp_limit_mw"),
+        "terminal_flow": "same_issue_final_slot_net_blast_forecast; no_fixed_terminal_inventory",
+        "terminal_flow_source": "gated_historical_control; inferred_not_official_requirement",
+        "pending_decisions": []}
     acceptance = submission_readiness(answer)
     answer["summary"]["submission_readiness"] = acceptance
+    if C.OPT_CONFIG.get("submission_validation_basis") == "adopted_operating_policy":
+        answer.update(status="FORMAL_OPTIMIZATION", submittable=bool(acceptance["passed"]))
+        answer["summary"].update(status="FORMAL_OPTIMIZATION", validation_basis="adopted_operating_policy",
+            constraint_validation_passed=bool(acceptance["passed"]),
+            reason="; ".join(acceptance["problems"]) or None)
+        return answer
     if acceptance["passed"]:
         answer.update(status="READY_WITH_ASSUMPTIONS", submittable=True)
         answer["summary"].update(status="READY_WITH_ASSUMPTIONS", validation_basis=acceptance["validation_basis"])
@@ -2863,7 +3284,7 @@ def optimize_net_daily(prepared, grid, issue_times, positions, resource_bundle, 
         # 导出资格与认证结果分开；保留实际求解结果，核验失败仍在摘要中如实记录。
         answer.update(status="UNVERIFIED_OPTIMIZATION", submittable=False)
         answer["summary"].update(status="UNVERIFIED_OPTIMIZATION", validation_basis="unverified_export",
-            reason="已导出调度，待核验项: " + "; ".join(acceptance["problems"]))
+            reason="已导出调度，约束检查失败: " + "; ".join(acceptance["problems"]))
     return answer
 
 
@@ -2874,11 +3295,13 @@ def optimize_daily(prepared: PreparedData, origins: pd.DatetimeIndex,
     grid = pd.DatetimeIndex(origins)
     if quick:
         grid = grid[:2 * C.STEPS_PER_DAY]
-    if (not len(grid) or grid[0] != grid[0].normalize()
+    clock_hour, clock_minute = map(int, C.OPT_CONFIG["publication_time"].split(":"))
+    day_start = (grid[0].normalize()+pd.Timedelta(hours=clock_hour, minutes=clock_minute+C.STEP_MINUTES)) if len(grid) else None
+    if (not len(grid) or grid[0] not in (grid[0].normalize(), day_start)
             or len(grid) % C.STEPS_PER_DAY or grid.has_duplicates
             or not grid.equals(pd.date_range(grid[0], periods=len(grid), freq="15min"))):
         return {"status": "BLOCKED_OPT", "schedule": None,
-                "summary": {"reason": "每日固定发布要求完整、连续的自然日网格"}}
+                "summary": {"reason": "每日固定发布要求连续、完整的15分钟计划网格"}}
     try:
         issue_times = daily_publication_times(grid)
     except ValueError as exc:
@@ -3004,9 +3427,7 @@ def optimize_daily(prepared: PreparedData, origins: pd.DatetimeIndex,
 def export_fallback_schedule(prepared: PreparedData, origins, resource_bundle: ResourceBundle,
                              failed: dict, quick: bool = False) -> dict:
     """完整导出兜底：按发布前的历史或冻结资源预测生成指令，未认证项不阻断归档。"""
-    grid = pd.DatetimeIndex(origins)
-    if quick:
-        grid = grid[:2 * C.STEPS_PER_DAY]
+    grid = optimization_effective_grid(origins, quick)
     issues = daily_publication_times(grid)
     heat = resource_bundle.final_heat_rate or resource_bundle.heat_rate
     beta = np.array([heat.get("coefficients_mw_per_m3h", {}).get(g, np.nan)
@@ -3018,7 +3439,7 @@ def export_fallback_schedule(prepared: PreparedData, origins, resource_bundle: R
     pack = resource_bundle.final_net_supply
     records, plans, warnings = [], [], []
     try:
-        observed = _observed_net_frame(prepared) if pack is not None else None
+        observed = _observed_net_frame(prepared, pack) if pack is not None else None
     except Exception as exc:
         observed = None
         warnings.append(f"实时资源画像不可用，仅复用发布前冻结历史: {exc}")
@@ -3034,7 +3455,7 @@ def export_fallback_schedule(prepared: PreparedData, origins, resource_bundle: R
     warnings.extend(["兜底指令未通过气柜库存及净资源硬约束认证",
                      "经验气电系数未通过的标定项仍保留，导出不代表正式核验通过"])
     if not conversion_available:
-        warnings.append("没有有效气电系数，兜底生成零发电与零耗气的停机指令；首步爬坡待核验")
+        warnings.append("没有有效气电系数，兜底生成零发电与零耗气指令；该停机指令不能保证首步爬坡")
     capacity = float(sum(C.OPT_CONFIG["unit_capacity_mw"]))
     for issue in issues:
         effective = pd.date_range(issue + pd.Timedelta(minutes=C.STEP_MINUTES),
@@ -3087,8 +3508,10 @@ def export_fallback_schedule(prepared: PreparedData, origins, resource_bundle: R
             "extra_gas_above_inferred_budget_m3": dict(zip(C.RESOURCE_NAMES, excess.tolist()))})
     schedule = pd.DataFrame(records, columns=["datetime", "opt_generator_use_blast_furnace_gas",
         "opt_generator_use_coke_gas", "opt_generator_use_converter_gas", "opt_generator_1", "opt_generator_all"])
-    return {"status": "UNVERIFIED_OPTIMIZATION", "submittable": False, "schedule": schedule,
-        "summary": {"status": "UNVERIFIED_OPTIMIZATION", "validation_basis": "causal_fallback_export",
+    return {"status": "FORMAL_OPT_FALLBACK", "submittable": False, "schedule": schedule,
+        "summary": {"status": "FORMAL_OPT_FALLBACK", "validation_basis": "adopted_policy_fallback",
+            "operating_policy_version": C.OPT_CONFIG.get("policy_version"), "pending_decisions": [],
+            "policy_execution_status": "NO_FEASIBLE_DISPATCH", "constraint_validation_passed": False,
             "reason": "已生成因果兜底指令，原优化失败: " + str(failed.get("summary", {}).get("reason", failed.get("status"))),
             "original_optimization_failure": failed.get("summary", {}), "export_fallback_used": True,
             "export_warnings": list(dict.fromkeys(warnings)), "plan_validation_passed": False,
@@ -3113,5 +3536,5 @@ def optimize(resource_forecast: np.ndarray, prepared: PreparedData,
                 "summary": {"reason": resource_bundle.blocker}}
     resource_bundle.dispatch_selection = {"chosen": "daily_fixed", "replan_steps": C.STEPS_PER_DAY,
         "scope": "official_daily_publication_requirement_20261026", "intraday_refresh": False,
-        "publication_time": C.OPT_CONFIG["publication_time"], "coverage_basis": "same_datetime_as_long_forecast"}
-    return optimize_daily(prepared, origins, resource_bundle, quick=quick, use_final=use_final)
+        "publication_time": C.OPT_CONFIG["publication_time"], "coverage_basis": "daily_release_target_window"}
+    return optimize_daily(prepared, optimization_effective_grid(origins), resource_bundle, quick=quick, use_final=use_final)
