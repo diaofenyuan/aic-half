@@ -811,6 +811,7 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
                      "blocker": resource_bundle.blocker},
         "optimization": opt_summary,
         "data_contract": {"target_mask": "整个评测窗口", "step_minutes": C.STEP_MINUTES,
+                          "prediction_power_gas_policy": C.PREDICTION_POWER_GAS_POLICY,
                           "future_dynamic_fields": "forbidden"},
     }
     if ctx.optimization_grid is not None:

@@ -542,7 +542,7 @@ def train_short(prepared: PreparedData, folds: list[dict], quick: bool = False) 
     started = time.time()
     fold_cache = []
     for fold in C.progress(tuning, desc="短期验证数据准备", unit="折"):
-        masked = prepared.masked_copy(
+        masked = prepared.prediction_copy(
             fold["start"],
             pd.Timestamp(fold["start"]) + pd.Timedelta(days=int(fold["days"])))
         positions, eval_positions, ref_pos = _fold_positions(masked, fold, max(C.HORIZONS_S))
@@ -638,7 +638,7 @@ def train_short(prepared: PreparedData, folds: list[dict], quick: bool = False) 
                      for p, t in zip(blended_tuning, chosen["truths"])]
 
     confirm_fold = next(f for f in folds if f["role"] == "confirm")
-    confirm_masked = prepared.masked_copy(
+    confirm_masked = prepared.prediction_copy(
         confirm_fold["start"],
         pd.Timestamp(confirm_fold["start"]) + pd.Timedelta(days=int(confirm_fold["days"])))
     c_positions, c_eval, c_ref = _fold_positions(

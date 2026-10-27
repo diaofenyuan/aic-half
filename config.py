@@ -32,8 +32,9 @@ OUTPUT_ROOT = ROOT / "outputs"
 # 实验/调参/临时模型只允许放 tmp；不得写入 models/ 或正式 outputs 归档。
 TMP_ROOT = ROOT / "tmp"
 EXPERIMENT_OUTPUT_ROOT = TMP_ROOT / "tmp_outputs"
-# 当前迭代只运行调度；预测表及其模型直接复用已归档结果。
-EXECUTION_FOCUS = "optimization"
+# 默认重新训练选定配方并生成预测与调度；仅优化须显式选择 opt。
+EXECUTION_FOCUS = "prediction"
+PREDICTION_POWER_GAS_POLICY = "evaluation_window_masked"
 
 # ---------------------------------------------------------------------------
 # 阶段与文件

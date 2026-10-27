@@ -699,6 +699,34 @@ def _power_gas_availability_check() -> dict:
     return {"passed": all(checks.values()), **checks}
 
 
+def _prediction_dispatch_views_check() -> dict:
+    """测试期耗气对负荷预测不可见，调度视图保留合法同刻观测。"""
+    original = _synthetic_prepared(480)
+    columns = ["load_generator_use_blast_furnace_gas", "load_generator_use_coke_gas",
+               "load_generator_use_converter_gas"]
+    derived = ["d_use_blast", "d_use_coke", "d_use_converter"]
+    original.frame[columns] = original.frame[derived].to_numpy()
+    original.provenance = pd.DataFrame(1, index=original.index, columns=columns, dtype="int8")
+    start, end = original.index[192], original.index[383]
+    altered = copy.deepcopy(original)
+    altered.frame.loc[start:end, columns + derived] = 999999.
+    altered.frame.loc[start:end, ["d_use_total", "d_fuel_proxy"]] = 999999.
+    prediction = original.prediction_copy(start, end)
+    changed_prediction = altered.prediction_copy(start, end)
+    dispatch = original.masked_copy(start, end)
+    before = build_base_features(prediction, include_targets=True)
+    after = build_base_features(changed_prediction, include_targets=True)
+    checks = {
+        "prediction_features_ignore_evaluation_power_gas": np.allclose(before, after, equal_nan=True),
+        "prediction_targets_and_gas_masked": prediction.frame.loc[start:end, columns + derived
+            + list(C.TARGET_COLUMN.values())].isna().all().all(),
+        "dispatch_keeps_observed_gas": dispatch.frame.loc[start:end, columns].notna().all().all(),
+        "history_and_labels_preserved": prediction.frame.loc[:original.index[191], columns].equals(
+            original.frame.loc[:original.index[191], columns]) and prediction.labels.equals(original.labels),
+    }
+    return {"passed": bool(all(checks.values())), **{key: bool(value) for key, value in checks.items()}}
+
+
 def _observed_at_t_check() -> dict:
     from .pipeline import _observed_at_t_features
     from main_s import _feature_columns, _with_observed_features
@@ -1089,15 +1117,9 @@ def _net_dispatch_check() -> dict:
         holder_units_verified=units, config=cfg)
     missing_initial = main_opt.solve_net_day(boundary, np.ones(8), {names[1]: 100000.}, np.zeros(6),
         [1e6, 1e5, 1e5], heat, holder_units_verified=units, config=cfg)
-    # 初态在安全区外时，正式实现允许显式恢复，而不是把真实低柜位直接判死；
-    # 但恢复必须被记录，且末态回到各自安全区，不能用“两柜合计安全”掩盖单柜越界。
-    recovery_ok = (
-        bad_initial.get("status") != "BLOCKED_OPT"
-        and bad_initial.get("network_validation", {}).get("passed", False)
-        and bad_initial.get("holder_recovery", {}).get(names[0], {}).get("required", False)
-        and bad_initial["holders_m3"][-1, 0] >= 300000. * C.GAS_HOLDER["safe_low_ratio"] - 1.)
-    checks["safe_sum_cannot_hide_unsafe_holder"] = (
-        bad_initial["status"] in {"BLOCKED_OPT", "INFEASIBLE"} or recovery_ok)
+    # 安全区外的真实初态不得通过恢复宽限获得正式可行性。
+    checks["safe_sum_cannot_hide_unsafe_holder"] = bad_initial["status"] in {
+        "BLOCKED_OPT", "INFEASIBLE", "INVALID_SOLUTION"}
     checks["missing_holder_not_invented"] = missing_initial["status"] == "BLOCKED_OPT"
     tampered = copy.deepcopy(result)
     tampered["holders_m3"][0] += [5000., -5000.]
@@ -1399,6 +1421,7 @@ def run_self_checks(config=C) -> dict:
         "execution_tracking": _execution_tracking_check(),
         "long_process_expert": _process_expert_check(),
         "power_gas_availability": _power_gas_availability_check(),
+        "prediction_dispatch_views": _prediction_dispatch_views_check(),
         "observed_at_t": _observed_at_t_check(),
         "generator1_contract": _generator1_contract_check(),
     }

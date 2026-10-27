@@ -160,14 +160,11 @@ def physical_submission_check(optimization: dict) -> dict:
             return False
         low, high = capacity * C.GAS_HOLDER["safe_low_ratio"], capacity * C.GAS_HOLDER["safe_high_ratio"]
         tolerance = C.OPT_CONFIG["holder_tolerance_m3"]
-        recovery = int(item.get("initial_outside_recovery_steps", 0) or 0)
-        # 首态已在安全区外时，允许在恢复期内从实测值出发；恢复期后仍须回到安全区。
-        low_bound = min(start, low) if recovery else low
         return (np.isfinite([start, end, minimum, maximum, residual]).all()
-            and low_bound - tolerance <= minimum
+            and low - tolerance <= minimum
             and maximum <= high + tolerance
-            and -tolerance <= start <= capacity + tolerance
-            and -tolerance <= end <= capacity + tolerance
+            and low - tolerance <= start <= high + tolerance
+            and low - tolerance <= end <= high + tolerance
             and 0. <= residual <= tolerance)
     checks["independent_holder_safety"] = bool(steps > 0 and independent.get("passed") is True
         and independent.get("rows") == steps and all(
@@ -215,14 +212,10 @@ def model_submission_check(optimization: dict, config=C) -> dict:
         checks["submitted_controls_only"] = bool(np.max(np.abs(vent)) <= gt)
         names = list(config.GAS_HOLDER["capacity_by_column_m3"])
         capacity = np.array(list(config.GAS_HOLDER["capacity_by_column_m3"].values()))
-        recovery = np.zeros(2, dtype=int)
         safety = np.ones(2, dtype=bool)
         for j in range(2):
-            inside_initial = bool(.15*capacity[j] - st <= stock[0, j] <= .90*capacity[j] + st)
-            recovery[j] = 0 if inside_initial else max(1, min(int(config.OPT_CONFIG.get("holder_recovery_steps", 4)), n))
-            after = stock[recovery[j]:, j]
-            safety[j] = bool(((after >= .15*capacity[j]-st) & (after <= .90*capacity[j]+st)).all()
-                             and (stock[:, j] >= -st).all() and (stock[:, j] <= capacity[j]+st).all())
+            safety[j] = bool(((stock[:, j] >= .15*capacity[j]-st)
+                              & (stock[:, j] <= .90*capacity[j]+st)).all())
         checks["independent_holder_safety"] = bool(safety.all())
         supply = evidence.get("net_supply_model", {})
         uncertainty = net_supply_safety_check(supply, config)
@@ -338,7 +331,8 @@ def model_submission_check(optimization: dict, config=C) -> dict:
                     and bridge.get("first_effective_holders_m3") == plan.get("initial_holders_m3")
                     and np.isfinite([before, after, change, released]).all()
                     and (np.abs(after-before-change+released) <= st).all()
-                    and (before >= -st).all() and (before <= capacity+st).all()
+                    and (before >= capacity*config.GAS_HOLDER["safe_low_ratio"]-st).all()
+                    and (before <= capacity*config.GAS_HOLDER["safe_high_ratio"]+st).all()
                     and (after >= capacity*config.GAS_HOLDER["safe_low_ratio"]-st).all()
                     and (after <= capacity*config.GAS_HOLDER["safe_high_ratio"]+st).all()))
             checks["every_daily_state_bridge"] = bool(bridge_validity and all(bridge_validity))
@@ -538,10 +532,8 @@ def validate_net_dispatch(boundary: dict, result: dict, initial_holders: dict,
         path = np.r_[initial[i], levels[:, i]]
         low, high = capacity * config.GAS_HOLDER["safe_low_ratio"], capacity * config.GAS_HOLDER["safe_high_ratio"]
         initial_inside = bool(low - st <= initial[i] <= high + st)
-        recovery = max(1, min(int(config.OPT_CONFIG.get("holder_recovery_steps", 4)), n))
-        start = 0 if initial_inside else recovery - 1
-        inside = bool(((levels[start:, i] >= low - st) & (levels[start:, i] <= high + st)).all()
-            and (path >= -st).all() and (path <= capacity + st).all())
+        # 实测初态及所有计划时刻都参与安全核验，不能用恢复宽限掩盖越界。
+        inside = bool(initial_inside and ((levels[:, i] >= low - st) & (levels[:, i] <= high + st)).all())
         margin = capacity * config.OPT_CONFIG["holder_margin_ratio"]
         planned_low, planned_high = _independent_holder_plan_bounds(initial, n, config)
         planned = bool(((levels[:, i] >= planned_low[i] - st) & (levels[:, i] <= planned_high[i] + st)).all())
@@ -556,7 +548,7 @@ def validate_net_dispatch(boundary: dict, result: dict, initial_holders: dict,
             "minimum_m3": float(path.min()), "maximum_m3": float(path.max()),
             "safe_low_m3": low, "safe_high_m3": high, "units_verified": unit_ok,
             "initial_inside_safe_band": initial_inside,
-            "initial_outside_recovery_steps": 0 if initial_inside else recovery,
+            "initial_outside_recovery_steps": 0,
             "safety_passed": inside, "plan_margin_passed": planned, "balance_passed": balanced,
             "terminal_passed": bool(terminal), "terminal_target_m3": float(target),
             "balance_max_m3": float(np.abs(stock_residual[:, i]).max())}
@@ -3174,18 +3166,15 @@ def optimize_net_daily(prepared, grid, issue_times, positions, resource_bundle, 
         first_initial = float(paths[0, j])
         first_inside = bool(low - C.OPT_CONFIG["holder_tolerance_m3"] <= first_initial
                             <= high + C.OPT_CONFIG["holder_tolerance_m3"])
-        recovery = 0 if first_inside else max(1, min(int(C.OPT_CONFIG.get("holder_recovery_steps", 4)),
-                                                    len(paths) - 1))
-        after = paths[recovery:, j]
-        safety = bool(((after >= low - C.OPT_CONFIG["holder_tolerance_m3"])
-                       & (after <= high + C.OPT_CONFIG["holder_tolerance_m3"])).all())
+        safety = bool(((paths[:, j] >= low - C.OPT_CONFIG["holder_tolerance_m3"])
+                       & (paths[:, j] <= high + C.OPT_CONFIG["holder_tolerance_m3"])).all())
         holders[name] = {"passed": bool(detail.get("passed", False)), "units_verified": units_verified[name],
             "capacity_m3": capacity,
             "initial_m3": first_initial, "terminal_m3": float(paths[-1, j]),
             "minimum_m3": float(paths[:, j].min()), "maximum_m3": float(paths[:, j].max()),
             "balance_max_m3": max_stock_error[name],
             "initial_inside_safe_band": first_inside,
-            "initial_outside_recovery_steps": recovery,
+            "initial_outside_recovery_steps": 0,
             "safety_passed": safety,
             "plan_margin_passed": bool(detail.get("plan_margin_passed", False)),
             "balance_passed": bool(detail.get("balance_passed", False)),

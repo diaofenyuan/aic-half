@@ -82,6 +82,10 @@ class PreparedData:
         obj.mask_end = end
         return obj
 
+    def prediction_copy(self, start: pd.Timestamp | str, end: pd.Timestamp | str) -> "PreparedData":
+        """负荷预测隔离评测耗气；优化仍使用单独的目标遮挡视图。"""
+        return self.masked_copy(start, end).masked_power_gas_copy(start, end)
+
     def prefix_copy(self, end: pd.Timestamp | str) -> "PreparedData":
         """推理拟合只拿首个起报点之前的前缀，资源标签也不能跨进干跑窗口。"""
         stop = int(self.index.searchsorted(pd.Timestamp(end), side="right"))

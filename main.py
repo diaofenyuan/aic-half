@@ -1,7 +1,7 @@
 """半决赛唯一日常入口：python main.py
 
-当前默认 opt 仅生成调度，短期与长期预测表及模型原样复用；
-run 保留历史 21 天时序回测。测试标签为空，不计算测试集本地分数；
+默认重新训练选定预测配方并生成每日调度；opt 显式复用预测表，
+run 保留隔离的历史 21 天时序回测。测试标签为空，不计算测试集本地分数；
 当次结果能否提交由窗口、运行范围和优化核验共同判定。
 """
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 import traceback
@@ -26,6 +27,18 @@ from data_cleaning import data_contract_check, prepare_data, run_self_checks, sc
 
 
 LOGGER = logging.getLogger("aic-half")
+
+
+def _training_stage_record(before, started, *, kind="model"):
+    """区分实际拟合与缓存复用，资源画像的重建单独标记。"""
+    after = output.training_cache_stats()
+    changes = {bucket: {key: int(after[bucket].get(key, 0) - before[bucket].get(key, 0))
+                       for key in set(after[bucket]) | set(before[bucket])
+                       if after[bucket].get(key, 0) != before[bucket].get(key, 0)}
+               for bucket in ("hits", "misses")}
+    enabled = os.environ.get("AIC_TRAINING_CACHE", "1") != "0"
+    return {"kind": kind, "cache_enabled": enabled, "cache_delta": changes,
+            "seconds": round(time.perf_counter() - started, 4)}
 
 
 class _ProgressLogHandler(logging.StreamHandler):
@@ -326,6 +339,8 @@ def run_opt(quick: bool = False, experimental: bool = False, reuse_run: Path | N
         reuse_run = candidates[0]
     reuse_run = reuse_run.resolve()
     meta, resource, compatibility = output.load_optimization_reference(reuse_run)
+    if meta.get("data_contract", {}).get("prediction_power_gas_policy") != C.PREDICTION_POWER_GAS_POLICY:
+        raise ValueError("复用预测表缺少评测耗气遮挡契约，请先完整推理生成兼容的新预测归档")
     ctx = output.begin_run(C, mode="opt", experimental=quick or experimental, quick=quick)
     _setup_logger(ctx.log_path)
     LOGGER.info("仅优化运行目录: %s；预测表复用: %s", ctx.root, reuse_run)
@@ -464,14 +479,22 @@ def run_infer(quick: bool = False, experimental: bool = False,
         tick = time.perf_counter()
         stages.update(1)
         if reuse_run is None:
+            training_stages = {}
+            stage_started, cache_before = time.perf_counter(), output.training_cache_stats()
             stages.set_description("推理 · 短期训练")
             short_bundle = main_s.train_final_load(training, "short", main_s.ShortBundle, quick=quick)
+            training_stages["short"] = _training_stage_record(cache_before, stage_started)
             stages.update(1)
+            stage_started, cache_before = time.perf_counter(), output.training_cache_stats()
             stages.set_description("推理 · 长期训练")
             long_bundle = main_s.train_final_load(training, "long", main_l.LongBundle, quick=quick)
+            training_stages["long"] = _training_stage_record(cache_before, stage_started)
             stages.update(1)
+            stage_started, cache_before = time.perf_counter(), output.training_cache_stats()
             stages.set_description("推理 · 资源训练")
             resource_bundle = main_opt.train_final_resources(resource_training, quick=quick)
+            training_stages["resource"] = _training_stage_record(cache_before, stage_started,
+                kind="causal_net_profile_and_calibration" if resource_bundle.final_net_supply is not None else "resource_models")
             stages.update(1)
         else:
             stages.set_description("推理 · 复用模型与冻结 NN")
@@ -486,14 +509,21 @@ def run_infer(quick: bool = False, experimental: bool = False,
             summary["validation_scope"] = "完整冻结归档直接推理；不训练、不更新配方、不重新标定"
             stages.update(3)
         if reuse_run is None:
+            stage_started, cache_before = time.perf_counter(), output.training_cache_stats()
             if C.GENERATOR1_SPECIALIST:
                 summary["generator1"] = _train_generator1_final(training, short_bundle, long_bundle, quick=quick)
             summary["long_process_expert"] = main_l.train_process_expert(training, long_bundle, quick=quick)
+            training_stages["specialists"] = _training_stage_record(cache_before, stage_started)
+            summary["training_execution"] = {"mode": "fit_or_training_cache", "stages": training_stages}
         else:
             summary["generator1"] = {name: {"reused": True, "train_end": bundle.final_generator1["train_end"]}
                 for name, bundle in (("short", short_bundle), ("long", long_bundle)) if bundle.final_generator1}
             summary["long_process_expert"] = {"reused": bool(long_bundle.final_process_expert)}
-        summary["training_performed"] = reuse_run is None
+            summary["training_execution"] = {"mode": "archive_reuse", "source": str(reuse_run.resolve())}
+        cache_stats = output.training_cache_stats()
+        summary["training_requested"] = reuse_run is None
+        summary["training_performed"] = bool(reuse_run is None and
+            (os.environ.get("AIC_TRAINING_CACHE", "1") == "0" or sum(cache_stats["misses"].values()) > 0))
         timings["training_seconds" if reuse_run is None else "model_load_seconds"] = round(time.perf_counter() - tick, 4)
         if reuse_run is not None:
             timings["training_seconds"] = 0.
@@ -509,9 +539,10 @@ def run_infer(quick: bool = False, experimental: bool = False,
                     window, len(origins), origins[0], origins[-1])
         # 官方推理没有标签可见；评测窗口目标必须整体遮挡。
         mask_end = origins[-1] + pd.Timedelta(minutes=C.STEP_MINUTES)
-        masked = prepared.masked_copy(origins[0], mask_end)
-        short_pred = main_s.predict_short(short_bundle, masked, origins, use_final=True)
-        long_pred = main_l.predict_long(long_bundle, masked, origins, use_final=True)
+        dispatch_view = prepared.masked_copy(origins[0], mask_end)
+        prediction_view = prepared.prediction_copy(origins[0], mask_end)
+        short_pred = main_s.predict_short(short_bundle, prediction_view, origins, use_final=True)
+        long_pred = main_l.predict_long(long_bundle, prediction_view, origins, use_final=True)
         timings["load_inference_seconds"] = round(time.perf_counter() - tick, 4)
         tick = time.perf_counter()
         prediction_report = output.write_predictions(ctx, origins, short_pred, long_pred)
@@ -526,7 +557,7 @@ def run_infer(quick: bool = False, experimental: bool = False,
         stages.set_description("推理 · 调度优化")
         tick = time.perf_counter()
         try:
-            optimization = main_opt.optimize(resource_forecast, masked, origins,
+            optimization = main_opt.optimize(resource_forecast, dispatch_view, origins,
                                              long_pred, resource_bundle, quick=quick,
                                              use_final=True)
         except Exception as exc:
@@ -536,7 +567,7 @@ def run_infer(quick: bool = False, experimental: bool = False,
         if optimization.get("schedule") is None:
             LOGGER.warning("调度未取得完整解，改用因果兜底指令完成三表导出: %s",
                            optimization.get("summary", {}).get("reason", optimization.get("status")))
-            optimization = main_opt.export_fallback_schedule(masked, origins, resource_bundle,
+            optimization = main_opt.export_fallback_schedule(dispatch_view, origins, resource_bundle,
                                                              optimization, quick=quick)
         timings["dispatch_seconds"] = round(time.perf_counter() - tick, 4)
         timings.update(optimization.get("summary", {}).get("timings", {}))
@@ -587,8 +618,9 @@ def run_infer(quick: bool = False, experimental: bool = False,
             "origins": int(len(origins)),
             "origin_range": [str(origins[0]), str(origins[-1])],
             "prediction_input_support": {
-                "power_gas_missing_origins": int((~np.isfinite(masked.frame[["d_use_blast", "d_use_coke", "d_use_converter"]]
-                    .to_numpy(dtype=float)[masked.index.get_indexer(origins)]).all(axis=1)).sum()),
+                "power_gas_policy": C.PREDICTION_POWER_GAS_POLICY,
+                "power_gas_missing_origins": int((~np.isfinite(prediction_view.frame[["d_use_blast", "d_use_coke", "d_use_converter"]]
+                    .to_numpy(dtype=float)[prediction_view.index.get_indexer(origins)]).all(axis=1)).sum()),
                 "short_fallback_active": bool(short_bundle.final_availability),
                 "short_process_recovery": short_bundle.process_recovery,
                 "long_fallback_active": bool(long_bundle.final_availability)},
@@ -625,14 +657,14 @@ def run_infer(quick: bool = False, experimental: bool = False,
             tick = time.perf_counter()
             reloaded = output.load_final_models(ctx.root)
             sample = np.unique(np.array([0, min(96, len(origins) - 1), min(192, len(origins) - 1), len(origins) - 1]))
-            short_full = main_s.predict_short(reloaded[0], masked, origins, use_final=True)
-            long_full = main_l.predict_long(reloaded[1], masked, origins, use_final=True)
+            short_full = main_s.predict_short(reloaded[0], prediction_view, origins, use_final=True)
+            long_full = main_l.predict_long(reloaded[1], prediction_view, origins, use_final=True)
             differences = {"short": float(np.max(np.abs(short_full - short_pred))),
                            "long": float(np.max(np.abs(long_full - long_pred)))}
             if max(differences.values()) > 1e-5:
                 raise ValueError("最终模型归档重载未复现包含缺测分支的推理")
-            short_check = main_s.predict_short(reloaded[0], masked, origins[sample], use_final=True)
-            long_check = main_l.predict_long(reloaded[1], masked, origins[sample], use_final=True)
+            short_check = main_s.predict_short(reloaded[0], prediction_view, origins[sample], use_final=True)
+            long_check = main_l.predict_long(reloaded[1], prediction_view, origins[sample], use_final=True)
             sampled = {"short": float(np.max(np.abs(short_check - short_full[sample]))),
                        "long": float(np.max(np.abs(long_check - long_full[sample])))}
             # FP32 在不同 GPU 批形状下可能换用卷积核；抽样误差与完整重载误差分开验收。
@@ -675,11 +707,11 @@ def run_infer(quick: bool = False, experimental: bool = False,
 def run_full(quick: bool = False, experimental: bool = False) -> int:
     started = time.time()
     output.training_cache_stats(reset=True)
-    ctx = output.begin_run(C, mode="backtest", experimental=quick or experimental, quick=quick)
+    ctx = output.begin_run(C, mode="backtest", experimental=True, quick=quick)
     _setup_logger(ctx.log_path)
     LOGGER.info("运行目录: %s", ctx.root)
     summary = {"run_id": ctx.run_id, "status": "FAILED", "mode": "BACKTEST",
-               "experimental": bool(quick or experimental), "output_root": str(ctx.root),
+               "experimental": True, "output_root": str(ctx.root),
                "quick": bool(quick), "validation_scope": "A/B开发验证" if quick else "历史开发验证，D已被多次查看", "errors": []}
     stages = C.progress(total=8, desc="回测 · 数据准备", unit="阶段", leave=True)
     try:
@@ -1241,9 +1273,9 @@ def _fit_calibration_prefixes(ctx, summary, prepared, specs, templates, spans=("
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="AIC 半决赛煤气发电预测与优化")
-    parser.add_argument("command", nargs="?", default="opt" if C.EXECUTION_FOCUS == "optimization" else "infer",
+    parser.add_argument("command", nargs="?", default="infer",
                         choices=("opt", "run", "infer", "doctor", "self-check", "verify"),
-                        help="默认 opt 只优化调度，预测表直接复用；infer 为完整预测入口")
+                        help="默认 infer 训练并生成预测和调度；opt 复用预测表只优化")
     parser.add_argument("--run-dir", type=Path, help="verify 指定选定运行或实验结果目录")
     parser.add_argument("--quick", action="store_true", help="单折、低迭代的开发模式")
     progress_args = parser.add_mutually_exclusive_group()
@@ -1258,10 +1290,8 @@ def main(argv: list[str] | None = None) -> int:
     C.PROGRESS_ENABLED = args.progress
     if args.reuse_run and args.command not in ("infer", "opt"):
         parser.error("--reuse-run 只用于 infer / opt")
-    if args.command == "opt" or (args.command == "infer" and C.EXECUTION_FOCUS == "optimization"):
+    if args.command == "opt":
         return run_opt(quick=args.quick, experimental=args.experiment, reuse_run=args.reuse_run)
-    if args.command == "run" and C.EXECUTION_FOCUS == "optimization":
-        parser.error("当前专注优化，负荷预测训练已关闭；使用 opt 执行调度")
     if args.command == "doctor":
         return run_doctor()
     if args.command == "infer":
