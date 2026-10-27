@@ -145,6 +145,13 @@ def _validate_day(day):
     fit=day.get("gas_power_validation")
     if fit is not None:
         checks["gas_power_calibration"]=bool(fit["passed"])
+    refinement=day.get("refinement",{})
+    if refinement.get("applied"):
+        frozen_total=np.asarray(refinement["baseline_total_power"],float)
+        frozen_end=np.asarray(refinement["baseline_terminal_unit_power"],float)
+        checks["refinement_fixed_total_power"]=bool(np.max(np.abs(p.sum(axis=1)-frozen_total))<=1e-5)
+        checks["refinement_fixed_terminal_state"]=bool(np.max(np.abs(p[-1]-frozen_end))<=1e-5)
+        checks["group_mapping_causality"]=pd.Timestamp(day["group_mapping"]["train_end"])<pd.Timestamp(day["issued_at"])
     details["max_aggregate_change_mw"] = delta.max(axis=0).tolist()
     return {"passed": bool(all(checks.values())), "checks": checks,
             "problems": [k for k, v in checks.items() if not v], "details": details}

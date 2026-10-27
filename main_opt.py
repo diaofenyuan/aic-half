@@ -1,5 +1,6 @@
 """煤气资源、因果边界与每日固定 MILP；模型假设始终显式归档。"""
 from dataclasses import dataclass, field
+from copy import deepcopy
 import time
 import warnings
 import numpy as np
@@ -76,6 +77,7 @@ def fit_resources(data, quick=False, progress=None):
     b.diagnostics["training_budget"]={"quick":bool(quick),"threads":C.CPU_THREADS,
                                       "stride":stride,"horizons":horizons}
     b.beta,b.diagnostics["gas_power"] = calibrate_power(data)
+    b.diagnostics["group_mapping"] = fit_group_mapping(data)
     for name in labels:
         y = labels[name].to_numpy()[ix]
         if np.isfinite(y).sum() < 100:
@@ -396,6 +398,18 @@ def optimize_daily(bundle,data,origins,quick=False,progress=None):
                  state_reset_m3=anchor-previous_state if previous_state is not None else None,
                  warnings=warnings,fallback_used=fallback)
         day["validation"]=validate_day(day)
+        mapping=bundle.diagnostics.get("group_mapping")
+        if mapping is None:
+            raise ValueError("归档缺少新版分组标定，不能静默迁移旧模型")
+        if mapping["trusted"]:
+            refined=refine_group_day(day,mapping,smooth=C.GROUP_DISPATCH["smooth_penalty"])
+            if refined is not None:
+                day=refined
+                solution["power"]=day["power"]
+            else:
+                day["refinement"]={"applied":False,"reason":"fixed_trajectory_infeasible"}
+        else:
+            day["refinement"]={"applied":False,"reason":"mapping_holdout_gate_failed"}
         day["plan_revenue_cny"]=float(np.sum(price*solution["power"].sum(axis=1))*250.)
         day["planned_vent_m3"]=float(np.nansum(solution["vent"])*C.DT)
         day["export_resource_shortfall_m3"]=float(np.sum(solution.get("export_shortfall_m3h",0.))*C.DT)
@@ -415,9 +429,125 @@ def optimize_daily(bundle,data,origins,quick=False,progress=None):
     summary={"publication_time":"07:00","intraday_refresh":False,"daily_publications":len(days),
              "planned_steps":len(schedule),"constraint_validation_passed":not failures,
              "failed_publications":failures,"fallback_publications":sum(d["fallback_used"] for d in days),
+             "group_refined_publications":sum(d.get("refinement",{}).get("applied",False) for d in days),
              "plan_revenue_cny":sum(d["plan_revenue_cny"] for d in days),
              "planned_vent_m3":sum(d["planned_vent_m3"] for d in days),
              "physical_model_basis":"adopted_project_policy_inferred_resources",
              "field_safety_certified":False,"replay_complete":False,
              "execution_revenue":None,"note":"计划轨迹不冒充官方柜位重建或真实执行收益"}
     return schedule,days,summary
+
+
+def fit_group_mapping(data):
+    data.require_training(data.index[-1])
+    data=data.prefix(data.index[-1])
+    start=data.index[-1]-pd.Timedelta(days=C.GROUP_DISPATCH["history_days"])
+    data.frame=data.frame.loc[start:].copy()
+    data.labels=data.labels.reindex(data.frame.index)
+    frame=data.frame[list(C.USE)].to_numpy(float)
+    y=data.labels.generator_1.to_numpy(float)
+    valid=np.isfinite(frame).all(axis=1)&np.isfinite(y)&(frame[:,0]>0.)
+    q,y=frame[valid],y[valid]
+    times=data.index[valid]
+    if len(y)<400:
+        return {"trusted":False,"train_end":str(data.index[-1]),"rows":len(y),
+                "source":"historical_inferred","reason":"INSUFFICIENT_GROUP_OBSERVATIONS"}
+    scale=np.maximum(np.median(q,axis=0),1.)
+    X=q/scale
+    split=times.max()-pd.Timedelta(days=C.GROUP_DISPATCH["holdout_days"])
+    before=times<split
+    after=~before
+    def fit(a,b):
+        weight=np.ones(len(b))
+        coef=np.zeros(3)
+        for _ in range(5):
+            coef=lsq_linear(a*np.sqrt(weight)[:,None],b*np.sqrt(weight),bounds=(0.,np.inf)).x
+            err=np.abs(a@coef-b)
+            cutoff=max(float(np.median(err))*1.5,1.)
+            weight=np.minimum(1.,cutoff/np.maximum(err,1e-9))
+        return coef
+    if before.sum()<200 or after.sum()<100:
+        return {"trusted":False,"train_end":str(data.index[-1]),"rows":len(y),
+                "source":"historical_inferred","reason":"INSUFFICIENT_GROUP_HOLDOUT"}
+    test_coef=fit(X[before],y[before])
+    pred=X[after]@test_coef
+    score=score_resources(pred,y[after])
+    baseline=float(np.median(y[before]))
+    ref=score_resources(np.full(after.sum(),baseline),y[after])
+    beta=fit(X,y)/scale
+    trusted=score["wape"] is not None and score["wape"]<=C.GROUP_DISPATCH["max_wape"] and abs(score["bias"])<=C.GROUP_DISPATCH["max_abs_bias"]
+    return {"trusted":bool(trusted),"acceptance":C.GROUP_DISPATCH,"coefficients_mw_per_m3h":beta.tolist(),"train_end":str(data.index[-1]),
+            "source":"causal_training_prefix_inferred_group_mapping","rows":len(y),
+            "holdout_start":str(split),"holdout":score,"median_reference":ref,
+            "official_composition_formula":False}
+
+
+def refine_group_day(day,mapping,previous=None,smooth=0.,margin=.001):
+    if pd.Timestamp(mapping["train_end"])>=pd.Timestamp(day["issued_at"]):
+        raise ValueError("分组标定越过发布时刻")
+    power=np.arange(576).reshape(96,6)
+    on=np.arange(576,1152).reshape(96,6)
+    error=np.arange(1152,1248)
+    change=np.arange(1248,1344)
+    size=1344
+    cost=np.zeros(size);lower=np.zeros(size);upper=np.full(size,np.inf);integer=np.zeros(size)
+    cap=np.array(C.UNITS)
+    upper[power]=cap;upper[on]=1.;integer[on]=1.
+    # 冻结末条逐台状态，使本日再分配不改变次日发布的可达边界。
+    lower[power[-1]]=np.asarray(day["power"])[-1]
+    upper[power[-1]]=np.asarray(day["power"])[-1]
+    cost[error]=C.GROUP_DISPATCH["mapping_penalty"];cost[change]=smooth
+    q=np.asarray(day["gas"])
+    target=q@np.array(mapping["coefficients_mw_per_m3h"])
+    previous=np.asarray(day["previous_power"] if previous is None else previous)
+    total=np.asarray(day["power"]).sum(axis=1)
+    rows=LinearRows(size)
+    for k in range(96):
+        rows.add([(power[k,i],1.) for i in range(6)],low=total[k],high=total[k])
+        for i in range(6):
+            rows.add([(power[k,i],1.),(on[k,i],-cap[i])],high=0.)
+            rows.add([(power[k,i],1.),(on[k,i],-.6*cap[i])],low=0.)
+            for sign in (1.,-1.):
+                terms=[(power[k,i],sign),(on[k,i],cap[i])]
+                bound=.15*cap[i]+2*cap[i]
+                if k:
+                    terms.extend([(power[k-1,i],-sign),(on[k-1,i],cap[i])])
+                else:
+                    bound+=sign*previous[i]-cap[i]*float(previous[i]>=.6*cap[i]-.001)
+                rows.add(terms,high=bound)
+        terms=[(power[k,i],1.) for i in range(4)]
+        for sign in (1.,-1.):
+            rows.add([(j,v*sign) for j,v in terms]+[(error[k],-1.)],high=sign*target[k])
+        ramp=terms.copy()
+        if k:
+            ramp.extend((power[k-1,i],-1.) for i in range(4))
+            prior=0.
+        else:
+            prior=float(previous[:4].sum())
+        # 内部留极小数值裕度，不依赖放大验收容差跨越30MW边界。
+        rows.add(ramp,low=prior-(30.-margin),high=prior+(30.-margin))
+        for sign in (1.,-1.):
+            rows.add([(j,v*sign) for j,v in ramp]+[(change[k],-1.)],high=sign*prior)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore",message="Unrecognized options detected:.*threads.*")
+        result=milp(cost,integrality=integer,bounds=Bounds(lower,upper),constraints=rows.constraint(),
+                    options={"time_limit":10.,"mip_rel_gap":.005,"threads":C.CPU_THREADS})
+    if result.x is None:
+        if margin>0.:
+            return refine_group_day(day,mapping,previous,smooth,margin=0.)
+        return None
+    out=deepcopy(day)
+    out["power"]=result.x[power]
+    out["power"][-1]=np.asarray(day["power"])[-1]
+    out["previous_power"]=previous.copy()
+    out["group_mapping"]=mapping
+    out["refinement"]={"applied":True,"baseline_total_power":total.tolist(),"baseline_terminal_unit_power":np.asarray(day["power"])[-1].tolist(),"source":"fixed_gas_and_total_power_MILP","smooth_penalty":smooth,
+                       "solver_status":int(result.status),"total_power_max_difference":
+                       float(np.max(np.abs(out["power"].sum(axis=1)-total))),
+                       "group_mae_mw":float(np.mean(np.abs(out["power"][:,:4].sum(axis=1)-target)))}
+    out["validation"]=validate_day(out)
+    required=("unit_capacity","unit_minimum","aggregate_ramp","running_unit_ramp","gas_power",
+              "refinement_fixed_total_power","refinement_fixed_terminal_state","group_mapping_causality")
+    if not all(out["validation"]["checks"].get(k,False) for k in required):
+        return None
+    return out

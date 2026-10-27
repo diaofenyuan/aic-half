@@ -208,12 +208,21 @@ def self_check(ctx):
     check=validate_day(day)
     if not check["passed"]:
         raise AssertionError(check)
+    mapping={"trusted":True,"train_end":"2025-05-31 23:45:00",
+             "coefficients_mw_per_m3h":[.00015,0.,0.]}
+    refined=main_opt.refine_group_day(day,mapping,smooth=C.GROUP_DISPATCH["smooth_penalty"])
+    if refined is None:
+        raise AssertionError("分组再分配合成用例无解")
+    assert np.array_equal(refined["gas"],day["gas"])
+    assert np.allclose(refined["power"].sum(axis=1),day["power"].sum(axis=1),atol=1e-6)
+    assert np.array_equal(refined["power"][-1],day["power"][-1])
     day["stocks"]=solved["stocks"].copy()
     day["stocks"][4,0]+=100.
     assert not validate_day(day)["checks"]["holder_balance"]
     report={"status":"SELF_CHECK_PASSED","features":len(base.columns),"checks":[
         "future_perturbation","target_and_gas_blackout","no_holder_load_features","capacity_projection",
-        "synthetic_milp","independent_balance_mutation"],"solver":solver,"synthetic_validation":check}
+        "synthetic_milp","independent_balance_mutation","group_refinement_fixed_resources_and_terminal"],
+        "solver":solver,"synthetic_validation":check,"group_refinement":refined["refinement"]}
     output.write_report(ctx,report)
     return report
 

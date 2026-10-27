@@ -7,7 +7,7 @@ ROOT = next((p for p in (CODE_ROOT, *CODE_ROOT.parents) if (p / "data").is_dir()
 DATA_ROOT = Path(os.environ.get("AIC_DATA_ROOT", ROOT / "data"))
 OUTPUT_ROOT = ROOT / "outputs"
 EXPERIMENT_ROOT = ROOT / "tmp" / "tmp_outputs"
-SCHEMA = "lgbm_core_v2"
+SCHEMA = "lgbm_core_v3"
 CPU_THREADS = min(16, os.cpu_count() or 1)
 STEP = 15
 DT = .25
@@ -51,6 +51,8 @@ POLICY = {"source": "adopted_project_policy", "publication": "07:00", "availabil
           "residual_days": 28, "vent_penalty_cny_m3": .10,
           "switch_penalty_cny": 30., "terminal_constraint": False}
 GAS_POWER_ACCEPTANCE={"max_wape":.10,"max_abs_bias":.05,"source":"local_engineering_gate"}
+GROUP_DISPATCH={"history_days":28,"holdout_days":7,"max_wape":.15,"max_abs_bias":.05,
+                "mapping_penalty":10.,"smooth_penalty":10.,"source":"historical_inferred_soft_objective"}
 SOURCE_FILES = ("main.py", "main_s.py", "main_l.py", "main_opt.py", "main_nn.py",
                 "config.py", "output.py", "data_cleaning/__init__.py",
                 "data_cleaning/pipeline.py", "data_cleaning/quality.py",

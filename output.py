@@ -135,6 +135,8 @@ def load_models(run):
             raise ValueError("模型分量覆盖缺失或重复")
         bundles.append(b)
     r=meta["resource"]
+    if "group_mapping" not in r["diagnostics"]:
+        raise ValueError("新版归档必须包含分组气电标定和留出验证")
     resource=ResourceBundle(features=r["features"],train_end=r["train_end"],beta=r["beta"],diagnostics=r["diagnostics"])
     for name,record in r["models"].items():
         path=(root/record["file"]).resolve()
