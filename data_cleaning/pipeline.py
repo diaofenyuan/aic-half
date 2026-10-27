@@ -242,6 +242,11 @@ def _apply_sentinel_rules(frame: pd.DataFrame, quality: dict) -> None:
     quality["nonfinite_to_missing"] = {c: int(n) for c, n in zip(frame.columns, nonfinite) if n}
     frame.replace([np.inf, -np.inf], np.nan, inplace=True)
     counts = {}
+    sentinel = frame.abs().ge(C.CLEANING["sentinel_abs_min"])
+    for col in frame:
+        if sentinel[col].any():
+            counts[col] = int(sentinel[col].sum())
+    frame.mask(sentinel, inplace=True)
     for col, rule in C.CLEANING["sentinel_rules"].items():
         if col not in frame.columns:
             continue
@@ -251,7 +256,7 @@ def _apply_sentinel_rules(frame: pd.DataFrame, quality: dict) -> None:
             invalid |= values < float(rule["min"])
         if "max" in rule:
             invalid |= values > float(rule["max"])
-        counts[col] = int(invalid.sum())
+        counts[col] = counts.get(col, 0) + int(invalid.sum())
         frame.loc[invalid, col] = np.nan
     for prefix in C.CLEANING["nonnegative_prefixes"]:
         for col in frame.columns:
@@ -376,15 +381,19 @@ def short_process_view(prepared: PreparedData, recipe: dict) -> tuple[PreparedDa
     return obj, active
 
 
-def _build_derived(frame: pd.DataFrame) -> None:
+def _build_derived(frame: pd.DataFrame, provenance: pd.DataFrame | None = None) -> None:
     gen_blast = [f"gas_blast_furnace_{i}" for i in range(1, 6)]
     air_heaters = [f"gas_air_heater_{i}" for i in range(1, 6)]
     blast_users = [f"gas_user_blast_furnace_user{i}" for i in range(1, 5)]
     converter_users = [f"gas_user_converter_user{i}" for i in range(1, 3)]
     for name, columns in (("gen_blast", gen_blast), ("air_heater", air_heaters),
                           ("blast_user", blast_users), ("converter_user", converter_users)):
-        present = [c for c in columns if c in frame]
-        frame[f"d_{name}_valid_fraction"] = (frame[present].notna().sum(axis=1) / len(columns))
+        if provenance is None:
+            valid = frame.reindex(columns=columns).notna()
+        else:
+            # 有限前向填补可供模型输入，但不能提高实测组成项覆盖率。
+            valid = provenance.reindex(index=frame.index, columns=columns).eq(1)
+        frame[f"d_{name}_valid_fraction"] = valid.sum(axis=1) / len(columns)
 
     frame["d_gen_blast"] = _sum_columns(frame, gen_blast)
     frame["d_gen_coke"] = frame.get("gas_coke_oven_1", np.nan)
@@ -470,6 +479,24 @@ def _observed_at_t_features(tables: dict[str, pd.DataFrame], index: pd.DatetimeI
     return pd.DataFrame(out, index=index, dtype=float)
 
 
+def _clean_target_labels(targets: pd.DataFrame, quality: dict, config=C) -> pd.DataFrame:
+    """独立目标各自保留合法标签；联合设备关系冲突时才同时遮挡。"""
+    targets = targets.copy()
+    invalid = pd.DataFrame(False, index=targets.index, columns=targets.columns)
+    for target in config.TARGETS:
+        values = targets[target]
+        invalid[target] = values.notna() & (~np.isfinite(values) | (values < 0.) | (values > config.CAPACITY[target]))
+    targets.mask(invalid, inplace=True)
+    first, total = targets["generator_1"], targets["generator_all"]
+    conflict = first.notna() & total.notna() & ((total+1e-8 < first)
+        | (total-first > config.STRUCTURAL_CAPACITY["generator_big"]+1e-8))
+    targets.loc[conflict] = np.nan
+    quality["target_invalid"] = int((invalid.any(axis=1) | conflict).sum())
+    quality["target_invalid_by_column"] = {t: int(invalid[t].sum()) for t in config.TARGETS}
+    quality["target_relation_invalid"] = int(conflict.sum())
+    return targets
+
+
 def prepare_data(config=C, mask_targets: tuple | None = None,
                  cutoff: pd.Timestamp | str | None = None,
                  include_inference: bool = False) -> PreparedData:
@@ -537,16 +564,12 @@ def prepare_data(config=C, mask_targets: tuple | None = None,
                      "problems": conflicts}
     _apply_sentinel_rules(frame, quality)
     provenance = _causal_fill(frame, quality)
-    _build_derived(frame)
+    _build_derived(frame, provenance)
     frame = pd.concat([frame, _observed_at_t_features(merged_tables, index, config)], axis=1)
 
     targets = pd.DataFrame({t: frame.get(config.TARGET_COLUMN[t], np.nan)
                             for t in config.TARGETS}, index=index)
-    valid = (targets["generator_1"] >= 0) & (targets["generator_1"] <= config.CAPACITY["generator_1"])
-    valid &= (targets["generator_all"] >= 0) & (targets["generator_all"] <= config.CAPACITY["generator_all"])
-    valid &= targets["generator_all"] + 1e-8 >= targets["generator_1"]
-    quality["target_invalid"] = int((~valid & targets.notna().any(axis=1)).sum())
-    targets.loc[~valid] = np.nan
+    targets = _clean_target_labels(targets, quality, config)
     for target in config.TARGETS:
         frame[config.TARGET_COLUMN[target]] = targets[target]
         provenance[config.TARGET_COLUMN[target]] = targets[target].notna().astype(np.uint8)
@@ -593,7 +616,7 @@ def _last_valid(series: pd.Series) -> tuple[np.ndarray, np.ndarray]:
     valid = np.isfinite(values)
     positions = np.arange(len(values))
     last = np.maximum.accumulate(np.where(valid, positions, -1))
-    age = positions - last
+    age = np.where(last >= 0, positions-last, np.nan)
     level = np.where(last >= 0, values[np.maximum(last, 0)], np.nan)
     return level, age.astype(np.float32)
 
@@ -605,6 +628,28 @@ BASE_CURRENT_COLUMNS = (
     "d_surplus_blast", "d_surplus_coke", "d_surplus_converter",
     "d_holder_level", "d_holder_ratio",
 )
+
+
+def _feature_observation_series(prepared: PreparedData, column: str) -> pd.Series:
+    """部分合计及前向补值可作输入，观测标记和年龄只由齐备的原始组成项产生。"""
+    use = tuple(f"load_generator_use_{g}_gas" for g in ("blast_furnace", "coke", "converter"))
+    gen = tuple(f"gas_blast_furnace_{i}" for i in range(1, 6))
+    blast_users = tuple(f"gas_user_blast_furnace_user{i}" for i in range(1, 5))
+    converter_users = tuple(f"gas_user_converter_user{i}" for i in range(1, 3))
+    sources = {"d_gen_blast": gen, "d_gen_coke": ("gas_coke_oven_1",),
+        "d_gen_converter_scaled": ("gas_converter_1",), "d_holder_level": (C.GAS_HOLDER["column"],),
+        "d_use_total": use, "d_fuel_proxy": use,
+        "d_surplus_blast": (*gen, *(f"gas_air_heater_{i}" for i in range(1, 6)), *blast_users, "gas_into_gas_mixed_blast_furnace"),
+        "d_surplus_coke": ("gas_coke_oven_1", "gas_into_gas_mixed_coke"),
+        "d_surplus_converter": ("gas_converter_1", *converter_users, "gas_into_gas_mixed_converter")}
+    for i, gas in enumerate(("blast", "coke", "converter")):
+        sources["d_use_"+gas] = (use[i],)
+        sources["d_use_share_"+gas] = use
+    series = prepared.frame[column]
+    if prepared.provenance.empty or column not in sources:
+        return series
+    complete = prepared.provenance.reindex(index=prepared.index, columns=sources[column]).eq(1).all(axis=1)
+    return series.where(complete)
 
 
 def build_base_features(prepared: PreparedData, include_targets: bool) -> pd.DataFrame:
@@ -623,8 +668,9 @@ def build_base_features(prepared: PreparedData, include_targets: bool) -> pd.Dat
             continue
         series = frame[col]
         # 缺测与零供气是不同工况；年龄封顶一天，避免长缺口被当作稳定观测。
-        _, observation_age = _last_valid(series)
-        out[f"obs_{col}_missing"] = series.isna().to_numpy(dtype=float)
+        observed_series = _feature_observation_series(prepared, col)
+        _, observation_age = _last_valid(observed_series)
+        out[f"obs_{col}_missing"] = observed_series.isna().to_numpy(dtype=float)
         out[f"obs_{col}_staleness"] = np.minimum(observation_age, C.STEPS_PER_DAY)
         for lag in C.FEATURE_LAGS:
             out[f"{col}_lag{lag}"] = series.shift(lag).to_numpy(dtype=float)

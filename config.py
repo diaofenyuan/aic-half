@@ -125,6 +125,8 @@ FORBIDDEN_FUTURE = ("target_at_t_plus_h", "future_gas_truth")
 # 清洗与物理约束
 # ---------------------------------------------------------------------------
 CLEANING = {
+    # 已出现1e30量级的采集哨兵；这是无效编码，不按训练分位数删除正常极值。
+    "sentinel_abs_min": 1e29,
     # 传感器哨兵/不可识别量：只标记为 NaN，不猜真实值。
     "sentinel_rules": {
         "gas_air_heater_4": {"min": 0.0},
@@ -134,7 +136,8 @@ CLEANING = {
     # 煤气发生/消耗为负值时按无效观测处理；派生平衡量允许为负。
     "nonnegative_prefixes": ("gas_blast_furnace_", "gas_coke_oven_", "gas_converter_",
                              "gas_air_heater_", "gas_into_gas_mixed_",
-                             "gas_user_blast_furnace_user", "gas_user_converter_user"),
+                             "gas_user_blast_furnace_user", "gas_user_converter_user",
+                             "load_generator_use_", "gas_holder_"),
     # 连续用气仅允许有限步前向补值；来源另行记录，发生量和目标始终不填补。
     "causal_fill_columns": (
         "gas_air_heater_1", "gas_air_heater_2", "gas_air_heater_3",
@@ -236,11 +239,11 @@ TRAIN_STRIDE_LONG = 2
 QUICK_TRAIN_STRIDE = 8
 NN_CONFIG = {"look_back": 192, "epochs": 80, "quick_epochs": 8,
              "patience": 12, "quick_patience": 3, "early_stop_days": 7,
-             "batch_size": 512, "quick_batch_size": 256,
+             "batch_size": 2048, "quick_batch_size": 256,
              # 16GB GPU 引擎：按批 gather 滑窗、bf16 训练、fp32 推理。
              "precision": "bf16", "predict_batch": 1024, "train_stride": 1,
              "d_model": 64, "n_blocks": 5, "dropout": 0.15,
-             "lr": 1e-3, "weight_decay": 1e-4, "scheduler": "none",
+             "lr": 2e-3, "weight_decay": 1e-4, "scheduler": "none",
              # A/B/C 开发验证后保留容量归一化因果 TCN；是否部署仍由逐目标融合门槛决定。
              "kind_long": "tcn_causal", "kind_short": "tcn_causal",
              "head_mode": "scaled", "load_history": False,
@@ -405,21 +408,36 @@ FROZEN_RESOURCE_RECIPE = {
         "publication_time": "07:00", "intraday_refresh": False},
     "selection_scope": "frozen_retained_recipe; no_new_hourly_policy_selection",
     "source": "outputs/20261026_154721_infer; recipes_only_not_late_weights"}
-# 三种子完整A/B/C缺测验证通过；仅保留实际晋级的长期分组融合配方。
+# 连续缺测增强按三种子完整A/B/C部署组合验收，保留此前已晋级分量。
 LONG_PROCESS_EXPERT = {
     "kind": "global", "features": "gas_no_power_at_t", "decay_days": 60., "seeds": 3,
-    "weights": {"generator_1": {"short": 0., "medium": .05, "long": .025},
-                "generator_all": {"short": .025, "medium": .05, "long": .025}},
-    "source_study": "20261026_daily_dispatch",
-    "development": {"first48h_mean_gain_pp": .06636071799830034,
-                    "all_missing_mean_gain_pp": .08206551000267363,
-                    "seed_mean_gains_pp": [.06855592458056492, .06736435239111198, .06277616233677463],
-                    "scope": "complete_A_B_C_21days; no_D_or_test_reselection"},
+    "history_mask_days": 21, "history_visible_days": 7, "train_stride": 4,
+    "weights": {"generator_1": {"short": .03, "medium": .03, "long": .03},
+                "generator_all": {"short": .03, "medium": .03, "long": .03}},
+    "retained_recipe": {
+        "kind": "global", "features": "gas_no_power_at_t", "decay_days": 60., "seeds": 3,
+        "weights": {"generator_1": {"short": 0., "medium": .05, "long": .025},
+                    "generator_all": {"short": .025, "medium": .05, "long": .025}},
+        "source_study": "20261026_daily_dispatch",
+        "development": {"first48h_mean_gain_pp": .06636071799830034,
+                        "all_missing_mean_gain_pp": .08206551000267363,
+                        "seed_mean_gains_pp": [.06855592458056492, .06736435239111198, .06277616233677463],
+                        "scope": "complete_A_B_C_21days; no_D_or_test_reselection"}},
+    "source_study": "20261026_masked_profile_shrink",
+    "development": {"first48h_mean_gain_pp": .056795268877801654,
+                    "all_missing_mean_gain_pp": .06993366194097443,
+                    "seed_mean_gains_pp": [.07443464898423713, .06961360235724119, .04582906608220583],
+                    "worst_target_gain_pp": -.14417416583684428,
+                    "scope": "complete_A_B_C_21days; relative_to_retained_process_expert; no_D_or_test_reselection"},
 }
 # converter_1 的量纲与其它流量不一致；用历史“用户+混气+发电耗气 / converter_1”
 # 的中位数反推比例。标准 m³/h 已明确，但原始量级归一未闭合，此值仍为 inferred。
 CONVERTER_GAS_SCALE = 7043.5
 OPT_CONFIG = {
+    # 未知口径采用声明假设；提交仍须通过指令守恒及训练期资源误差安全核验。
+    "submission_validation_basis": "declared_assumptions",
+    "holder_scale_to_m3": {"gas_holder_blast_furnace_gas_holder_1": 10000.,
+                            "gas_holder_blast_furnace_gas_holder_2": 1.},
     "unit_capacity_mw": (50.0, 50.0, 50.0, 50.0, 120.0, 120.0),
     "unit_groups": (("generator_1", 4), ("generator_all", 6)),
     "min_load_ratio": 0.60,

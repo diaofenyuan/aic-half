@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import time
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import pandas as pd
@@ -331,26 +331,58 @@ def train_process_expert(prepared: PreparedData, bundle: LongBundle, quick: bool
     existing = bundle.final_process_expert
     if existing and existing["recipe"] == recipe and existing["train_end"] == end:
         return {"reused": True, "train_end": end, "recipe": recipe}
-    positions = np.arange(C.PROFILE_DAYS * C.STEPS_PER_DAY, ref - max(C.HORIZONS_L) + 1,
-                          C.QUICK_TRAIN_STRIDE if quick else C.TRAIN_STRIDE_LONG)
-    experts, started = [], time.time()
-    old_decay = C.DECAY_DAYS
-    try:
-        C.DECAY_DAYS = recipe["decay_days"]
-        base = build_base_features(prepared, True)
-        for seed in range(recipe["seeds"]):
-            logging.getLogger("aic-half").info("长期过程专家最终训练 seed=%d，截止=%s", 20261021 + seed, end)
-            models, names = _train_models(prepared, base, positions, C.HORIZONS_L,
-                recipe["kind"], recipe["features"], C.LGBM_TREES_QUICK if quick else C.LGBM_TREES_LONG,
-                ref, params_override={"seed": 20261021 + seed})
-            experts.append({"models": models, "feature_names": names})
-    finally:
-        C.DECAY_DAYS = old_decay
-    bundle.final_process_expert = {"recipe": recipe, "experts": experts, "train_end": end,
-        "max_training_target": str(prepared.index[positions[-1] + max(C.HORIZONS_L)])}
+    started = time.time()
+    def fit_recipe(selected, previous):
+        if previous and previous["recipe"] == selected and previous["train_end"] == end:
+            return previous
+        retained = None
+        if selected.get("retained_recipe"):
+            prior = previous.get("base_state") if previous else None
+            if previous and previous["recipe"] == selected["retained_recipe"]:
+                prior = previous
+            retained = fit_recipe(selected["retained_recipe"], prior)
+        view = process_training_view(prepared, selected)
+        positions = np.arange(C.PROFILE_DAYS * C.STEPS_PER_DAY, ref - max(C.HORIZONS_L) + 1,
+            C.QUICK_TRAIN_STRIDE if quick else selected.get("train_stride", C.TRAIN_STRIDE_LONG))
+        experts, old_decay = [], C.DECAY_DAYS
+        try:
+            C.DECAY_DAYS = selected["decay_days"]
+            base = build_base_features(view, True)
+            for seed in range(selected["seeds"]):
+                logging.getLogger("aic-half").info("长期过程专家最终训练 seed=%d，截止=%s，连续遮挡=%s天",
+                    20261021 + seed, end, selected.get("history_mask_days", 0))
+                models, names = _train_models(view, base, positions, C.HORIZONS_L,
+                    selected["kind"], selected["features"], C.LGBM_TREES_QUICK if quick else C.LGBM_TREES_LONG,
+                    ref, params_override={"seed": 20261021 + seed})
+                experts.append({"models": models, "feature_names": names})
+        finally:
+            C.DECAY_DAYS = old_decay
+        state = {"recipe": selected, "experts": experts, "train_end": end,
+            "max_training_target": str(prepared.index[positions[-1] + max(C.HORIZONS_L)])}
+        if retained:
+            state["base_state"] = retained
+        return state
+    bundle.final_process_expert = fit_recipe(recipe, existing)
     bundle.scores["process_expert_development"] = recipe["development"]
     bundle.scores["base_scores_exclude_process_expert"] = True
     return {"reused": False, "train_end": end, "recipe": recipe, "seconds": time.time() - started}
+
+
+def process_training_view(prepared: PreparedData, recipe: dict) -> PreparedData:
+    """只遮挡训练输入的目标历史，保留原始监督标签，模拟持续缺测时的陈旧画像。"""
+    missing = int(recipe.get("history_mask_days", 0))
+    if not missing:
+        return prepared
+    visible = int(recipe["history_visible_days"])
+    if missing <= 0 or visible <= 0:
+        raise ValueError("连续缺测训练的可见天数与遮挡天数必须为正")
+    frame, provenance = prepared.frame.copy(), prepared.provenance.copy()
+    day = np.arange(len(prepared.index)) // C.STEPS_PER_DAY
+    mask = day % (visible + missing) >= visible
+    for column in C.TARGET_COLUMN.values():
+        frame.loc[mask, column] = np.nan
+        provenance.loc[mask, column] = 0
+    return replace(prepared, frame=frame, provenance=provenance)
 
 
 def apply_process_expert(bundle: LongBundle, prepared: PreparedData, positions: np.ndarray,
@@ -360,6 +392,11 @@ def apply_process_expert(bundle: LongBundle, prepared: PreparedData, positions: 
         return prediction
     if pd.Timestamp(state["train_end"]) >= prepared.index[positions.min()]:
         raise ValueError("长期过程专家的训练截止进入推理窗口")
+    if state.get("base_state"):
+        from copy import copy
+        retained = copy(bundle)
+        retained.final_process_expert = state["base_state"]
+        prediction = apply_process_expert(retained, prepared, positions, prediction, use_final)
     current = prepared.frame[["d_use_blast", "d_use_coke", "d_use_converter"]].to_numpy(dtype=float)[positions]
     active = ~np.isfinite(current).all(axis=1)
     if not active.any():

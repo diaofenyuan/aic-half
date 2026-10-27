@@ -172,12 +172,16 @@ def run_verify(directory: Path | None = None) -> int:
         print(json.dumps({"directory": str(directory), "passed": False,
                           "problems": [str(exc)]}, ensure_ascii=False, indent=2))
         return 1
-    physical = main_opt.physical_submission_check({"summary": meta.get("optimization", {})})
+    schedule = pd.read_csv(directory / "opt_result.csv") if (directory / "opt_result.csv").is_file() else None
+    readiness = main_opt.submission_readiness({"summary": meta.get("optimization", {}), "schedule": schedule})
+    physical = readiness["physical"]
     declared_submittable = report.get("submittable", report.get("output", {}).get("submittable", False))
     if declared_submittable and (quick or meta.get("run", {}).get("experimental") or window != "half_test"):
         problems.append("运行范围不是完整正式 half_test，不能声明可提交")
-    if declared_submittable and not physical["passed"]:
-        problems.append("运行摘要声称可提交，但完整物理核验未通过")
+    if declared_submittable and not readiness["passed"]:
+        problems.append("运行摘要声称可提交，但声明口径下的逐步约束核验未通过")
+    if meta.get("optimization", {}).get("model_evidence") and not readiness.get("model", {}).get("simulation_constraints_passed", False):
+        problems.append("已有优化表未通过点预测模型硬约束核验: " + "; ".join(readiness["problems"]))
     zip_paths = [directory / name for name in {C.MOCK_ZIP_NAME, C.FORMAL_ZIP_NAME}
                  if (directory / name).is_file()]
     if not zip_paths:
@@ -202,10 +206,16 @@ def run_verify(directory: Path | None = None) -> int:
                         problems.append(f"ZIP 内 {name} 与磁盘不一致")
         except Exception as exc:
             problems.append(f"ZIP 读取失败: {exc}")
+    complete_results = all((directory / name).is_file()
+                           for name in ("s_result.csv", "l_result.csv", "opt_result.csv"))
     print(json.dumps({"directory": str(directory), "passed": not problems,
+                      "archive_integrity_passed": not problems, "complete_result_set": complete_results,
                       "problems": problems, "coverage": coverage,
-                      "submittable": bool(declared_submittable and physical["passed"] and not problems),
-                      "submission_blockers": physical["problems"]}, ensure_ascii=False, indent=2))
+                      "submittable": bool(declared_submittable and readiness["passed"] and not problems),
+                      "validation_basis": readiness["validation_basis"], "field_safety_certified": physical["passed"],
+                      "hard_constraints_passed": readiness.get("model", {}).get("passed", False),
+                      "simulation_constraints_passed": readiness.get("model", {}).get("simulation_constraints_passed", False),
+                      "submission_blockers": readiness["problems"], "assumption_warnings": readiness["warnings"]}, ensure_ascii=False, indent=2))
     return 0 if not problems else 1
 
 
@@ -263,21 +273,39 @@ def _inference_submission_check(window: str, optimization: dict, *,
     opt_summary = optimization.get("summary", {})
     if not opt_summary.get("plan_validation_passed"):
         problems.append("优化计划约束核验未通过")
-    physical = main_opt.physical_submission_check(optimization)
-    problems.extend(physical["problems"])
+    readiness = main_opt.submission_readiness(optimization)
+    physical = readiness["physical"]
+    problems.extend(readiness["problems"])
     if not optimization.get("submittable", False):
         if optimization.get("status") == "SIMULATED_NOT_SUBMITTABLE":
             problems.append("发电优化仍为代理资源模拟计划，尚未通过正式物理约束核验")
         else:
             problems.append("优化提交核验未通过：" + str(
                 opt_summary.get("reason") or optimization.get("status") or "未返回核验状态"))
-    return {"passed": not problems, "problems": list(dict.fromkeys(problems)), "physical": physical}
+    return {"passed": not problems, "problems": list(dict.fromkeys(problems)), "physical": physical,
+            "model": readiness.get("model"), "validation_basis": readiness["validation_basis"],
+            "assumption_warnings": readiness["warnings"]}
+
+
+def _inference_completion(window: str, optimization_report: dict, submittable: bool) -> dict:
+    """预测成功不能掩盖必交优化表缺失；模拟完成与正式可提交分别表达。"""
+    if not optimization_report.get("written"):
+        return {"status": "BLOCKED_OPT", "exit_code": 2, "description": "预测完成，优化受阻"}
+    if window != "half_test":
+        return {"status": "SUCCESS_DRYRUN", "exit_code": 0, "description": "兼容推理完成"}
+    if not submittable:
+        return {"status": "SUCCESS_INFER_SIMULATED", "exit_code": 0, "description": "模拟推理完成"}
+    if optimization_report.get("validation_basis") == "declared_assumptions":
+        return {"status": "READY_WITH_ASSUMPTIONS", "exit_code": 0, "description": "完整推理完成（采用声明假设）"}
+    return {"status": "SUCCESS_INFER", "exit_code": 0, "description": "推理完成"}
 
 
 def run_infer(quick: bool = False, experimental: bool = False,
               reuse_run: Path | None = None) -> int:
     """冻结模型后执行正式半决赛测试推理，并单独核验当次结果的提交条件。"""
     started = time.time()
+    timings = {}
+    tick = time.perf_counter()
     output.training_cache_stats(reset=True)
     ctx = output.begin_run(C, mode="infer", experimental=quick or experimental, quick=quick)
     _setup_logger(ctx.log_path)
@@ -307,6 +335,22 @@ def run_infer(quick: bool = False, experimental: bool = False,
         resource_training = training.prefix_copy(min(training.index[-1], first_issue))
         LOGGER.info("每日%s发布；资源训练截止=%s，首份计划发布=%s",
                     C.OPT_CONFIG["publication_time"], resource_training.index[-1], first_issue)
+        if reuse_run is None:
+            # 轻量标定先给出可操作原因，避免耗时训练结束后才暴露优化阻断。
+            preflight = main_opt.estimate_heat_rate(resource_training, len(resource_training.index) - 1)
+            resource_safety = main_opt.fit_net_supply(resource_training)["resource_error_validation"]
+            summary["optimization_preflight"] = {"gas_to_power_passed": bool(preflight.get("ok")),
+                "prefix_validation": preflight.get("prefix_validation", {}),
+                "calibration_end": preflight.get("calibration_end"),
+                "resource_error_validation": resource_safety}
+            if not preflight.get("ok"):
+                LOGGER.warning("优化预检未通过气电标定；预测继续，优化结果可能受阻。验证详情: %s",
+                               preflight.get("prefix_validation", preflight.get("reason")))
+            if not resource_safety["passed"]:
+                LOGGER.warning("资源误差安全预检未通过，无法取得提交资格；将尝试点预测模拟。详情: %s",
+                               resource_safety)
+        timings["read_preprocess_seconds"] = round(time.perf_counter() - tick, 4)
+        tick = time.perf_counter()
         stages.update(1)
         if reuse_run is None:
             stages.set_description("推理 · 短期训练")
@@ -328,15 +372,23 @@ def run_infer(quick: bool = False, experimental: bool = False,
             if not publication_check["passed"]:
                 raise ValueError("复用资源模型不满足每日发布时间边界：" + "; ".join(publication_check["problems"]))
             summary["reused_models_from"] = str(reuse_run.resolve())
-            short_bundle.process_recovery = dict(C.SHORT_PROCESS_RECOVERY)
-            summary["preprocessing_recipe_updated"] = {"short_process_recovery": short_bundle.process_recovery}
-            summary["validation_scope"] = "复用已有最终模型；神经网络按A/B/C冻结晋级，未评估D"
+            summary["validation_scope"] = "完整冻结归档直接推理；不训练、不更新配方、不重新标定"
             stages.update(3)
-            main_opt.refresh_physical_validation(resource_bundle, training, use_final=True)
-        if C.GENERATOR1_SPECIALIST:
-            summary["generator1"] = _train_generator1_final(training, short_bundle, long_bundle, quick=quick)
-        summary["long_process_expert"] = main_l.train_process_expert(training, long_bundle, quick=quick)
-        LOGGER.info("训练完成: short=%s/%s long=%s/%s heat_rate_ok=%s",
+        if reuse_run is None:
+            if C.GENERATOR1_SPECIALIST:
+                summary["generator1"] = _train_generator1_final(training, short_bundle, long_bundle, quick=quick)
+            summary["long_process_expert"] = main_l.train_process_expert(training, long_bundle, quick=quick)
+        else:
+            summary["generator1"] = {name: {"reused": True, "train_end": bundle.final_generator1["train_end"]}
+                for name, bundle in (("short", short_bundle), ("long", long_bundle)) if bundle.final_generator1}
+            summary["long_process_expert"] = {"reused": bool(long_bundle.final_process_expert)}
+        summary["training_performed"] = reuse_run is None
+        timings["training_seconds" if reuse_run is None else "model_load_seconds"] = round(time.perf_counter() - tick, 4)
+        if reuse_run is not None:
+            timings["training_seconds"] = 0.
+            summary["archive_compatibility"] = short_bundle.archive_compatibility
+        tick = time.perf_counter()
+        LOGGER.info("模型就绪: short=%s/%s long=%s/%s heat_rate_ok=%s",
                     short_bundle.kind, short_bundle.features,
                     long_bundle.kind, long_bundle.features,
                     resource_bundle.heat_rate.get("ok"))
@@ -349,7 +401,10 @@ def run_infer(quick: bool = False, experimental: bool = False,
         masked = prepared.masked_copy(origins[0], mask_end)
         short_pred = main_s.predict_short(short_bundle, masked, origins, use_final=True)
         long_pred = main_l.predict_long(long_bundle, masked, origins, use_final=True)
+        timings["load_inference_seconds"] = round(time.perf_counter() - tick, 4)
+        tick = time.perf_counter()
         prediction_report = output.write_predictions(ctx, origins, short_pred, long_pred)
+        timings["prediction_save_seconds"] = round(time.perf_counter() - tick, 4)
         LOGGER.info("预测宽表: 短期 %s 列, 长期 %s 列",
                     prediction_report["short"]["columns"],
                     prediction_report["long"]["columns"])
@@ -358,12 +413,20 @@ def run_infer(quick: bool = False, experimental: bool = False,
         resource_forecast = None
         stages.update(1)
         stages.set_description("推理 · 调度优化")
+        tick = time.perf_counter()
         optimization = main_opt.optimize(resource_forecast, masked, origins,
                                          long_pred, resource_bundle, quick=quick,
                                          use_final=True)
-        optimization.setdefault("summary", {})["physical_validation"] = resource_bundle.final_physical_validation
+        timings["dispatch_seconds"] = round(time.perf_counter() - tick, 4)
+        timings.update(optimization.get("summary", {}).get("timings", {}))
+        tick = time.perf_counter()
+        optimization.setdefault("summary", {}).setdefault("physical_validation", resource_bundle.final_physical_validation)
         optimization["summary"]["submission_physical_check"] = main_opt.physical_submission_check(optimization)
         optimization_report = output.write_optimization(ctx, optimization.get("schedule"))
+        optimization_report["validation_basis"] = optimization.get("summary", {}).get("validation_basis")
+        if not optimization_report.get("written"):
+            optimization_report["reason"] = optimization.get("summary", {}).get("reason") or optimization_report["reason"]
+            LOGGER.warning("未生成必交优化文件 opt_result.csv: %s", optimization_report["reason"])
         stages.update(1)
         stages.set_description("推理 · 模型与结果归档")
 
@@ -380,11 +443,14 @@ def run_infer(quick: bool = False, experimental: bool = False,
             source=source_report)
         submittable = submission_check["passed"]
         zip_report = output.build_zip(ctx, submittable=submittable, config=C)
+        completion = _inference_completion(window, optimization_report, submittable)
+        timings["validation_archive_seconds"] = round(time.perf_counter() - tick, 4)
         stages.update(1)
         stages.set_description("推理 · 保存摘要")
 
         summary.update({
-            "status": "SUCCESS_INFER" if window == "half_test" else "SUCCESS_DRYRUN",
+            "status": completion["status"],
+            "exit_code": completion["exit_code"],
             "window": window,
             "data_usage": {"training_range": [str(training.index[0]), str(training.index[-1])],
                            "resource_training_range": [str(resource_training.index[0]), str(resource_training.index[-1])],
@@ -394,7 +460,9 @@ def run_infer(quick: bool = False, experimental: bool = False,
                            "test_usage": ("frozen_model_official_inference" if window == "half_test"
                                           else "frozen_model_compatibility_dryrun")},
             "preprocessing": {"training": training.quality.get("preprocessing", {}),
-                              "inference": prepared.quality.get("preprocessing", {})},
+                              "inference": prepared.quality.get("preprocessing", {}),
+                              "training_labels": {key: training.quality.get(key) for key in (
+                                  "target_valid", "target_invalid_by_column", "target_relation_invalid")}},
             "origins": int(len(origins)),
             "origin_range": [str(origins[0]), str(origins[-1])],
             "prediction_input_support": {
@@ -419,11 +487,21 @@ def run_infer(quick: bool = False, experimental: bool = False,
             "submittable": submittable,
             "submission_check": submission_check,
             "reason": "; ".join(submission_check["problems"]) or None,
+            "timings": timings,
+            "functional_acceptance": {
+                "load_prediction_complete": bool(len(origins) == 2016 and window == "half_test"),
+                "frozen_inference_without_training": reuse_run is not None,
+                "net_dispatch_executed": (optimization.get("summary", {}).get("resource_mode")
+                    == "inferred_net_surplus_after_priority_users" and optimization_report.get("written", False)),
+                "net_dispatch_ready": optimization.get("summary", {}).get("dispatch_readiness", {}).get("passed", False),
+                "model_constraint_validation_passed": optimization.get("summary", {}).get("plan_validation_passed", False),
+                "field_safety_certified": False},
             "duration_seconds": round(time.time() - started, 2),
         })
         report_path = output.write_report(ctx, summary)
         if summary.get("generator1"):
             # 同时检查正常与缺测起报点，验证归档包含实际使用的全部分支。
+            tick = time.perf_counter()
             reloaded = output.load_final_models(ctx.root)
             sample = np.unique(np.array([0, min(96, len(origins) - 1), min(192, len(origins) - 1), len(origins) - 1]))
             short_full = main_s.predict_short(reloaded[0], masked, origins, use_final=True)
@@ -443,21 +521,25 @@ def run_infer(quick: bool = False, experimental: bool = False,
             summary["availability_reload_check"] = {"passed": True, "origins": sample.tolist(),
                 "max_abs_diff": differences, "sampled_batch_max_abs_diff": sampled,
                 "sampled_tolerance_mw": tolerance}
+            timings["archive_replay_validation_seconds"] = round(time.perf_counter() - tick, 4)
+            summary["duration_seconds"] = round(time.time() - started, 2)
             output.write_report(ctx, summary)
         stages.update(1)
-        stages.set_description("推理完成")
+        stages.set_description(completion["description"])
         LOGGER.info("报告: %s", report_path)
         print("\n推理摘要")
         print("  阶段: 正式半决赛")
         print(f"  窗口: {window} | 起报点 {len(origins)}")
         print(f"  优化状态: {optimization.get('status')}")
         print(f"  输出目录: {ctx.root}")
-        print(f"  半决赛结果包: {zip_report['name']}")
+        print(f"  运行状态: {completion['description']}")
+        print(f"  结果包: {zip_report['name'] or '未生成'} | 三表齐全: {zip_report['complete_result_set']}")
         print("  提交核验: " + ("通过" if submittable else "; ".join(submission_check["problems"])))
-        return 0
+        return completion["exit_code"]
     except Exception as exc:  # noqa: BLE001
         LOGGER.error("推理失败: %s", exc)
         LOGGER.error(traceback.format_exc())
+        summary.update(status="FAILED", exit_code=1)
         summary["errors"].append(f"{type(exc).__name__}: {exc}")
         summary["duration_seconds"] = round(time.time() - started, 2)
         try:

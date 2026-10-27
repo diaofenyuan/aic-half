@@ -245,7 +245,7 @@ def validate_publication_contract(meta: dict, grid) -> dict:
                 problems.append("每日计划的生效边界与实际发布时间不一致")
             if plan.get("validation", {}).get("passed") is not True:
                 problems.append("每日计划缺少通过的约束核验")
-            if summary.get("daily_control_policy"):
+            if summary.get("daily_control_policy") == "reserve140_terminal200_observed_fuel_cap240_to280":
                 control = plan.get("control", {})
                 limits = summary.get("daily_control_parameters", {})
                 cap = control.get("total_power_cap_mw", np.nan)
@@ -255,6 +255,10 @@ def validate_publication_contract(meta: dict, grid) -> dict:
                     problems.append("每日计划的保守负荷或末端状态与冻结控制参数不一致")
                 if plan.get("group_allocation", {}).get("passed") is not True:
                     problems.append("每日计划缺少通过的分组供气守恒核验")
+            elif summary.get("daily_control_policy"):
+                if (plan.get("model_constraints_passed") is not True
+                        or plan.get("group_allocation", {}).get("passed") is not True):
+                    problems.append("净资源每日计划缺少通过的模型约束或分组供气核验")
         resource = meta["resource"]
         ends = [resource["train_end"], resource.get("heat_rate", {}).get("calibration_end")]
         recorded = summary.get("resource_publication_check", {})
@@ -438,8 +442,65 @@ def _artifact_path(root: Path, relative: str) -> Path:
     return path
 
 
+_INFERENCE_SETTINGS = (
+    "STEP_MINUTES", "STEPS_PER_DAY", "TARGETS", "CAPACITY", "STRUCTURAL_CAPACITY",
+    "CLEANING", "CONVERTER_GAS_SCALE", "FUEL_PROXY_WEIGHTS", "PROFILE_DAYS",
+    "PROFILE_RATIO_CLIP", "FEATURE_WINDOW_COLUMNS", "FEATURE_LAGS", "FEATURE_ROLLS",
+    "FEATURE_STD_WINDOW", "OBSERVED_AT_T", "SHORT_GROUPS", "LONG_GROUPS",
+    "AT_T_DEVICE_COLUMNS", "AT_T_MINUTE_GROUPS",
+    "GAS_HOLDER", "OPT_CONFIG",
+)
+
+
+def inference_contract() -> dict:
+    """只冻结影响推理语义的设置，训练批量等运行预算不影响归档兼容性。"""
+    return json.loads(json.dumps({name: getattr(C, name) for name in _INFERENCE_SETTINGS}))
+
+
+def _check_inference_contract(directory: Path, meta: dict) -> dict:
+    archived = meta.get("inference_contract")
+    legacy = archived is None
+    literals = {}
+    if legacy:
+        # 旧包只解析本地源码中的常量，不执行归档代码，也不依赖开发缓存。
+        import ast
+        source = directory / C.SOURCE_DIR / "config.py"
+        if not source.is_file():
+            raise ValueError("旧归档缺少推理契约及源码/config.py，不能确认输入兼容性")
+        for statement in ast.parse(source.read_text(encoding="utf-8-sig")).body:
+            if isinstance(statement, ast.Assign) and len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Name):
+                try:
+                    literals[statement.targets[0].id] = ast.literal_eval(statement.value)
+                except (ValueError, TypeError):
+                    pass
+        current_tree = ast.parse((C.ROOT / "config.py").read_text(encoding="utf-8-sig"))
+        expressions = {s.targets[0].id: ast.dump(s.value) for s in current_tree.body
+            if isinstance(s, ast.Assign) and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name)}
+        for statement in ast.parse(source.read_text(encoding="utf-8-sig")).body:
+            if isinstance(statement, ast.Assign) and len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Name):
+                name = statement.targets[0].id
+                if name in _INFERENCE_SETTINGS and name not in literals and expressions.get(name) == ast.dump(statement.value):
+                    literals[name] = getattr(C, name)
+        archived = json.loads(json.dumps({name: literals.get(name) for name in _INFERENCE_SETTINGS}))
+    current = inference_contract()
+    mismatches = [name for name in _INFERENCE_SETTINGS if archived.get(name) != current[name]]
+    if mismatches:
+        raise ValueError("归档推理设置与当前代码不兼容，禁止静默覆盖：" + ", ".join(mismatches))
+    required = meta.get("required_components")
+    if required is None:
+        required = {name: {"generator1": bool(literals.get("GENERATOR1_SPECIALIST", {}).get(name)),
+                           "availability": bool(literals.get("AVAILABILITY_FALLBACK", {}).get(name)),
+                           "process_expert": name == "long" and bool(literals.get("LONG_PROCESS_EXPERT"))}
+                    for name in ("short", "long")}
+    for name, components in required.items():
+        for component, needed in components.items():
+            if needed and not meta.get(name, {}).get(component):
+                raise ValueError(f"冻结归档缺少必要分量：{name}/{component}；不能自动重训或降级")
+    return {"passed": True, "legacy_source_checked": legacy, "required_components": required}
+
+
 def load_final_models(directory: Path):
-    """重载本项目已归档的最终模型，避免神经网络专项重复拟合未改变的树与资源模型。"""
+    """完整重载实际部署的全部分量；缺失或不兼容时直接报错，不补训。"""
     import main_nn
     from main_s import ShortBundle
     from main_l import LongBundle
@@ -450,6 +511,7 @@ def load_final_models(directory: Path):
     meta = json.loads((model_root / "model_meta.json").read_text(encoding="utf-8"))
     if meta["role"] != "final":
         raise ValueError("推理只能复用 final 角色，禁止把确认模型冒充最终模型")
+    compatibility = _check_inference_contract(directory, meta)
     bundles = []
     for name, cls, horizons in (("short", ShortBundle, C.HORIZONS_S), ("long", LongBundle, C.HORIZONS_L)):
         item, artifacts = meta[name], meta["artifacts"][name]
@@ -495,19 +557,54 @@ def load_final_models(directory: Path):
     item, artifacts = meta["resource"], meta["artifacts"]["resource"]
     from main_opt import load_resource_model
     models = {tag: load_resource_model((model_root / "resource" / "final" / filename).read_text(encoding="utf-8"))
-              for tag, filename in artifacts["final"]["files"].items()}
+              for tag, filename in artifacts.get("final", {}).get("files", {}).items()}
     neural = main_nn.load_resource_nn(_artifact_path(model_root, artifacts["nn"]["path"])) if "nn" in artifacts else None
     selection = {**item["selection"], "head_selection": item.get("head_selection", {})}
     resource = ResourceBundle(models={}, final_models=models,
-        feature_names=next(iter(models.values())).feature_name(),
+        feature_names=next(iter(models.values())).feature_name() if models else [],
         metrics=item["metrics"], heat_rate=item["heat_rate"], final_heat_rate=item["heat_rate"],
         gas_caps=item["gas_caps"], final_gas_caps=item["gas_caps"],
         train_end=item["train_end"], final_train_end=item["train_end"],
         selection=selection, dispatch_selection=item["dispatch_selection"],
         final_physical_validation=item.get("physical_validation", {}),
-        resource_nn=None, final_resource_nn=neural, blocker=item.get("blocker"))
+        resource_nn=None, final_resource_nn=neural, blocker=item.get("blocker"),
+        final_net_supply=item.get("net_supply"))
     bundles.append(resource)
+    for name, bundle in zip(("short", "long", "resource"), bundles):
+        if not bundle.final_models and ((name == "resource" and not bundle.final_net_supply)
+                or (name != "resource" and bundle.kind != "nn")):
+            raise ValueError(f"冻结归档缺少{name}树模型")
+        if name != "resource":
+            neural = bundle.final_nn_bundle
+            if bundle.kind in ("nn", "nn_lgb_ens") and neural is None:
+                raise ValueError(f"冻结归档缺少{name}神经网络")
+            if neural is not None and (tuple(neural.horizons) != tuple(bundle.horizons)
+                    or pd.Timestamp(neural.train_end) > pd.Timestamp(bundle.final_train_end)):
+                raise ValueError(f"{name}网络跨度或训练截止与归档不一致")
+            for state in (bundle.final_generator1, getattr(bundle, "final_process_expert", None), bundle.final_availability):
+                _validate_frozen_state(state, bundle.final_train_end, name)
+        bundle.archive_compatibility = compatibility
     return bundles
+
+
+def _validate_frozen_state(state, cutoff, name):
+    if not state:
+        return
+    end = state.get("train_end")
+    if end is not None and (pd.isna(pd.Timestamp(end)) or pd.Timestamp(end) > pd.Timestamp(cutoff)):
+        raise ValueError(f"{name}专项训练截止超过所属模型截止")
+    recipe = state.get("recipe", {})
+    if recipe.get("calibration") and not state.get("calibration"):
+        raise ValueError(f"{name}冻结配方缺少校准分量，禁止自动补训")
+    if recipe.get("kind") in ("nn", "refined_nn") and state.get("nn") is None:
+        raise ValueError(f"{name}专项缺少网络权重")
+    if recipe.get("kind") == "refined_nn" and not state.get("base_state"):
+        raise ValueError(f"{name}专项缺少基础模型")
+    neural = state.get("nn")
+    if neural is not None and pd.Timestamp(neural.train_end) > pd.Timestamp(end or cutoff):
+        raise ValueError(f"{name}专项网络训练截止不一致")
+    for key in ("base_state", "retained_state", "calibration"):
+        _validate_frozen_state(state.get(key), end or cutoff, name)
 
 
 def _save_boosters(directory: Path, prefix: str, models: dict,
@@ -540,6 +637,9 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
     for name, bundle in (("short", short_bundle), ("long", long_bundle),
                          ("resource", resource_bundle)):
         models = bundle.final_models if use_final else bundle.models
+        if name == "resource" and use_final and bundle.final_net_supply is not None:
+            # 净资源路径只使用画像、气电和容量参数，不归档未参与本次推理的旧包络树。
+            models = {}
         prefix = "resource" if name == "resource" else f"{bundle.kind}_{bundle.features}"
         if models:
             info = _save_boosters(ctx.model_dir / name / role, prefix, models,
@@ -588,7 +688,7 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
             summary["reload_ok"] &= bool(same)
         if name == "resource":
             resource_nn = bundle.final_resource_nn if use_final else bundle.resource_nn
-            if resource_nn is not None:
+            if resource_nn is not None and not (use_final and bundle.final_net_supply is not None):
                 path = main_nn.save_resource_nn(resource_nn, ctx.model_dir / name / role / "resource_nn.pt")
                 loaded = main_nn.load_resource_nn(path)
                 same = (loaded["feature_names"] == resource_nn["feature_names"]
@@ -623,7 +723,13 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
                              (bundle.final_train_end if use_final else bundle.train_end)}
 
     meta = {
-        "schema_version": 2, "role": role, "artifacts": summary,
+        "schema_version": 3, "role": role, "artifacts": summary,
+        "inference_contract": inference_contract(),
+        "required_components": {**{name: {"generator1": bool(bundle.final_generator1),
+            "availability": bool(bundle.final_availability),
+            "process_expert": bool(getattr(bundle, "final_process_expert", None))}
+            for name, bundle in (("short", short_bundle), ("long", long_bundle))},
+            "resource": {"net_supply": resource_bundle.final_net_supply is not None}} if use_final else {},
         "run": {"mode": ctx.mode, "quick": ctx.quick, "experimental": ctx.experimental},
         "output_contract": {"prediction": _grid_spec(ctx.prediction_grid),
                             "optimization": _grid_spec(ctx.optimization_grid),
@@ -647,6 +753,7 @@ def save_models(ctx: RunContext, short_bundle, long_bundle,
                      "train_end": resource_bundle.final_train_end if use_final else resource_bundle.train_end,
                      "physical_validation": (resource_bundle.final_physical_validation if use_final
                                              else resource_bundle.physical_validation),
+                     "net_supply": resource_bundle.final_net_supply if use_final else None,
                      "blocker": resource_bundle.blocker},
         "optimization": opt_summary,
         "data_contract": {"target_mask": "整个评测窗口", "step_minutes": C.STEP_MINUTES,
@@ -757,19 +864,26 @@ def build_zip(ctx: RunContext, submittable: bool, config=C) -> dict:
     if ctx.prediction_grid is None:
         raise ValueError("缺少当次输出时间契约，拒绝打包")
     origins = None if ctx.window == "half_test" else ctx.prediction_grid
+    if ctx.mode == "infer" and not (ctx.root / "opt_result.csv").is_file():
+        # 推理包缺少必交优化表时不制造同名的不完整ZIP。
+        return {"name": None, "path": None, "members": 0, "root_csv": [], "crc_ok": False,
+            "submittable": False, "complete_result_set": False, "missing_result_files": ["opt_result.csv"],
+            "coverage": validate_result_files(ctx.root, origins, ctx.quick, require_optimization=True),
+            "source_consistency_passed": True, "reason": "缺少有效优化表，未生成不完整推理包"}
     coverage = validate_result_files(ctx.root, origins, ctx.quick,
                                     require_optimization=submittable)
     if not coverage["passed"]:
         raise ValueError("结果覆盖校验失败: " + "; ".join(coverage["problems"]))
     if submittable:
-        from main_opt import physical_submission_check
+        from main_opt import submission_readiness
         meta = json.loads((ctx.model_dir / "model_meta.json").read_text(encoding="utf-8"))
-        physical = physical_submission_check({"summary": meta["optimization"]})
+        readiness = submission_readiness({"summary": meta["optimization"],
+            "schedule": pd.read_csv(ctx.root / "opt_result.csv")})
         if (ctx.mode != "infer" or ctx.window != "half_test" or ctx.quick or ctx.experimental
                 or not ctx.prediction_grid.equals(expected_result_grid("s_result.csv"))):
             raise ValueError("非完整正式测试运行，拒绝标记为可提交")
-        if not physical["passed"]:
-            raise ValueError("正式物理核验未通过: " + "; ".join(physical["problems"]))
+        if not readiness["passed"]:
+            raise ValueError("声明口径下的提交核验未通过: " + "; ".join(readiness["problems"]))
     name = config.FORMAL_ZIP_NAME if submittable else config.MOCK_ZIP_NAME
     final_path = ctx.root / name
     temp_path = ctx.root / (name + ".tmp")
@@ -800,6 +914,8 @@ def build_zip(ctx: RunContext, submittable: bool, config=C) -> dict:
     temp_path.replace(final_path)
     return {"name": name, "path": str(final_path), "members": len(names),
             "root_csv": members, "crc_ok": True, "submittable": bool(submittable),
+            "complete_result_set": all(member in members for member in ("s_result.csv", "l_result.csv", "opt_result.csv")),
+            "missing_result_files": [member for member in ("s_result.csv", "l_result.csv", "opt_result.csv") if member not in members],
             "coverage": coverage, "source_consistency_passed": True}
 
 
