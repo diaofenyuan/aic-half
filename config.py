@@ -8,7 +8,7 @@ DATA_ROOT = Path(os.environ.get("AIC_DATA_ROOT", ROOT / "data"))
 OUTPUT_ROOT = ROOT / "outputs"
 EXPERIMENT_ROOT = ROOT / "tmp" / "tmp_outputs"
 SCHEMA = "lgbm_core_v3"
-LOAD_VERSION = "load_coupled_ensemble_v5"
+LOAD_VERSION = "load_process_scale_v6"
 CPU_THREADS = min(16, os.cpu_count() or 1)
 STEP = 15
 DT = .25
@@ -65,6 +65,7 @@ LOAD_RECIPE = {'short': 'shared',
                                               'rounds': 640,
                                               'aux_weight_target': 'small',
                                               'window_level': True,
+                                              'process_scale': 'stable_four',
                                               'target_kinds': ['window_factor',
                                                                'window_factor',
                                                                'window_factor']}}]},
@@ -76,6 +77,7 @@ LOAD_RECIPE = {'short': 'shared',
                                              'target_kinds': ['direct', 'factor', 'direct'],
                                              'tree_weights': [1.0, 1.0],
                                              'representation': 'group_ratio',
+                                             'process_scale': 'stable_four',
                                              'decay_days': 28,
                                              'aux_weight_target': 'small'}},
                                 {'weight': 0.5,

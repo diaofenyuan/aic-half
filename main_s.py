@@ -287,6 +287,10 @@ def train_load(prepared, span, recipe=None, quick=False, progress=None):
         bundle.recipe["loss_definition"].update(
             auxiliary_target="generator_1/generator_all; both labels required; both-zero maps to zero",
             ratio_conversion="relative g1 weight multiplied by true total MW during training only")
+    if spec.get("process_scale"):
+        bundle.recipe["loss_definition"].update(
+            factor_conversion="label=y_mw/(shape*process_scale);weight=relative_weight*shape*process_scale",
+            process_scale="causal four-furnace trailing 4-step median / 1e6; invalid or zero uses identity; raw fuel unchanged")
     shape_rows = np.ones((len(pos), 96, 3), dtype="float32")
     shape_sources = []
     if "factor" in kinds:
@@ -318,9 +322,9 @@ def train_load(prepared, span, recipe=None, quick=False, progress=None):
                 continue
             tick = time.perf_counter()
             y = labels[:, ti]
-            scale = np.ones(len(y))
+            scale = np.tile(process_scale(prepared, spec)[pos], len(group)) if not (ti == 2 and ratio_mode) else np.ones(len(y))
             if kinds[ti] == "factor":
-                scale = shape_rows[np.tile(np.arange(len(pos)), len(group)), target_slots, ti]
+                scale *= shape_rows[np.tile(np.arange(len(pos)), len(group)), target_slots, ti]
             original = labels[:, 0] if ti == 2 and ratio_mode else y
             conversion = np.maximum(labels[:, 1], 1.) if ti == 2 and ratio_mode else 1.
             model, diag = fit_booster(X, y/scale, names, times, loss=spec["loss"], rounds=rounds,
@@ -357,7 +361,7 @@ def train_window_load(prepared, span, recipe, quick=False, progress=None):
     bundle.recipe.update(load_version=C.LOAD_VERSION, frozen_profile=profile_pack(prepared, cutoff, spec.get("profile_days", 28)),
         effective_budget={"quick": bool(quick), "days": days, "stride": stride, "origins": len(pos),
                           "max_rounds": rounds, "threads": C.CPU_THREADS},
-        loss_definition={"window_level": "weighted_median(y/S); weights=S/relative_denominator**power",
+        loss_definition={"window_level": "weighted_median(y/scale); weights=scale/relative_denominator**power; scale=shape*causal_process_scale_if_enabled",
                          "zero_labels_retained": True, "partial_label_windows_used": False})
     shapes = np.ones((len(pos), 96, 3), dtype="float32")
     first_day = prepared.index[pos[0]].normalize()
@@ -382,7 +386,7 @@ def train_window_load(prepared, span, recipe, quick=False, progress=None):
         times = (prepared.index[pos]+pd.Timedelta(minutes=15*max(group))).to_numpy()
         for ti in targets:
             raw = y[..., ti]
-            scale = shapes[np.arange(len(pos))[:, None], slots, ti]
+            scale = shapes[np.arange(len(pos))[:, None], slots, ti]*process_scale(prepared, spec)[pos, None]
             weight_target = y[..., 0] if ti == 2 and spec.get("aux_weight_target") == "small" else raw
             complete = np.isfinite(raw).all(axis=1) & np.isfinite(weight_target).all(axis=1)
             positive = weight_target[np.isfinite(weight_target) & (weight_target > 0.)]
@@ -413,6 +417,20 @@ def train_window_load(prepared, span, recipe, quick=False, progress=None):
             if progress:
                 progress(f"{span} t={ti} window_factor h={group[0]}..{group[-1]} {diag['rows']}行 {diag['rounds']}轮")
     return bundle
+
+
+def process_scale(prepared, spec):
+    """用起报点已知过程水平换算标签，缺测或零量只回退单位尺度，不补写燃料。"""
+    mode = spec.get("process_scale")
+    if not mode:
+        return np.ones(len(prepared.index))
+    if mode != "stable_four":
+        raise ValueError("过程尺度配方不兼容")
+    columns = [f"gas_blast_furnace_{i}" for i in (1,2,4,5)]
+    values = prepared.frame[columns].sum(axis=1, min_count=len(columns))
+    current = values.rolling(4, min_periods=4).median().to_numpy()
+    # 百万立方米每小时只用于数值归一化，不是气电换算系数。
+    return np.where(np.isfinite(current) & (current > 0.), current/1e6, 1.)
 
 
 def deepcopy_recipe(recipe):
@@ -483,6 +501,8 @@ def predict_components(bundle, prepared, origins):
                 pred = np.repeat(pred, len(group), axis=1)
             if kinds[ti] in ("factor", "window_factor"):
                 pred *= np.asarray(pack["shape"])[slots[lo:lo+len(pos)][:, np.array(group)-1], ti]
+            if not (ti == 2 and spec.get("representation") == "group_ratio"):
+                pred *= process_scale(prepared, spec)[pos, None]
             values[lo:lo+len(pos), np.array(group)-1, ti] = pred
     weights = np.asarray(spec.get("tree_weights", [1., 1.]))
     values[..., :2] = values[..., :2]*weights+(1.-weights)*baseline[..., :2]
