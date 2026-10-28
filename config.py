@@ -8,6 +8,7 @@ DATA_ROOT = Path(os.environ.get("AIC_DATA_ROOT", ROOT / "data"))
 OUTPUT_ROOT = ROOT / "outputs"
 EXPERIMENT_ROOT = ROOT / "tmp" / "tmp_outputs"
 SCHEMA = "lgbm_core_v3"
+LOAD_VERSION = "load_group_shape_v3"
 CPU_THREADS = min(16, os.cpu_count() or 1)
 STEP = 15
 DT = .25
@@ -38,7 +39,14 @@ HOLDER_INPUT_VERSION = os.environ.get("AIC_HOLDER_VERSION", "historical_raw")
 HOLDER_SCALES = {"historical_raw": (10000., 1.), "official_m3": (1., 1.)}
 LOAD_RECIPE = {"short": "shared", "long": "shared", "loss": "relative_l1",
                "days": 112, "stride": 2, "rounds": 320, "leaves": 31, "seed": 2026,
-               "profile_days":28, "blend_weights":{"short":[.5,0.],"long":[1.,0.]}}
+               "profile_days": 28,
+               "tasks": {
+                   "short": {"feature_set": "memory+dynamics+missingness", "phase": "fixed",
+                             "representation": "group_difference", "consistency_alpha": .3,
+                             "decay_days": 28, "learning_rate": .03, "rounds": 640, "aux_weight_target":"small"},
+                   "long": {"long": "segmented", "feature_set": "base+relative+mechanism", "phase": "rotating",
+                            "weight_power":1.45,
+                            "target_kinds": ["direct", "factor"], "tree_weights": [0., 1.]}}}
 TREE = {"learning_rate": .05, "num_leaves": 31, "min_data_in_leaf": 80,
         "feature_fraction": .9, "lambda_l2": 2., "verbosity": -1,
         "num_threads": CPU_THREADS, "deterministic": True, "force_col_wise": True,
@@ -53,6 +61,18 @@ POLICY = {"source": "adopted_project_policy", "publication": "07:00", "availabil
 GAS_POWER_ACCEPTANCE={"max_wape":.10,"max_abs_bias":.05,"source":"local_engineering_gate"}
 GROUP_DISPATCH={"history_days":28,"holdout_days":7,"max_wape":.15,"max_abs_bias":.05,
                 "mapping_penalty":10.,"smooth_penalty":10.,"source":"historical_inferred_soft_objective"}
+OPTIONAL_USE_CALIBRATION={"version":"optional_prefix_level_v1","components":["budget_converter"],
+    "history_steps":4,"decay_steps":16,"require_current_observation":True,
+    "source":"inferred_short_term_consumption_level_calibration"}
+DISPATCH_CONTROL={"version":"joint_optional_prefix_v4","history_days":28,"min_support_rows":400,
+                  "sensitivity_days":[28,56],"reserve_hours":4,"reserve_quantile":.9,
+                  "benefit_fraction":.999,"ratio_iterations":3,"mip_gap":.005,
+                  "gas_support_role":"diagnostic_only",
+                  "optional_use_calibration":OPTIONAL_USE_CALIBRATION,
+                  "source":"historical_inferred_joint_control"}
+PROCESS_RESOURCE={"version":"shared_process_q25_v2","history_days":112,"stride":32,
+    "horizons":[1,4,8,16,24,48,72,96],"rounds":80,"leaves":15,"dropout_modulo":2,"quantile":.25,
+    "min_scale_samples":100,"source":"inferred_shared_furnace_process_model"}
 SOURCE_FILES = ("main.py", "main_s.py", "main_l.py", "main_opt.py", "main_nn.py",
                 "config.py", "output.py", "data_cleaning/__init__.py",
                 "data_cleaning/pipeline.py", "data_cleaning/quality.py",

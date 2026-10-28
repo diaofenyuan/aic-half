@@ -10,10 +10,10 @@ import numpy as np
 import pandas as pd
 import lightgbm as lgb
 import config as C
-from main_s import LoadBundle
+from main_s import LoadBundle, load_recipe, required_targets
 from main_opt import ResourceBundle
 from data_cleaning.pipeline import file_hash
-from data_cleaning.quality import validate_result_files, validate_day
+from data_cleaning.quality import validate_result_files, validate_day, validate_plan_sequence
 
 
 def clean_json(value):
@@ -75,15 +75,11 @@ def assert_source(ctx):
         raise ValueError("运行期间源码变化，拒绝混装归档："+",".join(changed))
 
 
-def save_models(root,short,long,resource,contract=None):
-    root=Path(root)
-    meta={"schema":C.SCHEMA,"holder_input_version":C.HOLDER_INPUT_VERSION,
-          "targets":C.TARGETS,"step_minutes":15,"load":{},"resource":{},
-          "preprocessing_sha256":file_hash(C.CODE_ROOT/"data_cleaning/pipeline.py"),
-          "training_quick":bool(short.recipe.get("effective_budget",{}).get("quick",False)),
-          "runtime":{name:importlib.metadata.version(name) for name in ("numpy","pandas","lightgbm","scipy","scikit-learn")},
-          "contract":contract or {}}
+def _save_load_bundles(root,short,long):
+    records_by_span={}
     for b in (short,long):
+        if b.recipe.get("load_version")!=C.LOAD_VERSION:
+            raise ValueError("负荷模型版本不兼容，禁止静默迁移")
         folder=root/b.span
         folder.mkdir(parents=True,exist_ok=True)
         records=[]
@@ -91,8 +87,80 @@ def save_models(root,short,long,resource,contract=None):
             name=f"tree_{number:03d}.txt"
             (folder/name).write_text(model.model_to_string(),encoding="utf-8")
             records.append({"target_index":ti,"horizons":group,"file":f"{b.span}/{name}","sha256":file_hash(folder/name)})
-        meta["load"][b.span]={"features":b.features,"horizons":b.horizons,"recipe":b.recipe,
-                              "train_end":b.train_end,"models":records,"diagnostics":b.diagnostics}
+        records_by_span[b.span]={"features":b.features,"horizons":b.horizons,"recipe":b.recipe,
+                                "train_end":b.train_end,"models":records,"diagnostics":b.diagnostics}
+    return records_by_span
+
+
+def _load_bundles(root,meta):
+    if meta.get("schema")!=C.SCHEMA or meta.get("load_version")!=C.LOAD_VERSION:
+        raise ValueError("负荷模型版本不兼容；旧模型禁止自动迁移")
+    if (meta.get("preprocessing_sha256")!=file_hash(C.CODE_ROOT/"data_cleaning/pipeline.py") or
+        meta.get("load_implementation_sha256")!=file_hash(C.CODE_ROOT/"main_s.py")):
+        raise ValueError("负荷特征或推理实现已改变，拒绝复用不兼容模型")
+    bundles=[]
+    for span in ("short","long"):
+        m=meta["load"][span]
+        b=LoadBundle(span,m["horizons"],m["features"],recipe=m["recipe"],train_end=m["train_end"],diagnostics=m["diagnostics"])
+        expected=list(range(1,9 if span=="short" else 97))
+        if b.horizons!=expected or b.recipe.get("load_version")!=C.LOAD_VERSION:
+            raise ValueError("负荷模型提前量或版本契约错误")
+        pack=b.recipe.get("frozen_profile",{})
+        if pack.get("cutoff")!=b.train_end:
+            raise ValueError("负荷模型画像截止不一致")
+        for key in ("values","shape"):
+            a=np.asarray(pack.get(key,[]),float)
+            if a.shape!=(96,3) or not np.isfinite(a).all() or (key=="shape" and (a<=0.).any()):
+                raise ValueError("负荷画像或形状契约错误")
+        covered=np.zeros((len(expected),3),int)
+        for record in m["models"]:
+            path=(root/record["file"]).resolve()
+            if not path.is_relative_to(root.resolve()) or file_hash(path)!=record["sha256"]:
+                raise ValueError("模型文件路径或完整性错误")
+            ti,group=record["target_index"],record["horizons"]
+            if ti not in (0,1,2) or not group or len(set(group))!=len(group) or not set(group)<=set(expected):
+                raise ValueError("负荷模型目标或提前量错误")
+            model=lgb.Booster(model_str=path.read_text(encoding="utf-8"))
+            if model.feature_name()!=b.features:
+                raise ValueError("模型内特征顺序与元数据不一致")
+            b.models.append((ti,group,model))
+            covered[np.array(group)-1,ti]+=1
+        needed=np.zeros(3,int)
+        needed[required_targets(load_recipe(b.recipe,span),span)]=1
+        if not (covered==needed[None,:]).all():
+            raise ValueError("模型分量覆盖缺失、冗余或重复")
+        bundles.append(b)
+    return bundles
+
+
+def save_load_models(root,short,long,contract=None):
+    """预测专项保存两条真实链路，不伪造资源模型或完整提交包。"""
+    root=Path(root)
+    meta={"schema":C.SCHEMA,"load_version":C.LOAD_VERSION,
+          "preprocessing_sha256":file_hash(C.CODE_ROOT/"data_cleaning/pipeline.py"),
+          "load_implementation_sha256":file_hash(C.CODE_ROOT/"main_s.py"),
+          "targets":C.TARGETS,"step_minutes":C.STEP,"contract":contract or {},
+          "load":_save_load_bundles(root,short,long)}
+    write_json(root/"load_meta.json",meta)
+    return meta
+
+
+def load_load_models(root):
+    root=Path(root)
+    meta=read_json(root/"load_meta.json")
+    return (*_load_bundles(root,meta),meta)
+
+
+def save_models(root,short,long,resource,contract=None):
+    root=Path(root)
+    meta={"schema":C.SCHEMA,"load_version":C.LOAD_VERSION,"holder_input_version":C.HOLDER_INPUT_VERSION,
+          "targets":C.TARGETS,"step_minutes":15,"load":{},"resource":{},
+          "preprocessing_sha256":file_hash(C.CODE_ROOT/"data_cleaning/pipeline.py"),
+          "load_implementation_sha256":file_hash(C.CODE_ROOT/"main_s.py"),
+          "training_quick":bool(short.recipe.get("effective_budget",{}).get("quick",False)),
+          "runtime":{name:importlib.metadata.version(name) for name in ("numpy","pandas","lightgbm","scipy","scikit-learn")},
+          "contract":contract or {}}
+    meta["load"]=_save_load_bundles(root,short,long)
     folder=root/"resource"
     folder.mkdir(parents=True,exist_ok=True)
     records={}
@@ -102,6 +170,13 @@ def save_models(root,short,long,resource,contract=None):
         records[name]={"file":f"resource/{name}.txt","sha256":file_hash(path)}
     meta["resource"]={"features":resource.features,"train_end":resource.train_end,"beta":resource.beta,
                        "diagnostics":resource.diagnostics,"models":records}
+    from main_opt import validate_process_resource
+    validate_process_resource(resource)
+    meta['resource']['process_meta']=resource.process_meta
+    if resource.process_meta['available']:
+        path=folder/'shared_process.txt'
+        path.write_text(resource.process_model.model_to_string(),encoding='utf-8')
+        meta['resource']['process_model']={'file':'resource/shared_process.txt','sha256':file_hash(path)}
     write_json(root/"model_meta.json",meta)
     return meta
 
@@ -113,31 +188,23 @@ def load_models(run):
         raise ValueError("模型版本或单位契约不兼容；旧模型禁止自动迁移")
     if meta.get("preprocessing_sha256") not in (None,file_hash(C.CODE_ROOT/"data_cleaning/pipeline.py")):
         raise ValueError("预处理实现已改变，禁止以新特征变换加载旧模型")
-    bundles=[]
-    for span in ("short","long"):
-        m=meta["load"][span]
-        b=LoadBundle(span,m["horizons"],m["features"],recipe=m["recipe"],train_end=m["train_end"],diagnostics=m["diagnostics"])
-        expected=list(range(1,9 if span=="short" else 97))
-        if b.horizons!=expected:
-            raise ValueError("模型提前量契约错误")
-        covered=np.zeros((len(expected),2),int)
-        for record in m["models"]:
-            path=(root/record["file"]).resolve()
-            if not path.is_relative_to(root.resolve()) or file_hash(path)!=record["sha256"]:
-                raise ValueError("模型文件路径或完整性错误")
-            model=lgb.Booster(model_str=path.read_text(encoding="utf-8"))
-            if model.feature_name()!=b.features:
-                raise ValueError("模型内特征顺序与元数据不一致")
-            b.models.append((record["target_index"],record["horizons"],model))
-            covered[np.array(record["horizons"])-1,record["target_index"]]+=1
-        needed=np.asarray(m["recipe"].get("blend_weights",{}).get(span,[1.,1.]))>0.
-        if not (covered==needed[None,:].astype(int)).all():
-            raise ValueError("模型分量覆盖缺失或重复")
-        bundles.append(b)
+    bundles=_load_bundles(root,meta)
     r=meta["resource"]
     if "group_mapping" not in r["diagnostics"]:
         raise ValueError("新版归档必须包含分组气电标定和留出验证")
     resource=ResourceBundle(features=r["features"],train_end=r["train_end"],beta=r["beta"],diagnostics=r["diagnostics"])
+    from main_opt import validate_dispatch_calibration
+    validate_dispatch_calibration(resource)
+    resource.process_meta=r.get('process_meta',{})
+    if resource.process_meta.get('available'):
+        record=r.get('process_model',{})
+        if not record.get('file'):raise ValueError('归档缺少资源过程模型文件')
+        path=(root/record['file']).resolve()
+        if not path.is_relative_to(root.resolve()) or file_hash(path)!=record.get('sha256'):
+            raise ValueError('资源过程模型路径或完整性错误')
+        resource.process_model=lgb.Booster(model_str=path.read_text(encoding='utf-8'))
+    from main_opt import validate_process_resource
+    validate_process_resource(resource)
     for name,record in r["models"].items():
         path=(root/record["file"]).resolve()
         if not path.is_relative_to(root.resolve()) or file_hash(path)!=record["sha256"]:
@@ -174,15 +241,27 @@ def build_zip(ctx):
     assert_source(ctx)
     target=ctx["root"]/"咕咕嘎嘎-半决赛.zip"
     with zipfile.ZipFile(target,"w",zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+        # 评分服务现阶段仅接收三表，源码与模型继续保留在本地归档。
         for name in ("s_result.csv","l_result.csv","opt_result.csv"):
             z.write(ctx["root"]/name,name)
-        for folder,arc in ((ctx["source"],"源码"),(ctx["root"]/"模型","模型")):
-            for p in sorted(folder.rglob("*")):
-                if p.is_file():
-                    z.write(p,str(Path(arc)/p.relative_to(folder)).replace("\\","/"))
+    checked=verify_zip(ctx["root"])
+    if not checked["passed"]:
+        raise ValueError("提交ZIP完整性或三表白名单校验未通过")
+    return checked
+
+
+def verify_zip(root):
+    root=Path(root)
+    target=root/"咕咕嘎嘎-半决赛.zip"
     with zipfile.ZipFile(target) as z:
-        bad=z.testzip()
-    return {"path":str(target),"crc_ok":bad is None,"bytes":target.stat().st_size}
+        names=z.namelist()
+        expected={"s_result.csv","l_result.csv","opt_result.csv"}
+        members_ok=len(names)==len(expected) and set(names)==expected
+        crc_ok=z.testzip() is None
+        csv_equal=members_ok and all(z.read(name)==(root/name).read_bytes() for name in names)
+    return {"path":str(target),"crc_ok":crc_ok,"bytes":target.stat().st_size,"members":names,
+            "members_ok":members_ok,"csv_bytes_equal":csv_equal,
+            "passed":bool(members_ok and crc_ok and csv_equal)}
 
 
 def verify_run(root):
@@ -199,27 +278,20 @@ def verify_run(root):
         p,q=np.asarray(day["power"]),np.asarray(day["gas"])
         evidence.extend(np.column_stack((q,p[:,:4].sum(axis=1),p.sum(axis=1))).tolist())
     linked=len(evidence)==len(exported) and np.allclose(exported.iloc[:,1:].to_numpy(),np.array(evidence),atol=.000002,rtol=0.)
-    actual=bool(days) and all(x["passed"] for x in constraints)
+    sequence=validate_plan_sequence(days)
+    actual=bool(days) and all(x["passed"] for x in constraints) and sequence["passed"]
     metadata=load_models(root)[-1]
     fingerprint=report.get("source",{})
-    zip_ok=False
-    with zipfile.ZipFile(root/"咕咕嘎嘎-半决赛.zip") as z:
-        names=z.namelist()
-        zip_ok=z.testzip() is None and not any(n.startswith(("data/","tmp/")) for n in names)
-        for name,digest in fingerprint.items():
-            if "源码/"+name not in names:
-                zip_ok=False
-                continue
-            import hashlib
-            zip_ok &= hashlib.sha256(z.read("源码/"+name)).hexdigest()==digest
-        for name in ("s_result.csv","l_result.csv","opt_result.csv"):
-            zip_ok &= z.read(name)==(root/name).read_bytes()
-        for path in (root/"模型").rglob("*"):
-            if path.is_file():
-                name="模型/"+path.relative_to(root/"模型").as_posix()
-                zip_ok &= name in names and z.read(name)==path.read_bytes()
-    return {"archive_passed":bool(files["passed"] and linked and zip_ok),
+    source=(C.ROOT/"tmp_main"/report["run_id"]/"源码") if report["experimental"] else root/"源码"
+    source_ok=all((source/name).is_file() and file_hash(source/name)==digest
+                  for name,digest in fingerprint.items())
+    checked=verify_zip(root)
+    return {"archive_passed":bool(files["passed"] and linked and source_ok and checked["passed"]),
+            "source_passed":source_ok,"zip":checked,
             "constraints_passed":actual,"files":files,"csv_evidence_equal":linked,
+            "constraint_scope":"local_strict_project_model","official_holder_validation":"UNVERIFIED",
+            "validation_scope":"project_local_strict_validation","official_acceptance_status":"unknown",
+            "sequence_validation":sequence,
             "submittable_claim_consistent":bool(report.get("submittable")==(
                 actual and files["passed"] and not report["experimental"] and report.get("full_window",False))),
             "models_schema":metadata["schema"],"daily_constraints":constraints}
