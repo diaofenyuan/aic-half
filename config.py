@@ -42,11 +42,11 @@ LOAD_RECIPE = {"short": "shared", "long": "shared", "loss": "relative_l1",
                "profile_days": 28,
                "tasks": {
                    "short": {"feature_set": "memory+dynamics+missingness", "phase": "fixed",
-                             "representation": "group_difference", "consistency_alpha": .3,
+                             "representation": "group_difference", "consistency_alpha": .6,
                              "decay_days": 28, "learning_rate": .03, "rounds": 640, "aux_weight_target":"small"},
                    "long": {"long": "segmented", "feature_set": "base+relative+mechanism", "phase": "rotating",
                             "weight_power":1.45,
-                            "target_kinds": ["direct", "factor"], "tree_weights": [0., 1.]}}}
+                            "target_kinds": ["factor", "factor"], "tree_weights": [1., 1.]}}}
 TREE = {"learning_rate": .05, "num_leaves": 31, "min_data_in_leaf": 80,
         "feature_fraction": .9, "lambda_l2": 2., "verbosity": -1,
         "num_threads": CPU_THREADS, "deterministic": True, "force_col_wise": True,
