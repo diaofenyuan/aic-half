@@ -8,7 +8,7 @@ DATA_ROOT = Path(os.environ.get("AIC_DATA_ROOT", ROOT / "data"))
 OUTPUT_ROOT = ROOT / "outputs"
 EXPERIMENT_ROOT = ROOT / "tmp" / "tmp_outputs"
 SCHEMA = "lgbm_core_v3"
-LOAD_VERSION = "load_reference_groups_v7"
+LOAD_VERSION = "load_causal_regime_v9"
 CPU_THREADS = min(16, os.cpu_count() or 1)
 STEP = 15
 DT = .25
@@ -90,6 +90,15 @@ LOAD_RECIPE = {'short': 'shared',
                                              'days': 56,
                                              'stride': 1,
                                              'decay_days': 14}}]}}}
+# 选择规则固定；只在合法训练前缀回放，不随测试输入或测试时段重选。
+LOAD_RECIPE["tasks"]["short"] = {"causal_selector": {
+    "version":"prefix7d_targets_v1", "history_days":7, "min_cells":100,
+    "experts":{"core":LOAD_RECIPE["tasks"]["short"],
+               "anchor":{"anchor_transform":"delta", "representation":"pair", "short":"shared",
+                   "feature_set":"memory+dynamics+relative+mechanism+missingness",
+                   "days":112, "stride":4, "profile_days":7, "rounds":320, "leaves":31,
+                   "learning_rate":.05, "decay_days":28, "weight_power":1.,
+                   "tree_weights":[1.,1.], "consistency_alpha":.6}}}}
 TREE = {"learning_rate": .05, "num_leaves": 31, "min_data_in_leaf": 80,
         "feature_fraction": .9, "lambda_l2": 2., "verbosity": -1,
         "num_threads": CPU_THREADS, "deterministic": True, "force_col_wise": True,

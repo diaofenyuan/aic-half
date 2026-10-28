@@ -6,7 +6,7 @@ import pandas as pd
 import lightgbm as lgb
 import config as C
 from data_cleaning.pipeline import build_features, horizon_block, process_series
-from data_cleaning.quality import project_load
+from data_cleaning.quality import project_load, truth_cube, score_load
 
 
 @dataclass
@@ -19,6 +19,7 @@ class LoadBundle:
     train_end: str = ""
     diagnostics: list = field(default_factory=list)
     members: list = field(default_factory=list)
+    experts: dict = field(default_factory=dict)
 
 
 def fit_booster(X, y, names, times, *, loss="l1", rounds=320, seed=2026, leaves=31,
@@ -240,6 +241,10 @@ def required_targets(spec, span):
 def train_load(prepared, span, recipe=None, quick=False, progress=None):
     recipe = dict(recipe or C.LOAD_RECIPE)
     spec = load_recipe(recipe, span)
+    if spec.get("causal_selector"):
+        return train_regime_load(prepared, span, recipe, quick, progress)
+    if spec.get("anchor_transform"):
+        return train_anchored_load(prepared, span, recipe, quick, progress)
     if spec.get("members"):
         prepared.require_training(prepared.index[-1])
         maximum = 8 if span == "short" else 96
@@ -509,6 +514,8 @@ def predict_components(bundle, prepared, origins):
     if pd.Timestamp(bundle.train_end) >= origins[0]:
         raise ValueError("模型标签截止必须早于起报窗口")
     spec = load_recipe(bundle.recipe, bundle.span)
+    if spec.get("anchor_transform"):
+        return predict_anchored_components(bundle, prepared, origins)
     base = build_load_features(prepared, spec.get("feature_set", "base"))
     positions = prepared.index.get_indexer(origins)
     if (positions < 0).any():
@@ -553,6 +560,11 @@ def predict_load(bundle, prepared, origins):
         raise ValueError("请求起报点必须位于训练截止之后且存在于输入网格")
     if bundle.recipe.get("load_version") != C.LOAD_VERSION:
         raise ValueError("负荷模型版本不兼容")
+    validate_regime_bundle(bundle)
+    if bundle.experts:
+        predictions = {name:predict_load(child,prepared,origins) for name,child in bundle.experts.items()}
+        sources = bundle.recipe["regime_selection"]["target_sources"]
+        return project_load(np.stack([predictions[name][...,i] for i,name in enumerate(sources)],axis=-1))
     if bundle.members:
         if any(child.span != bundle.span or child.train_end != bundle.train_end for _, child in bundle.members):
             raise ValueError("组合分量跨度或训练截止不一致")
@@ -592,3 +604,225 @@ def predict_short(bundle, prepared, origins):
     if bundle.span != "short":
         raise ValueError("短期入口拒绝长期模型")
     return predict_load(bundle, prepared, origins)
+
+
+def anchor_inputs(prepared):
+    """过程上下文仅取完整分量的向后观测，不填造缺失燃料。"""
+    f = prepared.frame
+    blast = f[[f"gas_blast_furnace_{i}" for i in (1,2,4,5)]].sum(axis=1, min_count=4)
+    heaters = f[[f"gas_air_heater_{i}" for i in range(1,6)]].sum(axis=1, min_count=5)
+    coke = process_series(prepared).coke_available_proxy
+    return pd.DataFrame({"blast":blast, "heaters":heaters, "coke":coke}).rolling(4,min_periods=4).median()
+
+
+def anchor_pack(prepared, cutoff, days=7, inputs=None):
+    pack = profile_pack(prepared, cutoff, days)
+    history = (anchor_inputs(prepared) if inputs is None else inputs).loc[:cutoff].tail(days*96)
+    references = history.median().where(history.count() >= 24)
+    pack.update(anchor_inputs=references.to_numpy().tolist(), anchor_input_support=history.count().tolist(),
+        anchor_input_basis="causal complete-component 4-step median; >=24 observations; no fuel imputation")
+    return pack
+
+
+def anchored_block(X, names, positions, origins, horizons, profiles, ages, inputs, references, target):
+    """同一合法输入配不同已知目标截止点，学习目标长期不可见时的变化。"""
+    n = len(positions); rows = np.tile(np.arange(n),len(horizons))
+    future = pd.DatetimeIndex(np.tile(origins.to_numpy(),len(horizons)))+pd.to_timedelta(np.repeat(horizons,n)*15,unit="min")
+    slots = future.hour*4+future.minute//15
+    levels = np.maximum(profiles[rows,slots,target],1.)
+    with np.errstate(divide="ignore",invalid="ignore"):
+        ratios = inputs / references
+    ratios[~np.isfinite(ratios) | (references <= 0.)] = np.nan
+    extended = np.column_stack((X,levels,np.tile(ages,len(horizons)),ratios[rows])).astype("float32")
+    return extended,names+["anchor_value_mw","anchor_age_days","anchor_ratio_blast","anchor_ratio_heaters","anchor_ratio_coke"],levels,future.to_numpy()
+
+
+def train_anchored_load(prepared, span, recipe, quick=False, progress=None):
+    spec = load_recipe(recipe,span); transform = spec["anchor_transform"]
+    if span != "short" or transform != "delta" or spec.get("representation") != "pair":
+        raise ValueError("负荷水平锚点配方不兼容")
+    cutoff = prepared.index[-1]; prepared.require_training(cutoff)
+    base = build_load_features(prepared,spec["feature_set"])
+    process = anchor_inputs(prepared)
+    stride = max(16,spec["stride"]) if quick else spec["stride"]
+    days = min(56,spec["days"]) if quick else spec["days"]
+    rounds = min(60,spec["rounds"]) if quick else spec["rounds"]
+    initial = training_positions(prepared.index,days,stride,"rotating")
+    initial = initial[initial >= 28*96]
+    rng = np.random.default_rng(spec["seed"])
+    gaps = (rng.integers(0,22,len(initial))[:,None]+np.array([0,5,11,16]))%22
+    positions = np.repeat(initial,4); gaps = gaps.reshape(-1)
+    origin = prepared.index[positions]
+    anchor_cutoffs = origin.normalize()-pd.to_timedelta(gaps,unit="D")-pd.Timedelta(minutes=15)
+    assert (anchor_cutoffs < origin).all()
+    profiles = np.zeros((len(positions),96,3),dtype="float32")
+    references = np.full((len(positions),3),np.nan)
+    pack_records = []
+    for end in anchor_cutoffs.unique():
+        pack = anchor_pack(prepared,end,spec["profile_days"],process)
+        mask = anchor_cutoffs == end
+        profiles[mask] = np.asarray(pack["values"])
+        references[mask] = np.asarray(pack["anchor_inputs"],float)
+        pack_records.append(str(end))
+    ages = np.asarray((origin-anchor_cutoffs).total_seconds()/86400.)
+    current = process.to_numpy()[positions]
+    maximum = 8
+    bundle = LoadBundle(span,list(range(1,maximum+1)),[],recipe=deepcopy_recipe(recipe),train_end=str(cutoff))
+    bundle.recipe.update(load_version=C.LOAD_VERSION,frozen_profile=anchor_pack(prepared,cutoff,spec["profile_days"],process),
+        effective_budget={"quick":bool(quick),"days":days,"stride":stride,"origins":len(initial),
+            "anchor_cases":len(positions),"max_rounds":rounds,"threads":C.CPU_THREADS},
+        loss_definition={"transform":transform,"anchor_floor_mw":1.,"zero_labels_retained":True,
+            "delta_conversion":"y-A; relative MW loss weight unchanged", "synthetic_gap_days":[0,21],
+            "gap_sampling":"4 distinct uniformly shifted ages per origin, seed fixed",
+            "anchor_cutoffs":pack_records,"outer_validation_anchor_frozen":True})
+    for group in horizon_groups(span,spec[span]):
+        horizons = group
+        X,names = load_horizon_block(prepared,base,positions,horizons,spec["feature_set"])
+        ix = np.concatenate([positions+h for h in horizons]);available = ix < len(prepared.index)
+        raw = np.full((len(ix),2),np.nan);raw[available] = prepared.labels.to_numpy()[ix[available]]
+        for target in (0,1):
+            extended,features,scale,times = anchored_block(X,names,positions,origin,horizons,profiles,ages,current,references,target)
+            y = raw[:,target]
+            labels = y-scale
+            model,diag = fit_booster(extended,labels,features,times,loss="relative_l1",rounds=rounds,
+                seed=spec["seed"],leaves=spec["leaves"],original_y=y,
+                weight_scale=np.ones(len(y)),
+                decay_days=spec.get("decay_days"),learning_rate=spec.get("learning_rate"))
+            bundle.models.append((target,group,model));bundle.features = features
+            bundle.diagnostics.append(dict(diag,target=C.TARGETS[target],horizons=group,
+                training_horizons=horizons,structure="frozen_absolute_level_"+transform,
+                max_anchor_cutoff=str(anchor_cutoffs.max()),max_anchor_age_days=float(ages.max())))
+            if progress:
+                progress(f"{span} t={target} anchor_{transform} h={group[0]}..{group[-1]} {diag['rows']}行 {diag['rounds']}轮")
+    return bundle
+
+
+def predict_anchored_components(bundle,prepared,origins):
+    spec = load_recipe(bundle.recipe,bundle.span);transform = spec["anchor_transform"]
+    if bundle.span != "short" or transform != "delta":
+        raise ValueError("负荷水平锚点变换错误")
+    pack = bundle.recipe["frozen_profile"]
+    if pack["cutoff"] != bundle.train_end or "anchor_inputs" not in pack:
+        raise ValueError("负荷水平锚点来源或过程上下文缺失")
+    positions = prepared.index.get_indexer(origins)
+    if (positions < 0).any():raise ValueError("缺少起报网格")
+    base = build_load_features(prepared,spec["feature_set"])
+    process = anchor_inputs(prepared).to_numpy()
+    values = np.zeros((len(origins),len(bundle.horizons),3))
+    for lo in range(0,len(origins),256):
+        pos = positions[lo:lo+256];origin = origins[lo:lo+256]
+        profiles = np.broadcast_to(np.asarray(pack["values"]),(len(pos),96,3))
+        references = np.broadcast_to(np.asarray(pack["anchor_inputs"],float),(len(pos),3))
+        ages = np.asarray((origin-pd.Timestamp(bundle.train_end)).total_seconds()/86400.)
+        for target,group,model in bundle.models:
+            X,names = load_horizon_block(prepared,base,pos,group,spec["feature_set"])
+            extended,features,scale,_ = anchored_block(X,names,pos,origin,group,profiles,ages,process[pos],references,target)
+            if features != bundle.features or model.feature_name() != features:
+                raise ValueError("锚点模型特征顺序不一致")
+            pred = model.predict(extended,num_threads=C.CPU_THREADS)
+            pred = pred+scale
+            values[lo:lo+len(pos),np.asarray(group)-1,target] = pred.reshape(len(group),len(pos)).T
+    return values
+
+
+REGIME_ROUTES = (("core","core"),("anchor","core"),("core","anchor"),("anchor","anchor"))
+
+
+def choose_regime(scores, minimum):
+    valid = {"/".join(route):scores["/".join(route)] for route in REGIME_ROUTES
+        if scores["/".join(route)].get("macro_score") is not None and
+        all(scores["/".join(route)][t]["nonzero_cells"] >= minimum for t in C.TARGETS)}
+    if not valid:
+        return ["core","core"]
+    best = max(valid,key=lambda key:valid[key]["macro_score"])
+    return best.split("/")
+
+
+def select_regime(prepared, span, recipe, quick=False, progress=None):
+    """只在训练前缀最后七天回放，整段遮挡回放标签后决定两目标来源。"""
+    if span != "short":raise ValueError("当前因果选择只用于独立短期链路")
+    policy = deepcopy_recipe(load_recipe(recipe,span)["causal_selector"])
+    if policy.get("version") != "prefix7d_targets_v1" or policy.get("history_days") != 7 or set(policy["experts"]) != {"core","anchor"}:
+        raise ValueError("因果选择配方不兼容")
+    cutoff = prepared.index[-1];prepared.require_training(cutoff)
+    start = cutoff-pd.Timedelta(days=7)+pd.Timedelta(minutes=15)
+    train = prepared.prefix(start-pd.Timedelta(minutes=15))
+    origins = pd.date_range(start,cutoff,freq="15min")
+    view = prepared.masked_copy(start,mask_use=True);view.labels=view.labels.copy();view.labels.loc[start:]=np.nan
+    truth = truth_cube(prepared,origins,range(1,9))
+    predictions = {}; models = {}
+    for name in ("core","anchor"):
+        child_recipe = deepcopy_recipe(recipe);child_recipe["tasks"][span] = deepcopy_recipe(policy["experts"][name])
+        models[name] = train_load(train,span,child_recipe,quick,progress)
+        predictions[name] = predict_load(models[name],view,origins)
+    scores = {}
+    for route in REGIME_ROUTES:
+        pred = project_load(np.stack([predictions[name][...,i] for i,name in enumerate(route)],axis=-1))
+        scores["/".join(route)] = score_load(pred,truth)
+    sources = choose_regime(scores,policy["min_cells"])
+    decision = {"version":policy["version"],"policy":policy,"target_sources":sources,"scores":scores,
+        "inner_start":str(start),"inner_end":str(cutoff),"inner_train_end":str(train.index[-1]),
+        "max_label_used_at":str(cutoff),"outer_targets_used":False,"inner_target_blackout":True,
+        "future_targets_past_cutoff_excluded":True,"selection_performed_at":str(cutoff)}
+    if progress:progress(f"short 因果目标选择：小机组={sources[0]}，全厂={sources[1]}")
+    return decision,models
+
+
+def train_regime_load(prepared, span, recipe, quick=False, progress=None):
+    tick = time.perf_counter()
+    decision,inner = select_regime(prepared,span,recipe,quick,progress)
+    del inner
+    experts = {}
+    for name in sorted(set(decision["target_sources"])):
+        resolved = deepcopy_recipe(recipe);resolved["tasks"][span] = deepcopy_recipe(decision["policy"]["experts"][name])
+        experts[name] = train_load(prepared,span,resolved,quick,progress)
+    if len(experts) == 1:
+        bundle = next(iter(experts.values()))
+        bundle.recipe["regime_selection"] = decision
+    else:
+        bundle = LoadBundle(span,list(range(1,9)),[],recipe=deepcopy_recipe(recipe),train_end=str(prepared.index[-1]),experts=experts)
+        bundle.recipe.update(load_version=C.LOAD_VERSION,regime_selection=decision,
+            frozen_profile=profile_pack(prepared,prepared.index[-1]),effective_budget={"quick":bool(quick),"threads":C.CPU_THREADS})
+        bundle.diagnostics = [dict(d,selected_expert=name) for name,child in experts.items() for d in child.diagnostics]
+    bundle.recipe["regime_training_seconds"] = time.perf_counter()-tick
+    validate_regime_bundle(bundle)
+    return bundle
+
+
+def validate_regime_bundle(bundle):
+    selection = bundle.recipe.get("regime_selection")
+    if selection is None:
+        if bundle.experts or load_recipe(bundle.recipe,bundle.span).get("causal_selector"):
+            raise ValueError("缺少因果目标选择记录")
+        return
+    policy = selection.get("policy",{})
+    if bundle.span != "short" or selection.get("version") != "prefix7d_targets_v1" or policy.get("version") != selection["version"]:
+        raise ValueError("因果选择版本或任务错误")
+    if set(policy.get("experts",{})) != {"core","anchor"} or policy.get("history_days") != 7 or policy.get("min_cells") != 100:
+        raise ValueError("因果选择策略契约错误")
+    cutoff = pd.Timestamp(bundle.train_end);start = pd.Timestamp(selection["inner_start"])
+    if (pd.Timestamp(selection["inner_end"]) != cutoff or pd.Timestamp(selection["max_label_used_at"]) > cutoff or
+        start != cutoff-pd.Timedelta(days=7)+pd.Timedelta(minutes=15) or
+        pd.Timestamp(selection["inner_train_end"]) != start-pd.Timedelta(minutes=15) or
+        selection.get("outer_targets_used") is not False or selection.get("inner_target_blackout") is not True or
+        selection.get("future_targets_past_cutoff_excluded") is not True or
+        pd.Timestamp(selection["selection_performed_at"]) != cutoff):
+        raise ValueError("因果选择时间边界错误")
+    sources = selection.get("target_sources")
+    if set(selection.get("scores",{})) != {"/".join(route) for route in REGIME_ROUTES}:
+        raise ValueError("因果回放缺少完整目标组合")
+    if sources != choose_regime(selection["scores"],policy["min_cells"]):
+        raise ValueError("因果目标来源与前缀回放分数不一致")
+    if bundle.experts:
+        if bundle.models or bundle.members or set(bundle.experts) != set(sources) or len(bundle.experts) != 2:
+            raise ValueError("因果专家覆盖错误")
+        children = bundle.experts
+    else:
+        if len(set(sources)) != 1:raise ValueError("混合目标缺少实际专家")
+        children = {sources[0]:bundle}
+    for name,child in children.items():
+        if child.span != bundle.span or child.train_end != bundle.train_end:
+            raise ValueError("因果专家训练截止不一致")
+        actual = load_recipe(child.recipe,child.span)
+        if any(actual.get(k) != v for k,v in policy["experts"][name].items()):
+            raise ValueError("因果专家实际配方不一致")

@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import lightgbm as lgb
 import config as C
-from main_s import LoadBundle, load_recipe, required_targets
+from main_s import LoadBundle, load_recipe, required_targets, validate_regime_bundle
 from main_opt import ResourceBundle
 from data_cleaning.pipeline import file_hash
 from data_cleaning.quality import validate_result_files, validate_day, validate_plan_sequence
@@ -88,6 +88,9 @@ def _save_load_bundles(root,short,long):
             records.append({"target_index":ti,"horizons":group,"file":str(relative/name),"sha256":file_hash(folder/name)})
         meta={"features":b.features,"horizons":b.horizons,"recipe":b.recipe,
               "train_end":b.train_end,"models":records,"diagnostics":b.diagnostics}
+        validate_regime_bundle(b)
+        if b.experts:
+            meta["experts"]={name:save_one(child,relative/name) for name,child in b.experts.items()}
         if b.members:
             if b.models:
                 raise ValueError("组合根节点不能混入独立预测树")
@@ -103,7 +106,7 @@ def _load_bundles(root,meta):
     if (meta.get("preprocessing_sha256")!=file_hash(C.CODE_ROOT/"data_cleaning/pipeline.py") or
         meta.get("load_implementation_sha256")!=file_hash(C.CODE_ROOT/"main_s.py")):
         raise ValueError("负荷特征或推理实现已改变，拒绝复用不兼容模型")
-    def load_one(span,m,allow_members=True):
+    def load_one(span,m,allow_members=True,allow_experts=True):
         b=LoadBundle(span,m["horizons"],m["features"],recipe=m["recipe"],train_end=m["train_end"],diagnostics=m["diagnostics"])
         expected=list(range(1,9 if span=="short" else 97))
         if b.horizons!=expected or b.recipe.get("load_version")!=C.LOAD_VERSION:
@@ -115,6 +118,13 @@ def _load_bundles(root,meta):
             a=np.asarray(pack.get(key,[]),float)
             if a.shape!=(96,3) or not np.isfinite(a).all() or (key=="shape" and (a<=0.).any()):
                 raise ValueError("负荷画像或形状契约错误")
+        experts=m.get("experts",{})
+        if experts:
+            if not allow_experts or m["models"] or m.get("members"):
+                raise ValueError("目标选择专家层级错误")
+            b.experts={name:load_one(span,child,True,False) for name,child in experts.items()}
+            validate_regime_bundle(b)
+            return b
         members=m.get("members",[])
         declared=load_recipe(b.recipe,span).get("members",[])
         if members or declared:
@@ -125,13 +135,14 @@ def _load_bundles(root,meta):
             for record,rule in zip(members,declared):
                 if record["weight"]!=rule["weight"]:
                     raise ValueError("组合归档权重与实际配方不一致")
-                child=load_one(span,record["bundle"],False)
+                child=load_one(span,record["bundle"],False,False)
                 if child.train_end!=b.train_end:
                     raise ValueError("组合分量训练截止不一致")
                 child_spec=load_recipe(child.recipe,span)
                 if any(child_spec.get(k)!=v for k,v in rule["options"].items()):
                     raise ValueError("组合分量的实际配方不一致")
                 b.members.append((record["weight"],child))
+            validate_regime_bundle(b)
             return b
         covered=np.zeros((len(expected),3),int)
         for record in m["models"]:
@@ -150,6 +161,7 @@ def _load_bundles(root,meta):
         needed[required_targets(load_recipe(b.recipe,span),span)]=1
         if not (covered==needed[None,:]).all():
             raise ValueError("模型分量覆盖缺失、冗余或重复")
+        validate_regime_bundle(b)
         return b
     return [load_one(span,meta["load"][span]) for span in ("short","long")]
 
