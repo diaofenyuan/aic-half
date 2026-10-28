@@ -8,7 +8,7 @@ DATA_ROOT = Path(os.environ.get("AIC_DATA_ROOT", ROOT / "data"))
 OUTPUT_ROOT = ROOT / "outputs"
 EXPERIMENT_ROOT = ROOT / "tmp" / "tmp_outputs"
 SCHEMA = "lgbm_core_v3"
-LOAD_VERSION = "load_group_shape_v3"
+LOAD_VERSION = "load_coupled_ensemble_v5"
 CPU_THREADS = min(16, os.cpu_count() or 1)
 STEP = 15
 DT = .25
@@ -37,16 +37,57 @@ TABLES = ("load", "gas", "gas_user", "gas_holder")
 # 倍率由数据版本声明，禁止根据量级猜测并重复换算。
 HOLDER_INPUT_VERSION = os.environ.get("AIC_HOLDER_VERSION", "historical_raw")
 HOLDER_SCALES = {"historical_raw": (10000., 1.), "official_m3": (1., 1.)}
-LOAD_RECIPE = {"short": "shared", "long": "shared", "loss": "relative_l1",
-               "days": 112, "stride": 2, "rounds": 320, "leaves": 31, "seed": 2026,
-               "profile_days": 28,
-               "tasks": {
-                   "short": {"feature_set": "memory+dynamics+missingness", "phase": "fixed",
-                             "representation": "group_difference", "consistency_alpha": .6,
-                             "decay_days": 28, "learning_rate": .03, "rounds": 640, "aux_weight_target":"small"},
-                   "long": {"long": "segmented", "feature_set": "base+relative+mechanism", "phase": "rotating",
-                            "weight_power":1.45,
-                            "target_kinds": ["factor", "factor"], "tree_weights": [1., 1.]}}}
+LOAD_RECIPE = {'short': 'shared',
+ 'long': 'shared',
+ 'loss': 'relative_l1',
+ 'days': 112,
+ 'stride': 2,
+ 'rounds': 320,
+ 'leaves': 31,
+ 'seed': 2026,
+ 'profile_days': 28,
+ 'tasks': {'short': {'members': [{'weight': 0.5,
+                                  'options': {'feature_set': 'memory+dynamics+missingness',
+                                              'phase': 'fixed',
+                                              'representation': 'group_difference',
+                                              'consistency_alpha': 0.6,
+                                              'decay_days': 28,
+                                              'learning_rate': 0.03,
+                                              'rounds': 640,
+                                              'aux_weight_target': 'small'}},
+                                 {'weight': 0.5,
+                                  'options': {'feature_set': 'memory+dynamics+missingness',
+                                              'phase': 'fixed',
+                                              'representation': 'group_difference',
+                                              'consistency_alpha': 0.6,
+                                              'decay_days': 28,
+                                              'learning_rate': 0.03,
+                                              'rounds': 640,
+                                              'aux_weight_target': 'small',
+                                              'window_level': True,
+                                              'target_kinds': ['window_factor',
+                                                               'window_factor',
+                                                               'window_factor']}}]},
+           'long': {'members': [{'weight': 0.5,
+                                 'options': {'long': 'segmented',
+                                             'feature_set': 'memory+dynamics+relative+mechanism+missingness',
+                                             'phase': 'rotating',
+                                             'weight_power': 1.0,
+                                             'target_kinds': ['direct', 'factor', 'direct'],
+                                             'tree_weights': [1.0, 1.0],
+                                             'representation': 'group_ratio',
+                                             'decay_days': 28,
+                                             'aux_weight_target': 'small'}},
+                                {'weight': 0.5,
+                                 'options': {'long': 'segmented',
+                                             'feature_set': 'memory+dynamics+relative+mechanism+missingness',
+                                             'phase': 'fixed',
+                                             'weight_power': 1.0,
+                                             'target_kinds': ['factor', 'factor'],
+                                             'tree_weights': [1.0, 1.0],
+                                             'days': 56,
+                                             'stride': 1,
+                                             'decay_days': 14}}]}}}
 TREE = {"learning_rate": .05, "num_leaves": 31, "min_data_in_leaf": 80,
         "feature_fraction": .9, "lambda_l2": 2., "verbosity": -1,
         "num_threads": CPU_THREADS, "deterministic": True, "force_col_wise": True,
@@ -66,7 +107,7 @@ OPTIONAL_USE_CALIBRATION={"version":"optional_prefix_level_v1","components":["bu
     "source":"inferred_short_term_consumption_level_calibration"}
 DISPATCH_CONTROL={"version":"joint_optional_prefix_v4","history_days":28,"min_support_rows":400,
                   "sensitivity_days":[28,56],"reserve_hours":4,"reserve_quantile":.9,
-                  "benefit_fraction":.999,"ratio_iterations":3,"mip_gap":.005,
+                  "benefit_fraction":.99,"ratio_iterations":3,"mip_gap":.005,
                   "gas_support_role":"diagnostic_only",
                   "optional_use_calibration":OPTIONAL_USE_CALIBRATION,
                   "source":"historical_inferred_joint_control"}

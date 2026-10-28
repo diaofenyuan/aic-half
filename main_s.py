@@ -18,6 +18,7 @@ class LoadBundle:
     recipe: dict = field(default_factory=dict)
     train_end: str = ""
     diagnostics: list = field(default_factory=list)
+    members: list = field(default_factory=list)
 
 
 def fit_booster(X, y, names, times, *, loss="l1", rounds=320, seed=2026, leaves=31,
@@ -224,6 +225,8 @@ def required_targets(spec, span):
         targets = [0, 1]
     elif representation == "group_difference":
         targets = [1, 2]
+    elif representation == "group_ratio":
+        targets = [1, 2]
     else:
         raise ValueError("未知机组组表示")
     weights = spec.get("tree_weights", [1., 1.])
@@ -233,6 +236,28 @@ def required_targets(spec, span):
 def train_load(prepared, span, recipe=None, quick=False, progress=None):
     recipe = dict(recipe or C.LOAD_RECIPE)
     spec = load_recipe(recipe, span)
+    if spec.get("members"):
+        prepared.require_training(prepared.index[-1])
+        maximum = 8 if span == "short" else 96
+        bundle = LoadBundle(span, list(range(1, maximum+1)), [], recipe=deepcopy_recipe(recipe),
+                            train_end=str(prepared.index[-1]))
+        bundle.recipe.update(load_version=C.LOAD_VERSION,
+            frozen_profile=profile_pack(prepared, prepared.index[-1], spec.get("profile_days", 28)),
+            effective_budget={"quick": bool(quick), "threads": C.CPU_THREADS, "kind": "fixed_ensemble"})
+        weights = np.asarray([item["weight"] for item in spec["members"]], float)
+        if len(weights) != 2 or not np.isfinite(weights).all() or (weights <= 0.).any() or not np.isclose(weights.sum(), 1.):
+            raise ValueError("固定组合必须包含两个正权重分量，且权重和为1")
+        for index, item in enumerate(spec["members"]):
+            if item["options"].get("members"):
+                raise ValueError("不允许嵌套研究组合")
+            child_recipe = deepcopy_recipe(recipe)
+            child_recipe["tasks"][span] = deepcopy_recipe(item["options"])
+            child = train_load(prepared, span, child_recipe, quick, progress)
+            bundle.members.append((float(item["weight"]), child))
+            bundle.diagnostics.extend(dict(d, member_index=index) for d in child.diagnostics)
+        return bundle
+    if spec.get("window_level", False):
+        return train_window_load(prepared, span, recipe, quick, progress)
     cutoff = prepared.index[-1]
     prepared.require_training(cutoff)
     base = build_load_features(prepared, spec.get("feature_set", "base"))
@@ -258,6 +283,10 @@ def train_load(prepared, span, recipe=None, quick=False, progress=None):
         "auxiliary_weight_target":spec.get('aux_weight_target','original'),
         "factor_conversion": "label=y_mw/S;weight=relative_weight*S",
         "auxiliary_target": "generator_all-generator_1;both_labels_required"}
+    if spec.get("representation") == "group_ratio":
+        bundle.recipe["loss_definition"].update(
+            auxiliary_target="generator_1/generator_all; both labels required; both-zero maps to zero",
+            ratio_conversion="relative g1 weight multiplied by true total MW during training only")
     shape_rows = np.ones((len(pos), 96, 3), dtype="float32")
     shape_sources = []
     if "factor" in kinds:
@@ -278,6 +307,11 @@ def train_load(prepared, span, recipe=None, quick=False, progress=None):
         labels = np.full((len(indices), 3), np.nan)
         labels[available, :2] = prepared.labels.iloc[indices[available]].to_numpy()
         labels[:, 2] = labels[:, 1]-labels[:, 0]
+        ratio_mode = spec.get("representation") == "group_ratio"
+        if ratio_mode:
+            with np.errstate(invalid="ignore", divide="ignore"):
+                labels[:, 2] = labels[:, 0]/labels[:, 1]
+            labels[(labels[:, 0] == 0.) & (labels[:, 1] == 0.), 2] = 0.
         target_slots = pd.DatetimeIndex(times).hour*4+pd.DatetimeIndex(times).minute//15
         for ti in targets:
             if ti < 2 and weights[ti] == 0.:
@@ -287,14 +321,17 @@ def train_load(prepared, span, recipe=None, quick=False, progress=None):
             scale = np.ones(len(y))
             if kinds[ti] == "factor":
                 scale = shape_rows[np.tile(np.arange(len(pos)), len(group)), target_slots, ti]
+            original = labels[:, 0] if ti == 2 and ratio_mode else y
+            conversion = np.maximum(labels[:, 1], 1.) if ti == 2 and ratio_mode else 1.
             model, diag = fit_booster(X, y/scale, names, times, loss=spec["loss"], rounds=rounds,
-                seed=spec["seed"], leaves=spec["leaves"], weight_scale=scale, original_y=y,
+                seed=spec["seed"], leaves=spec["leaves"], weight_scale=scale*conversion, original_y=original,
                 decay_days=spec.get("decay_days"), learning_rate=spec.get("learning_rate"),
                 weight_power=spec.get('weight_power',1.),
                 weight_target=labels[:,0] if ti==2 and spec.get('aux_weight_target')=='small' else None)
             bundle.models.append((ti, group, model))
             bundle.features = names
-            bundle.diagnostics.append(dict(diag, target=(*C.TARGETS, "generator_large")[ti],
+            bundle.diagnostics.append(dict(diag, target=("generator_1_fraction" if ti == 2 and ratio_mode
+                else (*C.TARGETS, "generator_large")[ti]),
                 horizons=group, structure=kinds[ti], shape_sources=shape_sources if kinds[ti] == "factor" else [],
                 seconds=round(time.perf_counter()-tick, 3)))
             if progress:
@@ -303,11 +340,93 @@ def train_load(prepared, span, recipe=None, quick=False, progress=None):
     return bundle
 
 
+def train_window_load(prepared, span, recipe, quick=False, progress=None):
+    """以完整未来窗口的相对损失中位水平作标签，降低逐提前量标签噪声。"""
+    if span != "short":
+        raise ValueError("窗口整体水平仅用于已采用的短期分量")
+    spec = load_recipe(recipe, span)
+    cutoff = prepared.index[-1]
+    prepared.require_training(cutoff)
+    base = build_load_features(prepared, spec.get("feature_set", "base"))
+    stride = max(8, spec["stride"]) if quick else spec["stride"]
+    days = min(56, spec["days"]) if quick else spec["days"]
+    rounds = min(60, spec["rounds"]) if quick else spec["rounds"]
+    pos = training_positions(prepared.index, days, stride, spec.get("phase", "fixed"))
+    maximum = 8 if span == "short" else 96
+    bundle = LoadBundle(span, list(range(1, maximum+1)), [], recipe=deepcopy_recipe(recipe), train_end=str(cutoff))
+    bundle.recipe.update(load_version=C.LOAD_VERSION, frozen_profile=profile_pack(prepared, cutoff, spec.get("profile_days", 28)),
+        effective_budget={"quick": bool(quick), "days": days, "stride": stride, "origins": len(pos),
+                          "max_rounds": rounds, "threads": C.CPU_THREADS},
+        loss_definition={"window_level": "weighted_median(y/S); weights=S/relative_denominator**power",
+                         "zero_labels_retained": True, "partial_label_windows_used": False})
+    shapes = np.ones((len(pos), 96, 3), dtype="float32")
+    first_day = prepared.index[pos[0]].normalize()
+    blocks = np.asarray((prepared.index[pos].normalize()-first_day).days//3)
+    sources = []
+    for block in np.unique(blocks):
+        end = first_day+pd.Timedelta(days=int(block)*3)-pd.Timedelta(minutes=15)
+        shapes[blocks == block] = np.asarray(profile_pack(prepared, end, spec.get("profile_days", 28))["shape"])
+        sources.append({"block_start": str(end+pd.Timedelta(minutes=15)), "shape_cutoff": str(end)})
+    targets = required_targets(spec, span)
+    power = spec.get("weight_power", 1.)
+    for group in horizon_groups(span, spec[span]):
+        mid = group[(len(group)-1)//2]
+        X, names = load_horizon_block(prepared, base, pos, [mid], spec.get("feature_set", "base"))
+        ix = pos[:, None]+np.asarray(group)[None, :]
+        available = ix < len(prepared.index)
+        y = np.full((*ix.shape, 3), np.nan)
+        y[available, :2] = prepared.labels.to_numpy()[ix[available]]
+        y[..., 2] = y[..., 1]-y[..., 0]
+        future = pd.DatetimeIndex(np.repeat(prepared.index[pos].to_numpy(), len(group)))+pd.to_timedelta(np.tile(group, len(pos))*15, unit="min")
+        slots = (future.hour*4+future.minute//15).to_numpy().reshape(ix.shape)
+        times = (prepared.index[pos]+pd.Timedelta(minutes=15*max(group))).to_numpy()
+        for ti in targets:
+            raw = y[..., ti]
+            scale = shapes[np.arange(len(pos))[:, None], slots, ti]
+            weight_target = y[..., 0] if ti == 2 and spec.get("aux_weight_target") == "small" else raw
+            complete = np.isfinite(raw).all(axis=1) & np.isfinite(weight_target).all(axis=1)
+            positive = weight_target[np.isfinite(weight_target) & (weight_target > 0.)]
+            zero_denominator = max(float(np.median(positive)) if len(positive) else 1., 1.)
+            denominator = np.where(weight_target == 0., zero_denominator, np.maximum(np.abs(weight_target), 1.))
+            weights = scale/denominator**power
+            levels = raw/scale
+            order = np.argsort(levels, axis=1)
+            ordered_values = np.take_along_axis(levels, order, axis=1)
+            ordered_weights = np.take_along_axis(weights, order, axis=1)
+            total_weight = ordered_weights.sum(axis=1)
+            indices = np.argmax(np.cumsum(ordered_weights, axis=1) >= total_weight[:, None]/2., axis=1)
+            target = ordered_values[np.arange(len(pos)), indices]
+            original = raw.mean(axis=1)
+            target[~complete] = np.nan
+            original[~complete] = np.nan
+            positive_mean = original[np.isfinite(original) & (original > 0.)]
+            mean_zero = max(float(np.median(positive_mean)) if len(positive_mean) else 1., 1.)
+            mean_denominator = np.where(original == 0., mean_zero, np.maximum(np.abs(original), 1.))
+            conversion = total_weight*mean_denominator**power
+            model, diag = fit_booster(X, target, names, times, loss=spec["loss"], rounds=rounds,
+                seed=spec["seed"], leaves=spec["leaves"], original_y=original, weight_scale=conversion,
+                weight_power=power, decay_days=spec.get("decay_days"), learning_rate=spec.get("learning_rate"))
+            bundle.models.append((ti, group, model)); bundle.features = names
+            bundle.diagnostics.append(dict(diag, target=(*C.TARGETS, "generator_large")[ti],
+                horizons=group, structure="window_factor", shape_sources=sources,
+                target_aggregation="full_window_relative_weighted_median"))
+            if progress:
+                progress(f"{span} t={ti} window_factor h={group[0]}..{group[-1]} {diag['rows']}行 {diag['rounds']}轮")
+    return bundle
+
+
+def deepcopy_recipe(recipe):
+    from copy import deepcopy
+    return deepcopy(recipe)
+
+
 def reconcile(values, spec):
     pred = values[..., :2].copy()
     representation = spec.get("representation", "pair")
     if representation == "group_difference":
         pred[..., 0] = values[..., 1]-values[..., 2]
+    elif representation == "group_ratio":
+        pred[..., 0] = values[..., 1]*np.clip(values[..., 2], 0., 1.)
     return pred
 
 
@@ -355,11 +474,14 @@ def predict_components(bundle, prepared, origins):
     for lo in range(0, len(positions), 256):
         pos = positions[lo:lo+256]
         for ti, group, model in bundle.models:
-            X, names = load_horizon_block(prepared,base,pos,group,spec.get('feature_set','base'))
+            actual_group = [group[(len(group)-1)//2]] if kinds[ti] == "window_factor" else group
+            X, names = load_horizon_block(prepared,base,pos,actual_group,spec.get('feature_set','base'))
             if names != bundle.features or model.feature_name() != names:
                 raise ValueError("模型特征顺序不兼容")
-            pred = model.predict(X, num_threads=C.TREE["num_threads"]).reshape(len(group), len(pos)).T
-            if kinds[ti] == "factor":
+            pred = model.predict(X, num_threads=C.TREE["num_threads"]).reshape(len(actual_group), len(pos)).T
+            if kinds[ti] == "window_factor":
+                pred = np.repeat(pred, len(group), axis=1)
+            if kinds[ti] in ("factor", "window_factor"):
                 pred *= np.asarray(pack["shape"])[slots[lo:lo+len(pos)][:, np.array(group)-1], ti]
             values[lo:lo+len(pos), np.array(group)-1, ti] = pred
     weights = np.asarray(spec.get("tree_weights", [1., 1.]))
@@ -374,6 +496,13 @@ def predict_load(bundle, prepared, origins):
         raise ValueError("起报点必须非空、递增且不重复")
     if origins[0] <= pd.Timestamp(bundle.train_end) or not origins.isin(prepared.index).all():
         raise ValueError("请求起报点必须位于训练截止之后且存在于输入网格")
+    if bundle.recipe.get("load_version") != C.LOAD_VERSION:
+        raise ValueError("负荷模型版本不兼容")
+    if bundle.members:
+        if any(child.span != bundle.span or child.train_end != bundle.train_end for _, child in bundle.members):
+            raise ValueError("组合分量跨度或训练截止不一致")
+        result = sum(weight*predict_load(child, prepared, origins) for weight, child in bundle.members)
+        return project_load(result)
     alpha = spec.get("consistency_alpha", 0.) if bundle.span == "short" else 0.
     all_origins = origins
     if alpha:

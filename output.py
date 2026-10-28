@@ -76,20 +76,25 @@ def assert_source(ctx):
 
 
 def _save_load_bundles(root,short,long):
-    records_by_span={}
-    for b in (short,long):
+    def save_one(b,relative):
         if b.recipe.get("load_version")!=C.LOAD_VERSION:
             raise ValueError("负荷模型版本不兼容，禁止静默迁移")
-        folder=root/b.span
+        folder=root/relative
         folder.mkdir(parents=True,exist_ok=True)
         records=[]
         for number,(ti,group,model) in enumerate(b.models):
             name=f"tree_{number:03d}.txt"
             (folder/name).write_text(model.model_to_string(),encoding="utf-8")
-            records.append({"target_index":ti,"horizons":group,"file":f"{b.span}/{name}","sha256":file_hash(folder/name)})
-        records_by_span[b.span]={"features":b.features,"horizons":b.horizons,"recipe":b.recipe,
-                                "train_end":b.train_end,"models":records,"diagnostics":b.diagnostics}
-    return records_by_span
+            records.append({"target_index":ti,"horizons":group,"file":str(relative/name),"sha256":file_hash(folder/name)})
+        meta={"features":b.features,"horizons":b.horizons,"recipe":b.recipe,
+              "train_end":b.train_end,"models":records,"diagnostics":b.diagnostics}
+        if b.members:
+            if b.models:
+                raise ValueError("组合根节点不能混入独立预测树")
+            meta["members"]=[{"weight":weight,"bundle":save_one(child,relative/f"member_{i:02d}")}
+                             for i,(weight,child) in enumerate(b.members)]
+        return meta
+    return {b.span:save_one(b,Path(b.span)) for b in (short,long)}
 
 
 def _load_bundles(root,meta):
@@ -98,9 +103,7 @@ def _load_bundles(root,meta):
     if (meta.get("preprocessing_sha256")!=file_hash(C.CODE_ROOT/"data_cleaning/pipeline.py") or
         meta.get("load_implementation_sha256")!=file_hash(C.CODE_ROOT/"main_s.py")):
         raise ValueError("负荷特征或推理实现已改变，拒绝复用不兼容模型")
-    bundles=[]
-    for span in ("short","long"):
-        m=meta["load"][span]
+    def load_one(span,m,allow_members=True):
         b=LoadBundle(span,m["horizons"],m["features"],recipe=m["recipe"],train_end=m["train_end"],diagnostics=m["diagnostics"])
         expected=list(range(1,9 if span=="short" else 97))
         if b.horizons!=expected or b.recipe.get("load_version")!=C.LOAD_VERSION:
@@ -112,6 +115,24 @@ def _load_bundles(root,meta):
             a=np.asarray(pack.get(key,[]),float)
             if a.shape!=(96,3) or not np.isfinite(a).all() or (key=="shape" and (a<=0.).any()):
                 raise ValueError("负荷画像或形状契约错误")
+        members=m.get("members",[])
+        declared=load_recipe(b.recipe,span).get("members",[])
+        if members or declared:
+            weights=np.asarray([item["weight"] for item in members],float)
+            if (not allow_members or m["models"] or len(members)!=2 or len(declared)!=2 or
+                not np.isfinite(weights).all() or (weights<=0.).any() or not np.isclose(weights.sum(),1.)):
+                raise ValueError("固定组合分量、层级或权重契约错误")
+            for record,rule in zip(members,declared):
+                if record["weight"]!=rule["weight"]:
+                    raise ValueError("组合归档权重与实际配方不一致")
+                child=load_one(span,record["bundle"],False)
+                if child.train_end!=b.train_end:
+                    raise ValueError("组合分量训练截止不一致")
+                child_spec=load_recipe(child.recipe,span)
+                if any(child_spec.get(k)!=v for k,v in rule["options"].items()):
+                    raise ValueError("组合分量的实际配方不一致")
+                b.members.append((record["weight"],child))
+            return b
         covered=np.zeros((len(expected),3),int)
         for record in m["models"]:
             path=(root/record["file"]).resolve()
@@ -129,8 +150,8 @@ def _load_bundles(root,meta):
         needed[required_targets(load_recipe(b.recipe,span),span)]=1
         if not (covered==needed[None,:]).all():
             raise ValueError("模型分量覆盖缺失、冗余或重复")
-        bundles.append(b)
-    return bundles
+        return b
+    return [load_one(span,meta["load"][span]) for span in ("short","long")]
 
 
 def save_load_models(root,short,long,contract=None):
