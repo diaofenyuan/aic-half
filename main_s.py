@@ -223,6 +223,10 @@ def required_targets(spec, span):
     representation = spec.get("representation", "pair")
     if representation == "pair":
         targets = [0, 1]
+    elif representation in ("reference_difference", "reference_ratio"):
+        if not np.array_equal(spec.get("tree_weights", [1., 1.]), [1., 1.]):
+            raise ValueError("参考水平结构必须保留全部预测头")
+        return [0, 1, 2]
     elif representation == "group_difference":
         targets = [1, 2]
     elif representation == "group_ratio":
@@ -283,7 +287,7 @@ def train_load(prepared, span, recipe=None, quick=False, progress=None):
         "auxiliary_weight_target":spec.get('aux_weight_target','original'),
         "factor_conversion": "label=y_mw/S;weight=relative_weight*S",
         "auxiliary_target": "generator_all-generator_1;both_labels_required"}
-    if spec.get("representation") == "group_ratio":
+    if spec.get("representation") in ("group_ratio", "reference_ratio"):
         bundle.recipe["loss_definition"].update(
             auxiliary_target="generator_1/generator_all; both labels required; both-zero maps to zero",
             ratio_conversion="relative g1 weight multiplied by true total MW during training only")
@@ -291,6 +295,10 @@ def train_load(prepared, span, recipe=None, quick=False, progress=None):
         bundle.recipe["loss_definition"].update(
             factor_conversion="label=y_mw/(shape*process_scale);weight=relative_weight*shape*process_scale",
             process_scale="causal four-furnace trailing 4-step median / 1e6; invalid or zero uses identity; raw fuel unchanged")
+    if spec.get("representation") == "reference_ratio":
+        bundle.recipe["loss_definition"].update(
+            reference_heads="0=unscaled_total_reference;1=process_scaled_total;2=small_fraction;small=head0*head2",
+            process_scale_targets=[1],reference_shape_target=1)
     shape_rows = np.ones((len(pos), 96, 3), dtype="float32")
     shape_sources = []
     if "factor" in kinds:
@@ -311,30 +319,35 @@ def train_load(prepared, span, recipe=None, quick=False, progress=None):
         labels = np.full((len(indices), 3), np.nan)
         labels[available, :2] = prepared.labels.iloc[indices[available]].to_numpy()
         labels[:, 2] = labels[:, 1]-labels[:, 0]
-        ratio_mode = spec.get("representation") == "group_ratio"
+        original_small = labels[:, 0].copy()
+        reference_mode = spec.get("representation") in ("reference_difference", "reference_ratio")
+        ratio_mode = spec.get("representation") in ("group_ratio", "reference_ratio")
         if ratio_mode:
             with np.errstate(invalid="ignore", divide="ignore"):
                 labels[:, 2] = labels[:, 0]/labels[:, 1]
             labels[(labels[:, 0] == 0.) & (labels[:, 1] == 0.), 2] = 0.
+        if reference_mode:
+            labels[:, 0] = labels[:, 1]
         target_slots = pd.DatetimeIndex(times).hour*4+pd.DatetimeIndex(times).minute//15
         for ti in targets:
             if ti < 2 and weights[ti] == 0.:
                 continue
             tick = time.perf_counter()
             y = labels[:, ti]
-            scale = np.tile(process_scale(prepared, spec)[pos], len(group)) if not (ti == 2 and ratio_mode) else np.ones(len(y))
+            scale = np.tile(target_process_scale(prepared, spec, ti)[pos], len(group)) if not (ti == 2 and ratio_mode) else np.ones(len(y))
             if kinds[ti] == "factor":
-                scale *= shape_rows[np.tile(np.arange(len(pos)), len(group)), target_slots, ti]
-            original = labels[:, 0] if ti == 2 and ratio_mode else y
+                shape_ti = 1 if reference_mode and ti == 0 else ti
+                scale *= shape_rows[np.tile(np.arange(len(pos)), len(group)), target_slots, shape_ti]
+            original = original_small if ti == 2 and ratio_mode else y
             conversion = np.maximum(labels[:, 1], 1.) if ti == 2 and ratio_mode else 1.
             model, diag = fit_booster(X, y/scale, names, times, loss=spec["loss"], rounds=rounds,
                 seed=spec["seed"], leaves=spec["leaves"], weight_scale=scale*conversion, original_y=original,
                 decay_days=spec.get("decay_days"), learning_rate=spec.get("learning_rate"),
                 weight_power=spec.get('weight_power',1.),
-                weight_target=labels[:,0] if ti==2 and spec.get('aux_weight_target')=='small' else None)
+                weight_target=original_small if ti==2 and spec.get('aux_weight_target')=='small' else None)
             bundle.models.append((ti, group, model))
             bundle.features = names
-            bundle.diagnostics.append(dict(diag, target=("generator_1_fraction" if ti == 2 and ratio_mode
+            bundle.diagnostics.append(dict(diag, target=("generator_all_reference" if reference_mode and ti == 0 else "generator_1_fraction" if ti == 2 and ratio_mode
                 else (*C.TARGETS, "generator_large")[ti]),
                 horizons=group, structure=kinds[ti], shape_sources=shape_sources if kinds[ti] == "factor" else [],
                 seconds=round(time.perf_counter()-tick, 3)))
@@ -363,6 +376,10 @@ def train_window_load(prepared, span, recipe, quick=False, progress=None):
                           "max_rounds": rounds, "threads": C.CPU_THREADS},
         loss_definition={"window_level": "weighted_median(y/scale); weights=scale/relative_denominator**power; scale=shape*causal_process_scale_if_enabled",
                          "zero_labels_retained": True, "partial_label_windows_used": False})
+    if spec.get("representation") == "reference_difference":
+        bundle.recipe["loss_definition"].update(
+            reference_heads="0=unscaled_total_reference;1=process_scaled_total;2=unscaled_large;small=head0-head2",
+            process_scale_targets=[1],reference_shape_target=1)
     shapes = np.ones((len(pos), 96, 3), dtype="float32")
     first_day = prepared.index[pos[0]].normalize()
     blocks = np.asarray((prepared.index[pos].normalize()-first_day).days//3)
@@ -381,13 +398,18 @@ def train_window_load(prepared, span, recipe, quick=False, progress=None):
         y = np.full((*ix.shape, 3), np.nan)
         y[available, :2] = prepared.labels.to_numpy()[ix[available]]
         y[..., 2] = y[..., 1]-y[..., 0]
+        original_small = y[..., 0].copy()
+        reference_mode = spec.get("representation") == "reference_difference"
+        if reference_mode:
+            y[..., 0] = y[..., 1]
         future = pd.DatetimeIndex(np.repeat(prepared.index[pos].to_numpy(), len(group)))+pd.to_timedelta(np.tile(group, len(pos))*15, unit="min")
         slots = (future.hour*4+future.minute//15).to_numpy().reshape(ix.shape)
         times = (prepared.index[pos]+pd.Timedelta(minutes=15*max(group))).to_numpy()
         for ti in targets:
             raw = y[..., ti]
-            scale = shapes[np.arange(len(pos))[:, None], slots, ti]*process_scale(prepared, spec)[pos, None]
-            weight_target = y[..., 0] if ti == 2 and spec.get("aux_weight_target") == "small" else raw
+            shape_ti = 1 if reference_mode and ti == 0 else ti
+            scale = shapes[np.arange(len(pos))[:, None], slots, shape_ti]*target_process_scale(prepared, spec, ti)[pos, None]
+            weight_target = original_small if ti == 2 and spec.get("aux_weight_target") == "small" else raw
             complete = np.isfinite(raw).all(axis=1) & np.isfinite(weight_target).all(axis=1)
             positive = weight_target[np.isfinite(weight_target) & (weight_target > 0.)]
             zero_denominator = max(float(np.median(positive)) if len(positive) else 1., 1.)
@@ -411,12 +433,19 @@ def train_window_load(prepared, span, recipe, quick=False, progress=None):
                 seed=spec["seed"], leaves=spec["leaves"], original_y=original, weight_scale=conversion,
                 weight_power=power, decay_days=spec.get("decay_days"), learning_rate=spec.get("learning_rate"))
             bundle.models.append((ti, group, model)); bundle.features = names
-            bundle.diagnostics.append(dict(diag, target=(*C.TARGETS, "generator_large")[ti],
+            bundle.diagnostics.append(dict(diag, target="generator_all_reference" if reference_mode and ti == 0 else (*C.TARGETS, "generator_large")[ti],
                 horizons=group, structure="window_factor", shape_sources=sources,
                 target_aggregation="full_window_relative_weighted_median"))
             if progress:
                 progress(f"{span} t={ti} window_factor h={group[0]}..{group[-1]} {diag['rows']}行 {diag['rounds']}轮")
     return bundle
+
+
+def target_process_scale(prepared, spec, target):
+    """参考水平和机组组关系保持原尺度，过程修正仅作用于实际全厂目标。"""
+    if spec.get("representation") in ("reference_difference", "reference_ratio") and target != 1:
+        return np.ones(len(prepared.index))
+    return process_scale(prepared, spec)
 
 
 def process_scale(prepared, spec):
@@ -443,6 +472,10 @@ def reconcile(values, spec):
     representation = spec.get("representation", "pair")
     if representation == "group_difference":
         pred[..., 0] = values[..., 1]-values[..., 2]
+    elif representation == "reference_difference":
+        pred[..., 0] = values[..., 0]-values[..., 2]
+    elif representation == "reference_ratio":
+        pred[..., 0] = values[..., 0]*np.clip(values[..., 2], 0., 1.)
     elif representation == "group_ratio":
         pred[..., 0] = values[..., 1]*np.clip(values[..., 2], 0., 1.)
     return pred
@@ -489,6 +522,7 @@ def predict_components(bundle, prepared, origins):
     values = baseline.copy()
     kinds = spec.get("target_kinds", ["direct", "direct"])
     kinds = kinds+["direct"]*(3-len(kinds))
+    reference_mode = spec.get("representation") in ("reference_difference", "reference_ratio")
     for lo in range(0, len(positions), 256):
         pos = positions[lo:lo+256]
         for ti, group, model in bundle.models:
@@ -500,9 +534,10 @@ def predict_components(bundle, prepared, origins):
             if kinds[ti] == "window_factor":
                 pred = np.repeat(pred, len(group), axis=1)
             if kinds[ti] in ("factor", "window_factor"):
-                pred *= np.asarray(pack["shape"])[slots[lo:lo+len(pos)][:, np.array(group)-1], ti]
-            if not (ti == 2 and spec.get("representation") == "group_ratio"):
-                pred *= process_scale(prepared, spec)[pos, None]
+                shape_ti = 1 if reference_mode and ti == 0 else ti
+                pred *= np.asarray(pack["shape"])[slots[lo:lo+len(pos)][:, np.array(group)-1], shape_ti]
+            if not (ti == 2 and spec.get("representation") in ("group_ratio", "reference_ratio")):
+                pred *= target_process_scale(prepared, spec, ti)[pos, None]
             values[lo:lo+len(pos), np.array(group)-1, ti] = pred
     weights = np.asarray(spec.get("tree_weights", [1., 1.]))
     values[..., :2] = values[..., :2]*weights+(1.-weights)*baseline[..., :2]
