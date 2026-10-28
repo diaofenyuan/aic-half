@@ -197,7 +197,11 @@ python main.py run --threads 16
 | `opt --reuse-run <run_dir>` | 复用兼容预测和资源参数，仅重新生成调度 |
 | `doctor` | 检查数据阶段与运行条件 |
 | `self-check` | 检查因果性、数据、模型及优化契约 |
-| `verify --run-dir <run_dir>` | 检查结果覆盖、归档与约束证据 |
+| `verify --run-dir <run_dir>` | 检查结果覆盖、原始输入、全部预测重推理一致性、归档与约束证据 |
+
+`verify` 需要当次原始赛事数据，使用归档模型逐格重算短期和长期预测。输入指纹、
+列序或任一预测单元格不一致都会拒绝归档，重新打包ZIP不能绕过检查。`opt` 复用预测时，
+在生成调度前执行相同核对；核对不训练模型、不替换复用的预测表。
 
 可通过 `python main.py --help` 查看当前参数，`--run-id` 指定新的运行标识。`--quick` 用于精简开发验证，与其他
 实验均须写入 `tmp/tmp_outputs/<experiment_id>/`，不能视为正式完整验收。

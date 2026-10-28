@@ -172,6 +172,29 @@ def _validate_day(day):
         stages["post_execution_unsafe_steps"] = int(unsafe.any(axis=1).sum())
         stages["post_execution_unsafe_steps_by_holder"] = unsafe.sum(axis=0).astype(int).tolist()
     details["holder_boundary_diagnostics"] = stages
+    # 诊断只解释不可行性，不豁免实测初态，也不把偏乐观上界当作可执行轨迹。
+    optional = np.asarray(day.get("optional_caps",[]),float)
+    bound_known = (trajectory_known and checks["resource_shapes"] and optional.shape==(96,2) and
+        np.isfinite(a).all() and np.isfinite(split).all() and np.isfinite(optional).all() and
+        np.isfinite(previous).all() and beta.shape==(3,) and np.isfinite(beta).all() and beta[0]>0. and
+        (optional>=0.).all() and (beta>=0.).all() and (split>=0.).all() and
+        np.allclose(split.sum(axis=1),1.) and checks["initial_state_known"])
+    feasibility={"scope":"local_inferred_resource_model","immutable_anchor_or_bridge_failure":bool(
+        stages["anchor_unsafe_holders"] or stages["pre_command_unsafe_holders"]),
+        "optimistic_bound_available":bool(bound_known),"original_safety_checks_unchanged":True,
+        "official_reconstruction_certified":False}
+    if bound_known:
+        # 允许立即用满其他气种，并忽略逐台启停等更紧约束，得到高炉耗气的合法下界。
+        minimum_power=np.maximum(previous.sum()-C.POLICY["ramp"][1]*np.arange(1,97),0.)
+        minimum_blast=np.maximum((minimum_power-optional@beta[1:])/beta[0],0.)
+        upper_stock=h[0]+C.DT*np.cumsum(a-split*minimum_blast[:,None],axis=0)
+        unavoidable_low=(upper_stock<safe_low).any(axis=1)
+        feasibility.update(minimum_blast_extraction_bound_m3h=minimum_blast.tolist(),
+            optimistic_stock_upper_bound_m3=upper_stock.tolist(),
+            unavoidable_low_steps_lower_bound=int(unavoidable_low.sum()),
+            unavoidable_low_effective_times=[str(day["times"][k]) for k in np.flatnonzero(unavoidable_low)],
+            bound_basis="aggregate_ramp_and_maximum_optional_gas_only; ignored_constraints_make_bound_optimistic")
+    details["feasibility_diagnostics"]=feasibility
     checks["holder_balance"] = False
     checks["bridge_balance"] = False
     checks["overflow_rule"] = False

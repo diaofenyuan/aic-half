@@ -145,6 +145,7 @@ def infer(ctx,quick=False,reuse=None,opt_only=False):
         raise ValueError("测试标签隔离失败")
     view=data.masked_copy(C.TEST_START,C.TEST_END,mask_use=True)
     reload=reload_check(ctx,short,long,resource,view,origins,meta.get("contract"))
+    copied_prediction_check=None
     if opt_only:
         source=Path(reuse)
         for name in ("s_result.csv","l_result.csv"):
@@ -157,6 +158,11 @@ def infer(ctx,quick=False,reuse=None,opt_only=False):
                 table.to_csv(ctx["root"]/name,index=False,float_format="%.6f",encoding="utf-8")
             else:
                 shutil.copy2(source/name,ctx["root"]/name)
+        source_report=output.read_json(source/"报告"/"运行结果.json")
+        copied_prediction_check=output.verify_prediction_replay(ctx["root"],source_report,origins,short,long)
+        if not copied_prediction_check["passed"]:
+            raise ValueError("复用预测与归档模型或原始输入不一致，拒绝生成调度结果："+
+                json.dumps(output.clean_json(copied_prediction_check),ensure_ascii=False))
         ps=pl=None
     else:
         LOG.info("推理：%s个起报点；测试标签不计算本地分数",len(origins))
@@ -189,6 +195,7 @@ def infer(ctx,quick=False,reuse=None,opt_only=False):
             "optimization_grid":[str(schedule.datetime.iloc[0]),str(schedule.datetime.iloc[-1])],
             "quality":data.quality,"data_sources":data.sources,"source":ctx["hashes"],
             "reload_max_abs_difference":reload,"optimization":opt,"daily_plans":days,
+            "prediction_integrity_replay_on_reuse":copied_prediction_check,
             "historical_replay":historical_replay(data,days),"coverage":coverage,
             "field_safety_certified":False,"official_score":None,"duration_seconds":round(time.perf_counter()-tick,3)}
     report['validation_scope']='local_strict_project_model'

@@ -297,6 +297,42 @@ def verify_zip(root):
             "passed":bool(members_ok and crc_ok and csv_equal)}
 
 
+def verify_prediction_replay(root,report,origins,short,long):
+    """逐格重算归档预测，格式合法或重新压缩都不能掩盖手改结果。"""
+    from data_cleaning.pipeline import prepare_data
+    from main_s import predict_load
+    data=prepare_data(include_test=True)
+    source_matches=bool(report.get("data_sources")) and report["data_sources"]==data.sources
+    cutoff_ok=all(bool(b.diagnostics) and pd.Timestamp(b.train_end)<origins[0] and
+        pd.Timestamp(b.train_end)<=pd.Timestamp(C.TRAIN_END) and
+        all(pd.Timestamp(d["max_target_time"])<=pd.Timestamp(b.train_end) for d in b.diagnostics)
+        for b in (short,long))
+    result={"passed":False,"input_sources_match":source_matches,"training_cutoffs_passed":cutoff_ok,
+        "training_performed":False,"scope":"all_exported_forecast_cells","csv_rounding_tolerance":.00000051,
+        "short":{},"long":{}}
+    if not source_matches or not cutoff_ok:
+        return result
+    view=data.masked_copy(origins[0],mask_use=True)
+    view.labels=view.labels.copy();view.labels.loc[origins[0]:]=np.nan
+    for span,bundle,filename in (("short",short,"s_result.csv"),("long",long,"l_result.csv")):
+        expected=prediction_frame(origins,predict_load(bundle,view,origins))
+        actual=pd.read_csv(Path(root)/filename)
+        columns=expected.columns[1:]
+        shape_ok=(list(actual.columns)==list(expected.columns) and len(actual)==len(expected) and
+            pd.DatetimeIndex(pd.to_datetime(actual["datetime"],errors="coerce")).equals(pd.DatetimeIndex(origins)))
+        if shape_ok:
+            difference=np.abs(actual[columns].to_numpy(float)-expected[columns].to_numpy(float))
+            finite=bool(np.isfinite(difference).all())
+            maximum=float(difference.max()) if finite else None
+            mismatch=int((difference>result["csv_rounding_tolerance"]).sum()) if finite else int(difference.size)
+            result[span]={"passed":finite and mismatch==0,"cells":int(difference.size),
+                "mismatched_cells":mismatch,"max_abs_difference_mw":maximum}
+        else:
+            result[span]={"passed":False,"reason":"forecast_columns_rows_or_timestamps_mismatch"}
+    result["passed"]=bool(result["short"]["passed"] and result["long"]["passed"])
+    return result
+
+
 def verify_run(root):
     root=Path(root)
     report=read_json(root/"报告"/"运行结果.json")
@@ -313,18 +349,20 @@ def verify_run(root):
     linked=len(evidence)==len(exported) and np.allclose(exported.iloc[:,1:].to_numpy(),np.array(evidence),atol=.000002,rtol=0.)
     sequence=validate_plan_sequence(days)
     actual=bool(days) and all(x["passed"] for x in constraints) and sequence["passed"]
-    metadata=load_models(root)[-1]
+    short,long,_,metadata=load_models(root)
     fingerprint=report.get("source",{})
     source=(C.ROOT/"tmp_main"/report["run_id"]/"源码") if report["experimental"] else root/"源码"
-    source_ok=all((source/name).is_file() and file_hash(source/name)==digest
+    source_ok=set(fingerprint)==set(C.SOURCE_FILES) and all((source/name).is_file() and file_hash(source/name)==digest
                   for name,digest in fingerprint.items())
     checked=verify_zip(root)
-    return {"archive_passed":bool(files["passed"] and linked and source_ok and checked["passed"]),
+    replay=verify_prediction_replay(root,report,origins,short,long)
+    archive_ok=bool(files["passed"] and linked and source_ok and checked["passed"] and replay["passed"])
+    return {"archive_passed":archive_ok,"prediction_replay":replay,
             "source_passed":source_ok,"zip":checked,
             "constraints_passed":actual,"files":files,"csv_evidence_equal":linked,
             "constraint_scope":"local_strict_project_model","official_holder_validation":"UNVERIFIED",
             "validation_scope":"project_local_strict_validation","official_acceptance_status":"unknown",
             "sequence_validation":sequence,
             "submittable_claim_consistent":bool(report.get("submittable")==(
-                actual and files["passed"] and not report["experimental"] and report.get("full_window",False))),
+                actual and archive_ok and not report["experimental"] and report.get("full_window",False))),
             "models_schema":metadata["schema"],"daily_constraints":constraints}
