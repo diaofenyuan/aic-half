@@ -597,7 +597,9 @@ def naive_profile(prepared, origins, horizons, cutoff):
 
 
 def train_short(prepared, recipe=None, quick=False, progress=None):
-    return train_load(prepared, "short", recipe, quick, progress)
+    bundle=train_load(prepared, "short", recipe, quick, progress)
+    freeze_g1_prior(bundle,prepared)
+    return bundle
 
 
 def predict_short(bundle, prepared, origins):
@@ -829,11 +831,63 @@ def validate_regime_bundle(bundle):
 
 
 
+def g1_prior_pack(prepared,cutoff,policy):
+    """冻结相对绝对损失的槽位加权中位数，零标签按树训练相同规则保留。"""
+    if policy!=C.LOAD_RECIPE["deployment"]["g1_prior"]:
+        raise ValueError("小机组先验配方不兼容")
+    history=prepared.labels.loc[:pd.Timestamp(cutoff),"generator_1"].tail(policy["days"]*96)
+    history=history.where(np.isfinite(history))
+    def weighted_median(values):
+        values=values.dropna().to_numpy(float)
+        if not len(values):return np.nan
+        values=np.sort(values)
+        positive=values[values>0.]
+        zero_denominator=max(float(np.median(positive)) if len(positive) else 1.,1.)
+        weights=1./np.maximum(np.abs(values),1.)
+        weights[values==0.]=1./zero_denominator
+        return float(values[np.searchsorted(np.cumsum(weights),weights.sum()/2.)])
+    fallback=weighted_median(history)
+    if not np.isfinite(fallback):raise ValueError("小机组先验缺少有效历史标签")
+    slots=history.index.hour*4+history.index.minute//15
+    values=history.groupby(slots).apply(weighted_median).reindex(range(96)).fillna(fallback).to_numpy()
+    smoothed=sum(weight*np.roll(values,index-1) for index,weight in enumerate(policy["kernel"]))
+    return {"version":policy["version"],"cutoff":str(pd.Timestamp(cutoff)),"days":policy["days"],
+        "values_mw":smoothed.tolist(),"support":history.groupby(slots).count().reindex(range(96),fill_value=0).tolist(),
+        "max_label_used_at":str(history.dropna().index.max()),"source":"training_prefix_only",
+        "kernel":list(policy["kernel"]),"zero_labels_retained":True,
+        "loss":"relative_l1; denominator floor 1MW; zero weight uses slot median positive"}
+
+
+def freeze_g1_prior(bundle,prepared):
+    prepared.require_training(bundle.train_end)
+    bundle.recipe["g1_prior"]=g1_prior_pack(prepared,bundle.train_end,bundle.recipe["deployment"]["g1_prior"])
+
+
+def validate_g1_prior(bundle):
+    policy=C.LOAD_RECIPE["deployment"]["g1_prior"]
+    pack=bundle.recipe.get("g1_prior",{})
+    values=np.asarray(pack.get("values_mw",[]),float)
+    support=np.asarray(pack.get("support",[]),float)
+    observed_end=pd.to_datetime(pack.get("max_label_used_at"),errors="coerce")
+    if (bundle.recipe.get("deployment")!=C.LOAD_RECIPE["deployment"] or
+        pack.get("version")!=policy["version"] or pack.get("cutoff")!=bundle.train_end or
+        pack.get("days")!=policy["days"] or pack.get("kernel")!=policy["kernel"] or
+        pack.get("source")!="training_prefix_only" or pack.get("zero_labels_retained") is not True or
+        values.shape!=(96,) or not np.isfinite(values).all() or (values<0.).any() or
+        support.shape!=(96,) or not np.isfinite(support).all() or (support<0.).any() or
+        (support>policy["days"]).any() or not np.array_equal(support,np.floor(support)) or support.sum()==0. or
+        pd.isna(observed_end) or observed_end>pd.Timestamp(bundle.train_end)):
+        raise ValueError("小机组冻结先验来源、时间或数值契约错误")
+
+
 def validate_deployment_pair(short,long):
-    expected={"version":"short_level_v1","ratio_bounds":[.5,1.5]}
+    expected=C.LOAD_RECIPE["deployment"]
     if (short.span!="short" or long.span!="long" or short.train_end!=long.train_end or
         short.recipe.get("deployment")!=expected or long.recipe.get("deployment")!=expected):
         raise ValueError("长短期部署配方、跨度或训练截止不一致")
+    for bundle in (short,long):validate_g1_prior(bundle)
+    if short.recipe["g1_prior"]!=long.recipe["g1_prior"]:
+        raise ValueError("相同训练截止的小机组先验不一致")
 
 
 def align_long_level(long_pred,short_pred):
@@ -856,4 +910,21 @@ def predict_deployed(short,long,prepared,origins):
     validate_deployment_pair(short,long)
     ps=predict_short(short,prepared,origins)
     pl=predict_load(long,prepared,origins)
-    return ps,align_long_level(pl,ps)
+    aligned=align_long_level(pl,ps)
+    return regularize_g1(ps,short,origins),regularize_g1(aligned,long,origins)
+
+
+def regularize_g1(pred,bundle,origins):
+    """只约束不稳定的组间分配，保留全厂预测及其水平联动结果。"""
+    validate_g1_prior(bundle)
+    out=np.asarray(pred,float).copy();origins=pd.DatetimeIndex(origins)
+    if (out.shape!=(len(origins),len(bundle.horizons),2) or not np.isfinite(out).all() or
+        origins.empty or origins[0]<=pd.Timestamp(bundle.train_end)):
+        raise ValueError("小机组正则化输入的形状、时间或数值错误")
+    slots=np.stack([(origins+pd.Timedelta(minutes=15*h)).hour*4+
+                    (origins+pd.Timedelta(minutes=15*h)).minute//15 for h in bundle.horizons],axis=1)
+    prior=np.asarray(bundle.recipe["g1_prior"]["values_mw"])[slots]
+    strength=bundle.recipe["deployment"]["g1_prior"]["strength"]
+    small=(1.-strength)*out[...,0]+strength*prior
+    out[...,0]=np.clip(small,np.maximum(0.,out[...,1]-sum(C.UNITS[4:])),np.minimum(sum(C.UNITS[:4]),out[...,1]))
+    return out

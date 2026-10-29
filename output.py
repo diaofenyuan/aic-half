@@ -303,17 +303,21 @@ def verify_zip(root):
 def verify_prediction_replay(root,report,origins,short,long):
     """逐格重算归档预测，格式合法或重新压缩都不能掩盖手改结果。"""
     from data_cleaning.pipeline import prepare_data
-    from main_s import predict_deployed
+    from main_s import predict_deployed,g1_prior_pack
     data=prepare_data(include_test=True)
     source_matches=bool(report.get("data_sources")) and report["data_sources"]==data.sources
     cutoff_ok=all(bool(b.diagnostics) and pd.Timestamp(b.train_end)<origins[0] and
         pd.Timestamp(b.train_end)<=pd.Timestamp(C.TRAIN_END) and
         all(pd.Timestamp(d["max_target_time"])<=pd.Timestamp(b.train_end) for d in b.diagnostics)
         for b in (short,long))
+    prior_ok=bool(source_matches and cutoff_ok and all(
+        b.recipe.get("g1_prior")==g1_prior_pack(data,b.train_end,b.recipe["deployment"]["g1_prior"])
+        for b in (short,long)))
     result={"passed":False,"input_sources_match":source_matches,"training_cutoffs_passed":cutoff_ok,
+        "g1_prior_reconstructed_from_raw_training_labels":prior_ok,
         "training_performed":False,"scope":"all_exported_forecast_cells","csv_rounding_tolerance":.00000051,
         "short":{},"long":{}}
-    if not source_matches or not cutoff_ok:
+    if not source_matches or not cutoff_ok or not prior_ok:
         return result
     view=data.masked_copy(origins[0],mask_use=True)
     view.labels=view.labels.copy();view.labels.loc[origins[0]:]=np.nan
