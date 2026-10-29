@@ -15,7 +15,8 @@ import main_opt
 import output
 from data_cleaning.pipeline import prepare_data, build_features
 from data_cleaning.quality import (truth_cube, score_load, score_horizons, validate_day,
-                                   validate_result_files, historical_replay, project_load, audit_resource_forecasts)
+                                   validate_result_files, historical_replay, project_load, audit_resource_forecasts,
+                                   full_window_coverage)
 
 LOG=logging.getLogger("aic-half")
 
@@ -188,7 +189,7 @@ def infer(ctx,quick=False,reuse=None,opt_only=False):
     coverage=validate_result_files(ctx["root"],origins,schedule.datetime)
     if not coverage["passed"]:
         raise ValueError("三表导出契约未通过："+json.dumps(coverage,ensure_ascii=False))
-    full=len(origins)==2016 and len(schedule)==2016 and len(days)==21
+    full=full_window_coverage(origins,schedule.datetime,days)["actual_full_window"]
     passed=bool(full and not ctx["experimental"] and coverage["passed"] and opt["constraint_validation_passed"])
     report={"run_id":ctx["run_id"],"schema":C.SCHEMA,"mode":"opt" if opt_only else "infer",
             "status":"COMPLETE" if passed else "COMPLETE_WITH_CONSTRAINT_FAILURES" if not opt["constraint_validation_passed"] else "EXPERIMENT_COMPLETE",

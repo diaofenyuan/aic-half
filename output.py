@@ -13,7 +13,7 @@ import config as C
 from main_s import LoadBundle, load_recipe, required_targets, validate_regime_bundle, validate_deployment_pair
 from main_opt import ResourceBundle
 from data_cleaning.pipeline import file_hash
-from data_cleaning.quality import validate_result_files, validate_day, validate_plan_sequence
+from data_cleaning.quality import validate_result_files, validate_day, validate_plan_sequence, full_window_coverage
 
 
 def clean_json(value):
@@ -344,6 +344,8 @@ def verify_run(root):
     effective=pd.date_range(report["optimization_grid"][0],report["optimization_grid"][1],freq="15min")
     files=validate_result_files(root,origins,effective)
     days=report.get("daily_plans",[])
+    window=full_window_coverage(origins,effective,days)
+    window_claim_ok=bool(report.get("full_window") is window["actual_full_window"])
     constraints=[validate_day(d) for d in days]
     exported=pd.read_csv(root/"opt_result.csv")
     evidence=[]
@@ -360,13 +362,14 @@ def verify_run(root):
                   for name,digest in fingerprint.items())
     checked=verify_zip(root)
     replay=verify_prediction_replay(root,report,origins,short,long)
-    archive_ok=bool(files["passed"] and linked and source_ok and checked["passed"] and replay["passed"])
+    archive_ok=bool(files["passed"] and linked and source_ok and checked["passed"] and replay["passed"] and window_claim_ok)
     return {"archive_passed":archive_ok,"prediction_replay":replay,
             "source_passed":source_ok,"zip":checked,
             "constraints_passed":actual,"files":files,"csv_evidence_equal":linked,
             "constraint_scope":"local_strict_project_model","official_holder_validation":"UNVERIFIED",
             "validation_scope":"project_local_strict_validation","official_acceptance_status":"unknown",
             "sequence_validation":sequence,
+            "full_window_coverage":window,"full_window_claim_consistent":window_claim_ok,
             "submittable_claim_consistent":bool(report.get("submittable")==(
-                actual and archive_ok and not report["experimental"] and report.get("full_window",False))),
+                actual and archive_ok and not report["experimental"] and window["actual_full_window"])),
             "models_schema":metadata["schema"],"daily_constraints":constraints}

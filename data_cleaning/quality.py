@@ -366,12 +366,13 @@ def validate_day(day):
 
 def validate_plan_sequence(days):
     """直接核对发布序列和跨日初态，不信任各日自行声明的上一条指令。"""
-    checks={"daily_publication_grid":False,"effective_grid":False,"previous_power_link":True,
+    checks={"daily_publication_grid":False,"publication_at_0700":False,"effective_grid":False,"previous_power_link":True,
             "previous_gas_link":True,"stock_reset_link":True}
     try:
         if not days:
             return {"passed":False,"checks":checks}
         issues=pd.DatetimeIndex([d["issued_at"] for d in days])
+        checks["publication_at_0700"]=bool(issues.equals(issues.normalize()+pd.Timedelta(hours=7)))
         checks["daily_publication_grid"]=bool(issues.equals(pd.date_range(issues[0],periods=len(days),freq="1D")))
         times=pd.DatetimeIndex([t for d in days for t in d["times"]])
         expected=pd.date_range(issues[0]+pd.Timedelta(minutes=15),periods=len(days)*96,freq="15min")
@@ -387,6 +388,24 @@ def validate_plan_sequence(days):
         return {"passed":bool(all(checks.values())),"checks":checks}
     except (KeyError,ValueError,TypeError,IndexError) as exc:
         return {"passed":False,"checks":checks,"problem":"INVALID_SEQUENCE:"+str(exc)}
+
+
+def full_window_coverage(origins,effective,days):
+    """正式范围由配置和已发布轨迹确定，不能用报告自报的完整标志代替。"""
+    expected_origins=pd.date_range(C.TEST_START,C.TEST_END,freq="15min")
+    expected_issues=pd.date_range(pd.Timestamp(C.TEST_START).normalize()+pd.Timedelta(hours=7),
+        pd.Timestamp(C.TEST_END).normalize()+pd.Timedelta(hours=7),freq="1D")
+    expected_effective=pd.date_range(expected_issues[0]+pd.Timedelta(minutes=15),
+        expected_issues[-1]+pd.Timedelta(days=1),freq="15min")
+    issues=pd.DatetimeIndex([d["issued_at"] for d in days])
+    times=pd.DatetimeIndex([t for d in days for t in d["times"]])
+    checks={"prediction_grid":pd.DatetimeIndex(origins).equals(expected_origins),
+        "optimization_grid":pd.DatetimeIndex(effective).equals(expected_effective),
+        "daily_publication_grid":issues.equals(expected_issues),
+        "trajectory_effective_grid":times.equals(expected_effective)}
+    return {"actual_full_window":bool(all(checks.values())),"checks":checks,
+        "expected_prediction_rows":len(expected_origins),"expected_optimization_rows":len(expected_effective),
+        "expected_daily_publications":len(expected_issues)}
 
 
 def audit_resource_forecasts(days, truth):
