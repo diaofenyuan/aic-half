@@ -22,13 +22,14 @@ class LoadBundle:
 
 def fit_booster(X, y, names, times, *, loss="l1", rounds=320, seed=2026, leaves=31,
                 weight_scale=None, original_y=None, decay_days=None, learning_rate=None,
-                weight_power=1., weight_target=None):
+                weight_power=1., weight_target=None, state_target=None):
     valid = np.isfinite(y)
     X, y, times = X[valid], y[valid], np.asarray(times)[valid]
     if len(y) < 100:
         raise ValueError(f"有效训练标签不足：{len(y)}")
     observed = y if original_y is None else np.asarray(original_y)[valid]
     weight = np.ones(len(y), dtype=float)
+    state_balance = None
     if loss == "relative_l1":
         # 1MW以下分母截断仅用于训练稳定；评分仍使用非零真值的原始分母。
         denominator = observed if weight_target is None else np.asarray(weight_target)[valid]
@@ -41,6 +42,22 @@ def fit_booster(X, y, names, times, *, loss="l1", rounds=320, seed=2026, leaves=
             # 近期权重仅改变已选负荷配方的训练损失，资源模型默认不启用。
             age=(pd.Timestamp(times.max())-pd.DatetimeIndex(times)).total_seconds()/86400.
             weight *= np.exp2(-np.asarray(age)/decay_days)
+        if state_target is not None:
+            # 仅用内层训练期统计状态频次，限制稀少状态的放大倍数，避免借用留出标签。
+            state = np.asarray(state_target)[valid]
+            ids = np.digitize(state, [50., 100., 150.])
+            inner_end = pd.Timestamp(times.max())-pd.Timedelta(days=8)
+            available = np.isfinite(state) & (times < inner_end.to_datetime64())
+            counts = np.bincount(ids[available], minlength=4)
+            largest = max(int(counts.max()), 1)
+            factors = np.ones(4)
+            for i in range(4):
+                if counts[i]:
+                    factors[i] = min(2., np.sqrt(largest/counts[i]))
+            weight *= np.where(np.isfinite(state), factors[ids], 1.)
+            state_balance = {"edges_mw": [50., 100., 150.], "counts": counts.tolist(),
+                             "factors": factors.tolist(), "max_factor": 2.,
+                             "count_before": str(inner_end), "missing_state_factor": 1.}
         weight /= weight.mean()
     split = pd.Timestamp(times.max()) - pd.Timedelta(days=7)
     valid_rows = times >= split.to_datetime64()
@@ -63,6 +80,7 @@ def fit_booster(X, y, names, times, *, loss="l1", rounds=320, seed=2026, leaves=
     return final, {"rows": len(y), "rounds": best_round, "loss": loss,
                    "learning_rate": params["learning_rate"], "num_leaves": params["num_leaves"],
                    "weight_power":weight_power,"weight_target":"original" if weight_target is None else "score_aligned_auxiliary",
+                   "state_balance": state_balance,
                    "zero_label_rows": int((observed == 0.).sum()),
                    "min_target_time": str(pd.Timestamp(times.min())),
                    "max_target_time": str(pd.Timestamp(times.max())), "inner_split": str(split)}
@@ -180,25 +198,50 @@ def load_horizon_block(prepared,base,positions,horizons,feature_set):
 def horizon_groups(span, kind):
     if kind == "shared":
         return [list(range(1, 9 if span == "short" else 97))]
-    if span == "long" and kind == "segmented":
+    if kind == "segmented":
+        if span == "short":
+            # 短期近端与远端的误差结构和最优复杂度不同；实测两段优于共享、单步优于两段
+            # （六窗 short macro 87.36→87.40→88.17，long 同步 87.58→87.68→87.91，
+            #  w6 爬升窗 gall +0.99；代价是 w1/w4 的 g1 各 -0.5 左右）。
+            return [[h] for h in range(1, 9)]
         return [list(range(1, 9)), list(range(9, 33)), list(range(33, 97))]
     raise ValueError(f"不支持的提前量结构：{span}/{kind}")
 
 
-def profile_pack(prepared, cutoff, days=28):
+def _slot_profile(prepared, cutoff, days):
+    """按日内时段取中位数，得到画像取值与整体水平。"""
     history = prepared.labels.loc[:cutoff].tail(days*96)
     large = history.generator_all-history.generator_1
     labels = history.assign(generator_large=large)
     slots = labels.index.hour*4+labels.index.minute//15
     fallback = labels.median()
     values = labels.groupby(slots).median().reindex(range(96)).fillna(fallback)
-    if not np.isfinite(values.to_numpy()).all():
+    return labels, values.to_numpy(), fallback.to_numpy()
+
+
+def _slot_smooth(values, kernel):
+    """环形平滑 96 个日内时段，降低小样本中位数的形状噪声，并保持整体水平不变。"""
+    v = np.asarray(values, float)
+    k = np.asarray(kernel, float)
+    pad = len(k)//2
+    padded = np.concatenate((v[-pad:], v, v[:pad]))
+    smoothed = np.apply_along_axis(lambda c: np.convolve(c, k, mode="valid"), 0, padded)
+    total = smoothed.sum(axis=0)
+    return np.where(total > 0., smoothed*(v.sum(axis=0)/np.where(total > 0., total, 1.))[None, :], smoothed)
+
+
+def profile_pack(prepared, cutoff, days=28, smooth=None):
+    """画像包：最近 days 天的日内时段中位数与整体水平。"""
+    labels, values, levels = _slot_profile(prepared, cutoff, days)
+    if smooth:
+        values = _slot_smooth(values, smooth)
+    if not np.isfinite(values).all():
         raise ValueError("历史画像缺少有效支持")
-    levels = fallback.to_numpy()
     enabled = levels > 1.
     shape = np.ones((96, 3))
-    shape[:, enabled] = np.maximum(values.to_numpy()[:, enabled]/levels[enabled], .01)
-    return {"values": values.to_numpy().tolist(), "shape": shape.tolist(),
+    shape[:, enabled] = np.maximum(values[:, enabled]/levels[enabled], .01)
+    slots = labels.index.hour*4+labels.index.minute//15
+    return {"values": values.tolist(), "shape": shape.tolist(),
             "shape_enabled": enabled.tolist(), "support": labels.groupby(slots).count().reindex(range(96), fill_value=0).to_numpy().tolist(),
             "cutoff": str(pd.Timestamp(cutoff)), "days": days,
             "source": "training_prefix_only", "zero_labels_retained": True}
@@ -245,7 +288,7 @@ def train_load(prepared, span, recipe=None, quick=False, progress=None):
     bundle.recipe = dict(recipe, effective_budget={"quick": bool(quick), "days": days,
         "stride": stride, "origins": len(pos), "max_rounds": rounds, "threads": C.CPU_THREADS,
         "first_origin": str(prepared.index[pos[0]]), "last_origin": str(prepared.index[pos[-1]])})
-    pack = profile_pack(prepared, cutoff, spec.get("profile_days", 28))
+    pack = profile_pack(prepared, cutoff, spec.get("profile_days", 28), spec.get("profile_smooth"))
     bundle.recipe["frozen_profile"] = pack
     kinds = spec.get("target_kinds", ["direct", "direct"])
     kinds = kinds + ["direct"]*(3-len(kinds))
@@ -266,7 +309,7 @@ def train_load(prepared, span, recipe=None, quick=False, progress=None):
         for block in np.unique(block_ids):
             rows = block_ids == block
             end = first_day+pd.Timedelta(days=int(block)*3)-pd.Timedelta(minutes=15)
-            block_pack = profile_pack(prepared, end, spec.get("profile_days", 28))
+            block_pack = profile_pack(prepared, end, spec.get("profile_days", 28), spec.get("profile_smooth"))
             shape_rows[rows] = np.asarray(block_pack["shape"], "float32")
             shape_sources.append({"block_start": str(end+pd.Timedelta(minutes=15)), "shape_cutoff": str(end)})
     for group in horizon_groups(span, spec[span]):
@@ -291,7 +334,8 @@ def train_load(prepared, span, recipe=None, quick=False, progress=None):
                 seed=spec["seed"], leaves=spec["leaves"], weight_scale=scale, original_y=y,
                 decay_days=spec.get("decay_days"), learning_rate=spec.get("learning_rate"),
                 weight_power=spec.get('weight_power',1.),
-                weight_target=labels[:,0] if ti==2 and spec.get('aux_weight_target')=='small' else None)
+                weight_target=labels[:,0] if ti==2 and spec.get('aux_weight_target')=='small' else None,
+                state_target=labels[:,0] if span=='short' else None)
             bundle.models.append((ti, group, model))
             bundle.features = names
             bundle.diagnostics.append(dict(diag, target=(*C.TARGETS, "generator_large")[ti],
@@ -364,6 +408,11 @@ def predict_components(bundle, prepared, origins):
             values[lo:lo+len(pos), np.array(group)-1, ti] = pred
     weights = np.asarray(spec.get("tree_weights", [1., 1.]))
     values[..., :2] = values[..., :2]*weights+(1.-weights)*baseline[..., :2]
+    scale = spec.get("baseline_scale")
+    if scale is not None:
+        # 1-MAPE 对高估的惩罚重于低估：按赛题指标形状给冻结画像做轻微水平修正，
+        # 系数在四窗历史验证上确定，只作用于该任务的输出，不改变训练与特征。
+        values[..., :2] = values[..., :2]*np.asarray(scale, float)[:2]
     return values
 
 
@@ -408,3 +457,119 @@ def predict_short(bundle, prepared, origins):
     if bundle.span != "short":
         raise ValueError("短期入口拒绝长期模型")
     return predict_load(bundle, prepared, origins)
+
+
+def holder_anchor_factor(prepared, origins, cfg):
+    """柜位平衡反推的发电水平相对 28 天同刻中位的比值（有界锚定系数）。
+
+    只用起报点及以前已观测的发生量、热风炉、高炉用户、混合量与双柜变化：
+    单柜净变化是已发生的观测量，不读未来。双柜任一缺测时比值不可用，回退为 1
+    （不锚定、不插补）。系数只做有界缩放，不改变形状，也不写回任何输入。
+    """
+    if not cfg:
+        return None
+    f = prepared.frame
+    blast_cols = [f"gas_blast_furnace_{i}" for i in range(1, 6)]
+    heater_cols = [f"gas_air_heater_{i}" for i in range(1, 6)]
+    user_cols = [f"gas_user_blast_furnace_user{i}" for i in range(1, 5)]
+    blast = f[blast_cols].sum(axis=1, min_count=len(blast_cols))
+    heater = f[heater_cols].sum(axis=1, min_count=len(heater_cols))
+    user = f[user_cols].sum(axis=1, min_count=len(user_cols))
+    mixed = f["gas_into_gas_mixed_blast_furnace"]
+    hold = f[list(C.HOLDERS)].sum(axis=1, min_count=2)
+    # 部分发生量不是完整供气；当前或上一柜位缺失时不能沿用滚动窗口中的旧值缩放。
+    valid = blast.notna() & heater.notna() & user.notna() & mixed.notna() & hold.notna() & hold.shift(1).notna()
+    balance = (blast-heater-user-mixed-hold.diff()/C.DT).where(valid)
+    implied = balance.rolling(int(cfg.get("smooth", 16)), min_periods=4).mean().where(valid)
+    ref = implied.rolling(int(cfg.get("days", 28))*96, min_periods=96).median()
+    ratio = (implied/ref).reindex(pd.DatetimeIndex(origins)).to_numpy(float)
+    ratio = np.where(np.isfinite(ratio), ratio, 1.)
+    return np.clip(ratio, float(cfg["lo"]), float(cfg["hi"]))**float(cfg["gamma"])
+
+
+def predict_deployed(short, long, prepared, origins, recipe=None):
+    """正式推理、回测和自动选优共用同一出口，防止漏评已采用的后处理。"""
+    if long.span != "long":
+        raise ValueError("长期入口拒绝短期模型")
+    recipe = C.LOAD_RECIPE if recipe is None else recipe
+    ps = predict_short(short, prepared, origins)
+    pl = predict_load(long, prepared, origins)
+    spec_l = recipe.get("tasks", {}).get("long", {})
+    spec_s = recipe.get("tasks", {}).get("short", {})
+    pl = align_long_level(pl, ps, spec_l.get("short_level_alpha", 0.))
+    ps = shrink_short_to_long(ps, pl, spec_s.get("shrink_to_long", 0.))
+    guard = short.recipe.get("tasks", {}).get("short", {}).get("profile_upper_guard")
+    if not isinstance(guard, dict) or not (guard.get("ratio", 0.) >= 1. and 0. < guard.get("scale", 0.) <= 1.):
+        raise ValueError("短期模型缺少兼容的画像上沿校正参数")
+    origin_index = pd.DatetimeIndex(origins)
+    slots = np.stack([(origin_index + pd.Timedelta(minutes=15*h)).hour*4 +
+                      (origin_index + pd.Timedelta(minutes=15*h)).minute//15
+                      for h in range(1, 9)], axis=1)
+    reference = np.asarray(short.recipe["frozen_profile"]["values"])[slots, 1]
+    # 画像冻结于训练截止前；仅降低明显高于同槽画像的短期预测。
+    ps = ps * np.where((reference > 0.) & (ps[:, :, 1] > guard["ratio"]*reference), guard["scale"], 1.)[:, :, None]
+    # 柜位平衡锚：把当日“实际发出去的气”落实成水平系数，抑制整日状态级偏移。
+    factor = holder_anchor_factor(prepared, origins, recipe.get("holder_anchor"))
+    if factor is not None:
+        cap_small, cap_large = float(sum(C.UNITS[:4])), float(sum(C.UNITS[4:]))
+        for frame in (ps, pl):
+            frame *= factor[:, None, None]
+            frame[:, :, 0] = np.clip(frame[:, :, 0], 0., cap_small)
+            frame[:, :, 1] = np.clip(frame[:, :, 1], frame[:, :, 0], frame[:, :, 0]+cap_large)
+    return reconcile_groups(ps), pl
+
+
+def shrink_short_to_long(short_pred, long_pred, weight):
+    """把短期预测按提前量向长期（同起报点、同目标时刻）线性收缩。
+
+    短期 8 步在远端已明显衰减（四窗实测 h=7、8 的误差贡献最大），而长期在同一起报点
+    给出的是更稳的"形状×水平"估计；按 h=1..8 递增的权重做凸组合，相当于给短期
+    远端加一个先验。权重为 0 时保持原状，为 1 时 h=8 完全采用长期值。
+    """
+    if not weight or weight <= 0.:
+        return short_pred
+    short=np.asarray(short_pred,float)
+    long=np.asarray(long_pred,float)
+    steps=short.shape[1]
+    if long.shape[0]!=short.shape[0] or long.shape[2]!=short.shape[2] or long.shape[1]<steps:
+        raise ValueError("短期与长期预测的起报点或目标维度不一致")
+    ramp=np.linspace(float(weight)/steps,float(weight),steps)[None,:,None]
+    return reconcile_groups(short*(1.-ramp)+long[:,:steps,:]*ramp)
+
+
+def reconcile_groups(pred):
+    """把预测约束回机组容量关系：小机组 0~200MW，总负荷不低于小机组且不超 +240MW。"""
+    out=np.asarray(pred,float).copy()
+    small=float(sum(C.UNITS[:4]))
+    large=float(sum(C.UNITS[4:]))
+    out[:, :, 0]=np.clip(out[:, :, 0],0.,small)
+    out[:, :, 1]=np.clip(out[:, :, 1],out[:, :, 0],out[:, :, 0]+large)
+    return out
+
+
+def align_long_level(long_pred, short_pred, alpha):
+    """用短期模型的当前水平校正长期 generator_all 的水平。
+
+    长期是"形状×水平"结构，水平由 GBDT 从起报点特征给出；遇到供气或机组结构
+    变化时反应滞后（四窗实测 w4 的长期 gall 比真值低约 30MW）。短期模型在同一
+    因果边界内直接看到起报点前的气量与机组状态，因此用它的 8 步均值与长期 96 步
+    均值之比做一次有界混合：alpha=0 保持原状，alpha=1 完全改用短期水平。
+    只作用于 generator_all；generator_1 的冻结画像水平单独由 baseline_scale 控制。
+    """
+    if not alpha or alpha <= 0.:
+        return long_pred
+    short=np.asarray(short_pred,float)
+    out=np.asarray(long_pred,float).copy()
+    if short.shape[0]!=out.shape[0] or short.shape[2]!=out.shape[2]:
+        raise ValueError("短期与长期预测的起报点或目标维度不一致")
+    reference=out[:,:,1].mean(axis=1)
+    current=short[:,:,1].mean(axis=1)
+    ratio=np.clip(current/np.maximum(reference,1e-6),.5,1.5)
+    out[:,:,1]*=(1.+float(alpha)*(ratio-1.))[:,None]
+    # 缩放后必须仍满足机组容量与"总负荷不低于小机组负荷、大机组不超过 240MW"的
+    # 硬关系，否则三表导出契约会拒绝（l_result 的 capacity_relations）。
+    cap_small=float(sum(C.UNITS[:4]))
+    cap_large=float(sum(C.UNITS[4:]))
+    out[:,:,0]=np.clip(out[:,:,0],0.,cap_small)
+    out[:,:,1]=np.clip(out[:,:,1],out[:,:,0],out[:,:,0]+cap_large)
+    return out

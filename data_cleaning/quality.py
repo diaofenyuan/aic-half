@@ -34,10 +34,16 @@ def truth_cube(data, origins, horizons):
 
 
 def score_load(pred, truth):
+    pred, truth = np.asarray(pred, float), np.asarray(truth, float)
+    if pred.shape != truth.shape or pred.ndim == 0 or pred.shape[-1] != len(C.TARGETS):
+        raise ValueError("负荷预测与真值形状不一致")
+    # 缺失真值不参与评分，但预测缺失不能通过缩小分母制造虚假提升。
+    if not np.isfinite(pred).all():
+        raise ValueError("负荷预测包含非有限值，拒绝评分")
     out, scores = {}, []
     for i, name in enumerate(C.TARGETS):
-        p, y = np.asarray(pred)[..., i], np.asarray(truth)[..., i]
-        finite = np.isfinite(y) & np.isfinite(p)
+        p, y = pred[..., i], truth[..., i]
+        finite = np.isfinite(y)
         valid, zero = finite & (y > 0.), finite & (y == 0.)
         score = float(100.*(1.-np.mean(np.abs(p[valid]-y[valid])/y[valid]))) if valid.any() else None
         out[name] = {"score": score, "nonzero_cells": int(valid.sum()), "zero_cells": int(zero.sum()),
