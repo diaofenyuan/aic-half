@@ -20,6 +20,13 @@ from data_cleaning.quality import (truth_cube, score_load, score_horizons, valid
 LOG=logging.getLogger("aic-half")
 
 
+def prediction_view(data,start):
+    """预测输入与评分标签分离，两个标签入口都整段遮挡。"""
+    view=data.masked_copy(start,mask_use=True)
+    view.labels=data.labels.copy();view.labels.loc[pd.Timestamp(start):]=np.nan
+    return view
+
+
 def setup_log(ctx):
     LOG.handlers.clear()
     LOG.setLevel(logging.INFO)
@@ -35,9 +42,8 @@ def evaluate_load(data,origins,recipe,quick=False):
     train.require_training(start-pd.Timedelta(minutes=15))
     short=main_s.train_short(train,recipe,quick,LOG.info)
     long=main_l.train_long(train,recipe,quick,LOG.info)
-    view=data.masked_copy(start,pd.DatetimeIndex(origins)[-1]+pd.Timedelta(days=1),mask_use=True)
-    ps=main_s.predict_short(short,view,origins)
-    pl=main_l.predict_long(long,view,origins)
+    view=prediction_view(data,start)
+    ps,pl=main_s.predict_deployed(short,long,view,origins)
     ys,yl=truth_cube(data,origins,range(1,9)),truth_cube(data,origins,range(1,97))
     ns=main_s.naive_profile(train,origins,range(1,9),train.index[-1])
     nl=main_s.naive_profile(train,origins,range(1,97),train.index[-1])
@@ -57,7 +63,7 @@ def run_backtest(ctx,quick=False):
         short,long,ps,pl,score=evaluate_load(data,origins,C.LOAD_RECIPE,quick)
         train=data.prefix(origins[0]-pd.Timedelta(minutes=15))
         resource=main_opt.fit_resources(train,quick,LOG.info)
-        view=data.masked_copy(origins[0],origins[-1]+pd.Timedelta(days=1),mask_use=True)
+        view=prediction_view(data,origins[0])
         schedule,days,opt=main_opt.optimize_daily(resource,view,origins,quick,LOG.info)
         replay=historical_replay(data,days)
         metrics.append({"fold":spec["name"],**score,"optimization":opt,"historical_replay":replay,
@@ -68,8 +74,8 @@ def run_backtest(ctx,quick=False):
         output.write_results(fold_dir,origins,ps,pl,schedule)
         restored_s,restored_l,_,_=output.load_models(fold_dir)
         probe=origins[::251]
-        reload_error={"short":float(np.max(np.abs(main_s.predict_short(restored_s,view,probe)-ps[::251]))),
-                      "long":float(np.max(np.abs(main_l.predict_long(restored_l,view,probe)-pl[::251])))}
+        rs,rl=main_s.predict_deployed(restored_s,restored_l,view,probe)
+        reload_error={"short":float(np.max(np.abs(rs-ps[::251]))),"long":float(np.max(np.abs(rl-pl[::251])))}
         if max(reload_error.values())>1e-6:
             raise ValueError("历史验证模型重载不一致")
         metrics[-1]["reload_max_difference"]=reload_error
@@ -104,6 +110,11 @@ def reload_check(ctx,short,long,resource,data,origins,training_contract=None):
         differences[name]=float(np.max(np.abs(a-z)))
         if differences[name]>.000001:
             raise ValueError(f"{name}保存重载不一致")
+    before=main_s.predict_deployed(short,long,data,probe)
+    after=main_s.predict_deployed(loaded_s,loaded_l,data,probe)
+    for i,name in enumerate(("deployed_short","deployed_long")):
+        differences[name]=float(np.max(np.abs(before[i]-after[i])))
+        if differences[name]>1e-6:raise ValueError("部署预测保存重载不一致")
     issue=pd.DatetimeIndex(origins)[0].normalize()+pd.Timedelta(hours=7)
     a=main_opt.forecast_resources(resource,data,issue)
     z=main_opt.forecast_resources(loaded_r,data,issue)
@@ -143,7 +154,7 @@ def infer(ctx,quick=False,reuse=None,opt_only=False):
         raise ValueError("正式预测输入覆盖不完整")
     if data.labels.loc[C.TEST_START:C.TEST_END].notna().any().any():
         raise ValueError("测试标签隔离失败")
-    view=data.masked_copy(C.TEST_START,C.TEST_END,mask_use=True)
+    view=prediction_view(data,C.TEST_START)
     reload=reload_check(ctx,short,long,resource,view,origins,meta.get("contract"))
     copied_prediction_check=None
     if opt_only:
@@ -166,8 +177,7 @@ def infer(ctx,quick=False,reuse=None,opt_only=False):
         ps=pl=None
     else:
         LOG.info("推理：%s个起报点；测试标签不计算本地分数",len(origins))
-        ps=main_s.predict_short(short,view,origins)
-        pl=main_l.predict_long(long,view,origins)
+        ps,pl=main_s.predict_deployed(short,long,view,origins)
     schedule,days,opt=main_opt.optimize_daily(resource,view,origins,quick,LOG.info)
     if opt_only:
         s=schedule.copy()
@@ -215,8 +225,16 @@ def self_check(ctx):
     altered.frame.loc[altered.index>t,cols]=0.
     changed=build_features(altered)
     assert np.allclose(base.loc[:t],changed.loc[:t],equal_nan=True)
-    masked=data.masked_copy(data.index[-192],mask_use=True)
+    masked=prediction_view(data,data.index[-192])
     assert np.allclose(base,build_features(masked),equal_nan=True)
+    assert masked.labels.loc[data.index[-192]:].isna().all().all()
+    assert data.labels.loc[data.index[-192]:].notna().any().any()
+    try:
+        score_load(np.array([[[np.nan,1.]]]),np.array([[[1.,1.]]]))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("非有限预测不能通过缩小评分分母获得假增益")
     assert not any("holder" in x or "generator" in x or "load_" in x for x in base.columns)
     sample=project_load(np.array([[-10.,300.],[210.,0.],[100.,150.],[0.,0.]]))
     assert (sample[:,0]>=0).all() and (sample[:,0]<=200).all() and (sample[:,1]>=sample[:,0]).all()
@@ -320,7 +338,7 @@ def self_check(ctx):
     day["stocks"][4,0]+=100.
     assert not validate_day(day)["checks"]["holder_balance"]
     report={"status":"SELF_CHECK_PASSED","features":len(base.columns),"checks":[
-        "future_perturbation","target_and_gas_blackout","no_holder_load_features","capacity_projection",
+        "future_perturbation","target_and_gas_blackout","label_object_blackout","reject_nonfinite_score","no_holder_load_features","capacity_projection",
         "synthetic_milp","independent_balance_mutation","group_refinement_fixed_resources_and_terminal",
         "joint_control_validation","independent_benefit_floor_mutation","initial_boundary_failure_attribution",
         "process_resource_causality_mutation","no_fixed_gas_ratio","local_initial_condition_vs_official_unknown",

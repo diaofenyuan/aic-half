@@ -739,13 +739,13 @@ def choose_regime(scores, minimum):
 
 
 def select_regime(prepared, span, recipe, quick=False, progress=None):
-    """只在训练前缀最后七天回放，整段遮挡回放标签后决定两目标来源。"""
+    """只在训练前缀最后21天回放，整段遮挡回放标签后决定两目标来源。"""
     if span != "short":raise ValueError("当前因果选择只用于独立短期链路")
     policy = deepcopy_recipe(load_recipe(recipe,span)["causal_selector"])
-    if policy.get("version") != "prefix7d_targets_v1" or policy.get("history_days") != 7 or set(policy["experts"]) != {"core","anchor"}:
+    if policy.get("version") != "prefix21d_targets_v2" or policy.get("history_days") != 21 or set(policy["experts"]) != {"core","anchor"}:
         raise ValueError("因果选择配方不兼容")
     cutoff = prepared.index[-1];prepared.require_training(cutoff)
-    start = cutoff-pd.Timedelta(days=7)+pd.Timedelta(minutes=15)
+    start = cutoff-pd.Timedelta(days=21)+pd.Timedelta(minutes=15)
     train = prepared.prefix(start-pd.Timedelta(minutes=15))
     origins = pd.date_range(start,cutoff,freq="15min")
     view = prepared.masked_copy(start,mask_use=True);view.labels=view.labels.copy();view.labels.loc[start:]=np.nan
@@ -796,13 +796,13 @@ def validate_regime_bundle(bundle):
             raise ValueError("缺少因果目标选择记录")
         return
     policy = selection.get("policy",{})
-    if bundle.span != "short" or selection.get("version") != "prefix7d_targets_v1" or policy.get("version") != selection["version"]:
+    if bundle.span != "short" or selection.get("version") != "prefix21d_targets_v2" or policy.get("version") != selection["version"]:
         raise ValueError("因果选择版本或任务错误")
-    if set(policy.get("experts",{})) != {"core","anchor"} or policy.get("history_days") != 7 or policy.get("min_cells") != 100:
+    if set(policy.get("experts",{})) != {"core","anchor"} or policy.get("history_days") != 21 or policy.get("min_cells") != 100:
         raise ValueError("因果选择策略契约错误")
     cutoff = pd.Timestamp(bundle.train_end);start = pd.Timestamp(selection["inner_start"])
     if (pd.Timestamp(selection["inner_end"]) != cutoff or pd.Timestamp(selection["max_label_used_at"]) > cutoff or
-        start != cutoff-pd.Timedelta(days=7)+pd.Timedelta(minutes=15) or
+        start != cutoff-pd.Timedelta(days=21)+pd.Timedelta(minutes=15) or
         pd.Timestamp(selection["inner_train_end"]) != start-pd.Timedelta(minutes=15) or
         selection.get("outer_targets_used") is not False or selection.get("inner_target_blackout") is not True or
         selection.get("future_targets_past_cutoff_excluded") is not True or
@@ -826,3 +826,34 @@ def validate_regime_bundle(bundle):
         actual = load_recipe(child.recipe,child.span)
         if any(actual.get(k) != v for k,v in policy["experts"][name].items()):
             raise ValueError("因果专家实际配方不一致")
+
+
+
+def validate_deployment_pair(short,long):
+    expected={"version":"short_level_v1","ratio_bounds":[.5,1.5]}
+    if (short.span!="short" or long.span!="long" or short.train_end!=long.train_end or
+        short.recipe.get("deployment")!=expected or long.recipe.get("deployment")!=expected):
+        raise ValueError("长短期部署配方、跨度或训练截止不一致")
+
+
+def align_long_level(long_pred,short_pred):
+    """只校正全厂水平，保留长期形状和小机组预测；所有输入均为同起报点模型输出。"""
+    short=np.asarray(short_pred,float);out=np.asarray(long_pred,float).copy()
+    if (short.ndim!=3 or out.ndim!=3 or short.shape[1:]!=(8,2) or out.shape[1:]!=(96,2) or
+        short.shape[0]!=out.shape[0] or not np.isfinite(short).all() or not np.isfinite(out).all()):
+        raise ValueError("长短期预测形状错误或包含非有限值")
+    reference=out[:,:,1].mean(axis=1)
+    current=short[:,:,1].mean(axis=1)
+    ratio=np.clip(current/np.maximum(reference,1e-6),.5,1.5)
+    out[:,:,1]*=ratio[:,None]
+    # 保留独立的小机组预测，只收敛全厂容量关系，避免用总量校正反向移动小机组。
+    out[:,:,1]=np.clip(out[:,:,1],out[:,:,0],out[:,:,0]+sum(C.UNITS[4:]))
+    return out
+
+
+def predict_deployed(short,long,prepared,origins):
+    """训练验证、正式推理、模型复用及逐格重推理共用同一部署出口。"""
+    validate_deployment_pair(short,long)
+    ps=predict_short(short,prepared,origins)
+    pl=predict_load(long,prepared,origins)
+    return ps,align_long_level(pl,ps)

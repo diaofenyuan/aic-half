@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import lightgbm as lgb
 import config as C
-from main_s import LoadBundle, load_recipe, required_targets, validate_regime_bundle
+from main_s import LoadBundle, load_recipe, required_targets, validate_regime_bundle, validate_deployment_pair
 from main_opt import ResourceBundle
 from data_cleaning.pipeline import file_hash
 from data_cleaning.quality import validate_result_files, validate_day, validate_plan_sequence
@@ -76,6 +76,7 @@ def assert_source(ctx):
 
 
 def _save_load_bundles(root,short,long):
+    validate_deployment_pair(short,long)
     def save_one(b,relative):
         if b.recipe.get("load_version")!=C.LOAD_VERSION:
             raise ValueError("负荷模型版本不兼容，禁止静默迁移")
@@ -163,7 +164,9 @@ def _load_bundles(root,meta):
             raise ValueError("模型分量覆盖缺失、冗余或重复")
         validate_regime_bundle(b)
         return b
-    return [load_one(span,meta["load"][span]) for span in ("short","long")]
+    bundles=[load_one(span,meta["load"][span]) for span in ("short","long")]
+    validate_deployment_pair(*bundles)
+    return bundles
 
 
 def save_load_models(root,short,long,contract=None):
@@ -300,7 +303,7 @@ def verify_zip(root):
 def verify_prediction_replay(root,report,origins,short,long):
     """逐格重算归档预测，格式合法或重新压缩都不能掩盖手改结果。"""
     from data_cleaning.pipeline import prepare_data
-    from main_s import predict_load
+    from main_s import predict_deployed
     data=prepare_data(include_test=True)
     source_matches=bool(report.get("data_sources")) and report["data_sources"]==data.sources
     cutoff_ok=all(bool(b.diagnostics) and pd.Timestamp(b.train_end)<origins[0] and
@@ -314,8 +317,9 @@ def verify_prediction_replay(root,report,origins,short,long):
         return result
     view=data.masked_copy(origins[0],mask_use=True)
     view.labels=view.labels.copy();view.labels.loc[origins[0]:]=np.nan
-    for span,bundle,filename in (("short",short,"s_result.csv"),("long",long,"l_result.csv")):
-        expected=prediction_frame(origins,predict_load(bundle,view,origins))
+    predictions=predict_deployed(short,long,view,origins)
+    for i,(span,filename) in enumerate((("short","s_result.csv"),("long","l_result.csv"))):
+        expected=prediction_frame(origins,predictions[i])
         actual=pd.read_csv(Path(root)/filename)
         columns=expected.columns[1:]
         shape_ok=(list(actual.columns)==list(expected.columns) and len(actual)==len(expected) and
