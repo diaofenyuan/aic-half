@@ -131,8 +131,21 @@ def _validate_day(day):
     checks["finite_dispatch"] = bool(np.isfinite(q).all() and np.isfinite(p).all())
     checks["normal_dispatch_plan"] = not bool(day.get("fallback_used",False))
     checks["initial_state_known"] = day.get("initial_state",{}).get("basis") not in (None,"UNVERIFIED_EXPORT_STATE")
-    if day.get('recovery_export',{}).get('active'):
+    recovery=day.get('recovery_export',{})
+    if recovery.get('active'):
         checks['normal_inventory_plan']=False
+    relaxed=recovery.get('empirical_ramp_relaxed_prefix_steps',0)
+    if relaxed:
+        scenarios=day.get('joint_control',{}).get('ramp_scenarios',[])
+        checks['recovery_export_disclosure']=bool(day.get('fallback_used') is True and recovery.get('active') is True and
+            recovery.get('export_only') is True and recovery.get('terminal_command_fixed') is True and
+            isinstance(relaxed,int) and 0<relaxed<=96 and len(scenarios)>0 and
+            scenarios==recovery.get('original_ramp_scenarios'))
+        terminal=recovery.get('fixed_terminal_command') or {}
+        expected_p=np.asarray(terminal.get('power',[]),float);expected_q=np.asarray(terminal.get('gas',[]),float)
+        checks['recovery_terminal_command']=bool(expected_p.shape==(6,) and expected_q.shape==(3,) and
+            np.isfinite(expected_p).all() and np.isfinite(expected_q).all() and
+            np.allclose(p[-1],expected_p,atol=1e-6,rtol=0.) and np.allclose(q[-1],expected_q,atol=1e-6,rtol=0.))
     checks["gas_nonnegative"] = bool((q >= -gastol).all())
     checks["unit_capacity"] = bool(((p >= -tol) & (p <= cap+tol)).all())
     checks["unit_minimum"] = bool(((p <= tol) | (p >= .6*cap-tol)).all())
@@ -288,6 +301,12 @@ def _validate_day(day):
             change=np.abs(np.diff(np.vstack((first,mapped)),axis=0))
             checks['mapping_sensitivity_capacity']=bool(np.isfinite(mapped).all() and (mapped<=sum(C.UNITS)+tol).all())
             checks['mapping_sensitivity_ramp']=bool(np.isfinite(change).all() and (change<=C.POLICY['ramp'][1]+tol).all())
+            details['mapping_sensitivity_ramp']={'maximum_change_mw':float(np.max(change)),
+                'violating_step_indices':np.flatnonzero((change>C.POLICY['ramp'][1]+tol).any(axis=1)).tolist(),
+                'empirical_relaxed_prefix_steps':relaxed,'full_sensitivity_check_retained':True}
+            if relaxed:
+                checks['recovery_sensitivity_prefix_only']=bool(isinstance(relaxed,int) and 0<relaxed<=n and
+                    np.isfinite(change).all() and (change[relaxed:]<=C.POLICY['ramp'][1]+tol).all())
         frontier=joint.get('price_frontier')
         if frontier is not None:
             prices=np.asarray(day.get('prices',[]),float)
@@ -323,6 +342,7 @@ def _validate_day(day):
         'running_unit_ramp','publication_causality','effective_grid','process_resource_causality',
         'missing_process_not_zero_filled','control_calibration_causality','group_mapping_causality',
         'bridge_source_fidelity','bridge_source_causality','optional_calibration_causality'}
+    direct.update(('recovery_export_disclosure','recovery_terminal_command','recovery_sensitivity_prefix_only'))
     assessment={'scope':'local_strict_project_model','official_holder_validation':'UNVERIFIED',
         'official_anchor_boundary_treatment':'NOT_DISCLOSED',
         'failed_initial_conditions':[k for k in problems if k in initial],
