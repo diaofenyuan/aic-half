@@ -543,6 +543,10 @@ def _solve_joint(inputs,initial,beta,stock0,prices,inventory=True,export_shortfa
     if recovery_export:size+=96
     safety_gap=np.arange(size,size+192).reshape(96,2) if recovery_export else None
     if recovery_export:size+=192
+    recovery_vent=np.arange(size,size+192).reshape(96,2) if recovery_export else None
+    if recovery_export:size+=192
+    vent_active=np.arange(size,size+192).reshape(96,2) if recovery_export else None
+    if recovery_export:size+=192
     cost=np.zeros(size);lo=np.zeros(size);hi=np.full(size,np.inf);integer=np.zeros(size)
     hi[p]=cap;hi[on]=1.;integer[on]=1.;hi[switch]=1.
     hi[q[:,1:]]=inputs['optional_caps']
@@ -557,14 +561,24 @@ def _solve_joint(inputs,initial,beta,stock0,prices,inventory=True,export_shortfa
         if recovery_export:
             # 已知不安全初态可能无法在首步恢复；软变量只衡量失败，独立核验仍按原边界判定。
             lo[h[1:]]=-np.inf
+            hi[h[1:]]=np.asarray(C.CAPACITY)*.90
             cost[recovery_slack]=max(float(np.max(prices)),.01)*1000.*beta[0]*96.
             hi[unsafe_step]=1.;integer[unsafe_step]=1.
-            # 由最大电功率反推的耗气上界可给出合法库存下界，避免任意放大大M。
+            hi[vent_active]=1.;integer[vent_active]=1.
+            cost[recovery_vent]=C.POLICY['vent_penalty_cny_m3']*C.DT
+            # 由最大电功率反推柜位下界；每步先考虑90%自动放散，再计算下一步边界。
             maximum_blast=sum(C.UNITS)/beta[0]
-            minimum_stock=np.asarray(stock0)+C.DT*np.cumsum(np.asarray(inputs['available'])-
-                np.asarray(inputs['split'])*maximum_blast,axis=0)
+            minimum_stock=np.empty((n,2))
+            previous_lower=np.asarray(stock0,float).copy()
+            for k in range(n):
+                previous_lower=np.minimum(previous_lower+C.DT*(np.asarray(inputs['available'])[k]-
+                    np.asarray(inputs['split'])[k]*maximum_blast),.90*np.asarray(C.CAPACITY))
+                minimum_stock[k]=previous_lower
             lo[h[1:]]=minimum_stock
             safety_big_m=np.maximum(.15*np.asarray(C.CAPACITY)-minimum_stock,0.)+C.POLICY['stock_tolerance']
+            vent_big_m=np.maximum(np.asarray(inputs['available']),0.)+np.maximum(
+                np.asarray(stock0)-.90*np.asarray(C.CAPACITY),0.)/C.DT
+            hi[recovery_vent]=vent_big_m
     else: hi[h]=0.
     # 保持确定性资源可行域，期末仅计机会成本，不强加旧的期末气量或库存硬约束。
     cost[tail]=float(np.max(prices))*1000*C.DT
@@ -581,7 +595,6 @@ def _solve_joint(inputs,initial,beta,stock0,prices,inventory=True,export_shortfa
     rows=LinearRows(size)
     if benefit_floor is not None:
         rows.add([(p[k,i],float(prices[k])*250.) for k in range(n) for i in range(6)],low=benefit_floor)
-    q0=np.asarray(inputs.get('previous_gas',[np.nan]*3),float)
     # 正常计划使用生成裕度，恢复分支用已采纳的硬上限；离散启停不能再扣除0.001MW。
     ramp_limits=C.POLICY['ramp'] if recovery_export else C.POLICY['generate_ramp']
     for k in range(n):
@@ -614,26 +627,22 @@ def _solve_joint(inputs,initial,beta,stock0,prices,inventory=True,export_shortfa
         if trusted:
             terms=[(p[k,i],1.) for i in range(4)]+[(q[k,j],-small_beta[j]) for j in range(3)]
             for sign in (-1.,1.): rows.add([(i,v*sign) for i,v in terms]+[(err[k],-1.)],high=0.)
-        # 各情景共用同一份已发布决策，禁止使用事后可调整的耗气来虚构稳健可行性。
-        for b in scenarios:
-            b=np.asarray(b)
-            rows.add([(q[k,j],b[j]) for j in range(3)],high=440.)
-            terms=[(q[k,j],b[j]) for j in range(3)]
-            if k:
-                terms += [(q[k-1,j],-b[j]) for j in range(3)];prior=0.
-            elif np.isfinite(q0).all(): prior=float(q0@b)
-            else: continue
-            rows.add(terms,low=prior-ramp_limits[1],high=prior+ramp_limits[1])
-        # 历史气种占比只能说明经验支持范围，不能覆盖官方“无固定配比”的可用气量契约。
-        # 小机组组按真实决策功率核验爬坡，经验映射继续作为软目标。
+        # 历史映射情景只作敏感性诊断，不以推测映射替代决策功率的容量与爬坡约束。
         if inventory:
             for g in range(2):
                 bound=C.DT*inputs['available'][k,g]
-                rows.add([(h[k+1,g],1.),(h[k,g],-1.),(q[k,0],C.DT*inputs['split'][k,g])],low=bound,high=bound)
+                balance=[(h[k+1,g],1.),(h[k,g],-1.),(q[k,0],C.DT*inputs['split'][k,g])]
+                if recovery_export:
+                    balance.append((recovery_vent[k,g],C.DT))
+                rows.add(balance,low=bound,high=bound)
                 if recovery_export:
                     rows.add([(h[k+1,g],1.),(recovery_slack[k,g],1.)],low=.20*C.CAPACITY[g])
                     rows.add([(h[k+1,g],1.),(unsafe_step[k],safety_big_m[k,g])],low=.15*C.CAPACITY[g])
                     rows.add([(h[k+1,g],1.),(safety_gap[k,g],1.)],low=.15*C.CAPACITY[g])
+                    # 放散只可在柜位达到90%上限时发生，避免用人工放散伪造较低柜位。
+                    rows.add([(recovery_vent[k,g],1.),(vent_active[k,g],-vent_big_m[k,g])],high=0.)
+                    big_m=max(.90*C.CAPACITY[g]-minimum_stock[k,g],0.)+C.POLICY['stock_tolerance']
+                    rows.add([(h[k+1,g],1.),(vent_active[k,g],-big_m)],low=.90*C.CAPACITY[g]-big_m)
                 if reserve is not None:
                     rows.add([(h[k+1,g],1.),(reserve[k,g],1.)],low=risk['target_m3'][g])
     rows.add([(q[-1,0],beta[0]),(tail,-1.)],high=float(inputs['budget_blast'][-1])*beta[0])
@@ -685,7 +694,8 @@ def _solve_joint(inputs,initial,beta,stock0,prices,inventory=True,export_shortfa
     if recovery_export:meta['status']='EXPORT_RECOVERY_WITH_REPORTED_VIOLATIONS'
     x=result.x
     out={'power':x[p],'gas':x[q],'stocks':x[h] if inventory else np.full((97,2),np.nan),
-         'vent':np.zeros((96,2)),'export_shortfall_m3h':x[shortfall] if export_shortfall else np.zeros(96),
+         'vent':x[recovery_vent] if recovery_export else np.zeros((96,2)),
+         'export_shortfall_m3h':x[shortfall] if export_shortfall else np.zeros(96),
          'joint_control':{'terminal_resource_excess_mw':float(x[tail]),'group_mapping_used':trusted,
                           'empirical_gas_support':support,'ramp_scenarios':[list(b) for b in scenarios],
                           'reserve_risk':risk,'price_ratio_parameter':price_ratio,'benefit_floor_cny':benefit_floor}}

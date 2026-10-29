@@ -190,14 +190,14 @@ def evaluate(job, cache=None):
     if not origins.isin(view.index).all():
         raise ValueError("验证输入网格覆盖不完整")
     if contract.get("expected_origins") and len(origins) != contract["expected_origins"]:
-        raise ValueError("脚本窗口必须完整输出2016个起报点")
+        raise ValueError(f"脚本窗口起报点数量不匹配：期望{contract['expected_origins']}，实际{len(origins)}")
     quick = contract["training_budget"] == "quick"
     root = Path(job["output"])
     metrics, masks, checks = {}, {}, {"training_boundary": True, "coverage": True, "reload": True, "causality": True}
     primary = []
-    selected = ("short", "long") if job["track"] == "load" else (job["track"],)
+    selected = ("short", "long") if job["track"] in ("load", "g1") else (job["track"],)
     bundles, restored_bundles, reuse_info = {}, {}, {}
-    if job["track"] in ("short", "long", "load"):
+    if job["track"] in ("short", "long", "load", "g1"):
         # 单链路的主指标不变，但部署后处理有交叉依赖，不能用裸预测代替实际输出。
         for span, train_func in (("short", main_s.train_short), ("long", main_l.train_long)):
             existing = root / "模型" / span / "meta.json"
@@ -232,6 +232,7 @@ def evaluate(job, cache=None):
         if not np.allclose(pred, quality.project_load(pred), rtol=0., atol=1e-6):
             raise ValueError("预测不满足容量关系")
         truth = quality.truth_cube(truth_data, origins, range(1, h + 1))
+        available_tail = quality.score_load(pred, truth)
         times = origins.to_numpy()[:, None] + np.arange(1, h + 1)[None, :] * np.timedelta64(15, "m")
         if contract.get("score_tail") != "script_available_history":
             truth[times > end.to_datetime64()] = np.nan
@@ -239,20 +240,41 @@ def evaluate(job, cache=None):
         score = quality.score_load(pred, truth)
         naive = np.round(main_s.naive_profile(train, origins, range(1, h + 1), cutoff), 6)
         metrics[span] = {"score": score, "horizons": quality.score_horizons(pred, truth),
+                         "diagnostics": quality.load_diagnostics(pred, truth, origins),
                          "naive": quality.score_load(naive, truth), "training": bundle.diagnostics,
+                         "available_history_tail_sensitivity": available_tail,
                          "effective_budget": bundle.recipe.get("effective_budget"), **reuse_info[span],
                          "target_dates": {}}
+        for stage, begin, stop, role in C.STAGES:
+            if stage == "half_train" and role == "train":
+                begin, stop = max(start, pd.Timestamp(begin)), min(end, pd.Timestamp(stop))
+                if begin <= stop:
+                    metrics[span]["recent_training_window"] = {"stage": stage, **quality.score_origin_window(pred, truth, origins, begin, stop)}
         for date in pd.date_range(start.normalize(), end.normalize(), freq="1D"):
             mask = (times >= date.to_datetime64()) & (times < (date + pd.Timedelta(days=1)).to_datetime64())
             metrics[span]["target_dates"][str(date.date())] = quality.score_load(pred, np.where(mask[..., None], truth, np.nan))
-        primary.append(score["macro_score"])
+        selected_score = score["generator_1"]["score"] if job["track"] == "g1" else score["macro_score"]
+        if selected_score is None:
+            raise ValueError("主指标缺少有效真值，拒绝评分")
+        primary.append(selected_score)
         np.savez_compressed(root / (span + "_predictions.npz"), prediction=pred, truth=truth, origins=origins.to_numpy())
-        output.prediction_frame(origins, pred).to_csv(root / ("s_result.csv" if span == "short" else "l_result.csv"), index=False, float_format="%.6f")
+        csv_path=root / ("s_result.csv" if span == "short" else "l_result.csv")
+        output.prediction_frame(origins, pred).to_csv(csv_path, index=False, float_format="%.6f")
+        # 复评实际CSV而非内存数组，独立检查列偏移和目标时刻是否与冻结裁判一致。
+        tail_end=None if contract.get("score_tail")=="script_available_history" else end
+        csv_score,csv_pred,csv_truth=quality.score_prediction_csv(csv_path,truth_data.labels,origins,h,tail_end)
+        csv_ok=(np.array_equal(csv_pred,pred) and np.array_equal(csv_truth,truth,equal_nan=True) and
+                all(csv_score[t]["score"]==score[t]["score"] for t in C.TARGETS))
+        checks["csv_scoring_alignment"]=checks.get("csv_scoring_alignment",True) and bool(csv_ok)
+        metrics[span]["csv_score_validation"]={"passed":bool(csv_ok),"time_alignment":"origin_plus_column_offset",
+            "basis":"independent_csv_and_reference_labels","official_aggregation":"unknown"}
+        if not csv_ok:
+            raise ValueError("CSV与内部评分数据不一致，拒绝使用本次分数")
         reloaded = reloaded_predictions[index]
         delta = float(np.max(np.abs(pred - reloaded)))
         checks["reload"] &= delta <= 1e-6
         metrics[span]["reload_max_difference"] = delta
-    if job["track"] in ("short", "long", "load"):
+    if job["track"] in ("short", "long", "load", "g1"):
         objective = float((2 * primary[0] + 3 * primary[1]) / 5 if len(primary) == 2 else primary[0])
     else:
         cache = Path(job["resource_cache"]) if job["resource_cache"] else None
@@ -293,7 +315,7 @@ def evaluate(job, cache=None):
             for values in day["components"].values():
                 if np.asarray(values).shape != (96,) or not np.isfinite(values).all():
                     checks["coverage"] = False
-        audit = quality.audit_resource_forecasts(days, labels)
+        audit = quality.audit_resource_forecasts(days, labels, window_end=end)
         names = ("budget_blast", "budget_coke", "budget_converter")
         wapes = [audit[n]["wape"] for n in names]
         if any(w is None for w in wapes):
@@ -308,7 +330,8 @@ def evaluate(job, cache=None):
             after = truth_data.frame.reindex(times + pd.Timedelta(minutes=15))
             mask = (np.isfinite(future[list(C.USE)]).all(axis=1).to_numpy() &
                     np.isfinite(future[list(C.HOLDERS)]).all(axis=1).to_numpy() &
-                    np.isfinite(after[list(C.HOLDERS)]).all(axis=1).to_numpy() & (times <= end))
+                    np.isfinite(after[list(C.HOLDERS)]).all(axis=1).to_numpy() &
+                    (times + pd.Timedelta(minutes=15) <= end))
             price = pipeline.prices_at(truth_data, times)
             power = np.asarray(day["power"]).sum(axis=1)
             vent = np.asarray(day["vent"]).sum(axis=1)
@@ -320,7 +343,7 @@ def evaluate(job, cache=None):
         if job["track"] == "dispatch" and not sum(known):
             raise ValueError("调度主指标没有观测支持区间")
         metrics.update(resource=audit, optimization=opt, independent_days=independent, independent_sequence=sequence,
-                       historical_replay=quality.historical_replay(truth_data, days),
+                       historical_replay=quality.historical_replay(truth_data.prefix(end), days),
                        observed_window_planned_net_value_cny=value,
                        revenue_basis="计划负荷与计划放散在有观测区间上的本地价值，不是执行收益或官网得分")
         objective = -float(np.mean(wapes)) if job["track"] == "resource" else value
@@ -332,6 +355,73 @@ def evaluate(job, cache=None):
     return {"status": "COMPLETE", "primary": objective, "checks": checks, "metrics": metrics,
             "comparison": comparison, "experimental": True, "submittable": False,
             "official_acceptance_status": "unknown", "field_safety_certified": False}
+
+
+def paired_window_sensitivity(reports, reference):
+    """揭示配对收益对单个历史窗口的依赖；只作诊断，不改变选模指标。"""
+    import numpy as np
+    if set(reports) != set(reference) or not reports:
+        return {"status": "UNAVAILABLE_WINDOW_MISMATCH", "role": "diagnostic_only"}
+    delta = {}
+    for name, row in reports.items():
+        prior = reference[name]
+        left, right = row.get("comparison", {}), prior.get("comparison", {})
+        if (left.get("contract") != right.get("contract") or not left.get("masks") or
+                left.get("masks") != right.get("masks") or not left.get("data_sources") or
+                left.get("data_sources") != right.get("data_sources")):
+            return {"status": "UNAVAILABLE_CONTRACT_OR_TRUTH_MISMATCH", "role": "diagnostic_only"}
+        delta[name] = float(row["primary"] - prior["primary"])
+    mean = float(np.mean(list(delta.values())))
+    if len(delta) < 2:
+        return {"status": "NEEDS_MULTIPLE_WINDOWS", "role": "diagnostic_only", "mean_delta": mean,
+                "window_deltas": delta}
+    leave_out = {name: float(np.mean([v for k, v in delta.items() if k != name])) for name in delta}
+    return {"status": "AVAILABLE", "role": "diagnostic_only", "mean_delta": mean,
+            "window_deltas": delta, "leave_one_out_mean_delta": leave_out}
+
+
+def historical_score_stability(reports):
+    """比较仅用过去窗口得分估计下一窗口的误差，不预测或校准官网分数。"""
+    from datetime import datetime
+    import numpy as np
+    if len(reports)<3:
+        return {"status":"NEEDS_AT_LEAST_THREE_WINDOWS","role":"historical_diagnostic_only"}
+    rows=[]
+    try:
+        for name,r in reports.items():
+            c=r["comparison"]["contract"]
+            start,end,cutoff=(datetime.fromisoformat(str(c[x])) for x in ("start","end","train_end"))
+            if not cutoff<start<=end:
+                return {"status":"INVALID_TRAINING_BOUNDARY","role":"historical_diagnostic_only"}
+            rows.append((start,end,name,r))
+        rows.sort(key=lambda x:x[0])
+        if any(a[1]>=b[0] for a,b in zip(rows,rows[1:])):
+            return {"status":"OVERLAPPING_WINDOWS","role":"historical_diagnostic_only"}
+        groups={}
+        for span in ("short","long"):
+            for target in ("generator_1","generator_all"):
+                if not all(span in row[3].get("metrics",{}) for row in rows):
+                    continue
+                scores=[row[3]["metrics"][span]["score"][target]["score"] for row in rows]
+                if any(x is None or not np.isfinite(x) for x in scores):
+                    continue
+                comparisons=[]
+                for i in range(1,len(rows)):
+                    estimate=float(np.mean(scores[:i]));last=float(scores[i-1]);actual=float(scores[i])
+                    comparisons.append({"target_window":rows[i][2],"previous_count":i,
+                        "historical_mean":estimate,"previous_window":last,"actual_score":actual,
+                        "mean_error":estimate-actual,"previous_error":last-actual})
+                groups[span+"_"+target]={"count":len(comparisons),
+                    "mean_estimate_mae":float(np.mean([abs(x["mean_error"]) for x in comparisons])),
+                    "previous_estimate_mae":float(np.mean([abs(x["previous_error"]) for x in comparisons])),
+                    "comparisons":comparisons}
+        if not groups:
+            return {"status":"NO_COMPARABLE_SCORES","role":"historical_diagnostic_only"}
+        return {"status":"AVAILABLE","role":"historical_diagnostic_only_not_official_score",
+                "independent_holdout":False,"window_count":len(rows),
+                "window_order":[x[2] for x in rows],"groups":groups}
+    except (KeyError,TypeError,ValueError):
+        return {"status":"INVALID_WINDOW_OR_SCORE","role":"historical_diagnostic_only"}
 
 
 def evaluate_windows(job):
@@ -388,6 +478,16 @@ def evaluate_windows(job):
         if all(span in row for row in summary["windows"].values()):
             for target, suffix in (("generator_1", "g1"), ("generator_all", "gall")):
                 summary["mean"][span + "_" + suffix] = float(np.mean([row[span][target] for row in summary["windows"].values()]))
+    baseline = job.get("baseline_output")
+    if baseline:
+        reference = {}
+        for name in reports:
+            path = Path(baseline) / "窗口" / name / "报告" / "运行结果.json"
+            if path.is_file():
+                reference[name] = json.loads(path.read_text(encoding="utf-8"))
+        summary["paired_sensitivity"] = paired_window_sensitivity(reports, reference)
+    if job["track"] in ("short","long","load","g1"):
+        summary["historical_score_stability"] = historical_score_stability(reports)
     artifacts = {}
     for name, report in reports.items():
         artifacts.update({f"窗口/{name}/{path}": value for path, value in report.get("artifacts", {}).items()})

@@ -56,7 +56,7 @@ LOAD_RECIPE = {"short": "shared", "long": "shared", "loss": "relative_l1",
                "tasks": {
                    # 短期按 1-4 / 5-8 分段并加入相对水平特征：六窗 short g1 84.99→85.42、
                    # gall 89.74→90.17，long 同步 87.58→87.71。相对特征把水平绑到近期气量
-                   # 而不是历史画像，避免起报后水平漂移时整段错位；采用依据为本地六窗对照。
+                   # 而不是历史画像，避免起报后水平漂移时整段错位；采用依据为历史窗口对照。
                    # 短期训练窗口 112→84 天（六窗 short macro 87.79→88.04，5/6 窗改善，
                    # w4 水平偏低探针 +0.6、w6 爬升窗 +1.0；91 天出现 w4 崩到 78.6 的敏感点，
                    # 故取 12 周整数窗口而不追 77 天峰值）。长期仍用 112 天，水平由短期对齐。
@@ -74,7 +74,7 @@ LOAD_RECIPE = {"short": "shared", "long": "shared", "loss": "relative_l1",
                    # 长期全程遮挡下相对误差权重会系统性压低水平（四窗实测 w4 少 85MW），改用等权 L1。
                    "long": {"long": "segmented", "feature_set": "base+relative+mechanism", "phase": "rotating",
                             "weight_power": 0.0,
-                            # 1-MAPE 对高估更敏感：长期 g1 冻结画像整体下调 5%，
+                            # 长期 g1 冻结画像整体下调 5%，
                             # 四窗实测 85.11→85.95（w1/w2/w3 改善，w4 水平偏高下跌 3.4）。
                             "baseline_scale": [0.95, 1.0],
                             # 长期 generator_all 的水平完全取短期模型（形状仍用长期），
@@ -86,9 +86,9 @@ TREE = {"learning_rate": .05, "num_leaves": 31, "min_data_in_leaf": 80,
         "num_threads": CPU_THREADS, "deterministic": True, "force_col_wise": True,
         "use_missing": True, "zero_as_missing": False}
 POLICY = {"source": "adopted_project_policy", "publication": "07:00", "availability": "point",
-          # 本地对照中统一 60MW 后，10 个 |Δgall|>60 步消除，计划收益未下降。
-          # 保留当前项目配方；异常线上评分不能证明官方采用 60MW 阈值。
-          "safe": (.15, .90), "plan": (.20, .85), "ramp": (30., 60.),
+          # 聚合硬上限遵守当前项目选定的 30/66MW；正常生成采用 30/60MW 裕度。
+          # 历史线上触发数不能用于反推官方阈值。
+          "safe": (.15, .90), "plan": (.20, .85), "ramp": (30., 66.),
           "generate_ramp": (30., 60.), "running_ramp_per_min": .01,
           "min_load": .60, "solver_seconds": 10., "mip_gap": .01,
           "power_tolerance": .001, "gas_tolerance": 1., "stock_tolerance": 2.,

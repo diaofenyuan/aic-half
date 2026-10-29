@@ -28,7 +28,7 @@ CODE = ROOT / "tmp_main"
 POINTER = ROOT / "tmp" / "aic_auto_active.json"
 DEFAULT_WINDOWS = {"w1": ("2025-09-20", "2025-10-10"), "w2": ("2025-08-30", "2025-09-19"),
                    "w3": ("2025-07-31", "2025-08-20"), "w4": ("2025-07-01", "2025-07-21")}
-TRACKS = ("short", "long", "load", "resource", "dispatch")
+TRACKS = ("short", "long", "load", "g1", "resource", "dispatch")
 EDITABLE = {"config.py", "main_s.py", "main_l.py", "main_opt.py", "data_cleaning/pipeline.py"}
 OVERRIDES = ("LOAD_RECIPE.", "TREE.", "PROCESS_RESOURCE.", "DISPATCH_CONTROL.",
              "GROUP_DISPATCH.smooth_penalty", "GROUP_DISPATCH.mapping_penalty")
@@ -147,8 +147,11 @@ def snapshot(origin, target, names):
 
 
 def seeds(track):
-    if track in ("short", "long", "load"):
-        spans = ("short", "long") if track == "load" else (track,)
+    if track == "g1":
+        # g1 任务按已记录的误差机制提出候选，避免重复运行通用参数种子。
+        return []
+    if track in ("short", "long", "load", "g1"):
+        spans = ("short", "long") if track in ("load", "g1") else (track,)
         choices = []
         for span in spans:
             for leaves in (15, 63):
@@ -200,10 +203,12 @@ def window_design(path, selected):
         identifier(key)
         begin, end = (datetime.fromisoformat(v) for v in windows[key])
         stop = end + timedelta(hours=23, minutes=45)
-        if (end - begin).days != 20 or stop >= datetime(2025, 10, 11):
-            raise ValueError("每个脚本窗口须为正式测试之前的完整21天")
+        if (begin.time() != datetime.min.time() or end.time() != datetime.min.time() or
+                begin > end or stop >= datetime(2025, 10, 11)):
+            raise ValueError("脚本窗口须为正式测试之前、首尾均按日期给出的完整自然日")
+        expected_origins = int((stop - begin).total_seconds() // 900) + 1
         result.append({"name": key, "start": str(begin), "end": str(stop),
-                       "train_end": str(begin - timedelta(minutes=15)), "expected_origins": 2016})
+                       "train_end": str(begin - timedelta(minutes=15)), "expected_origins": expected_origins})
     return result
 
 
@@ -235,9 +240,10 @@ def initialize(args):
     state = {"schema": 5, "campaign": name, "track": args.track, "status": "ready", "created": now(),
              "contract": {"windows": windows, "window_source": str(args.window_script.resolve()) if not custom and args.window_script else None,
                           "window_source_sha256": digest(args.window_script) if not custom and args.window_script else None,
-                          "data_end": "2025-10-10 23:45:00", "score_tail": "script_available_history" if not custom else "within_window",
+                          "data_end": "2025-10-10 23:45:00", "score_tail": "within_window",
                           "training_budget": args.training_budget, "threads": args.threads,
-                          "primary": "1_mape_macro" if args.track in ("short", "long", "load") else
+                          "primary": "1_mape_g1_short_40_long_60" if args.track == "g1" else
+                              "1_mape_macro" if args.track in ("short", "long", "load") else
                               "negative_resource_macro_wape" if args.track == "resource" else "observed_window_planned_net_value_cny",
                           "direction": "maximize", "truth_mask": "fixed_reference_available_nonzero_targets",
                           "aggregation": "equal_window_mean_then_fixed_task_weight",
@@ -313,11 +319,11 @@ def evidence_errors(root, report, expected_job):
         errors.extend(manifest_errors(source, job.get("manifest")))
         errors.extend(manifest_errors(root, report.get("artifacts")))
         # 必需出口不能因清单缺项而绕过核验；交叉依赖模型也必须随本次输出保存。
-        spans = ("short", "long") if job["track"] == "load" else (job["track"],)
+        spans = ("short", "long") if job["track"] in ("load", "g1") else (job["track"],)
         for window in job["contract"].get("windows") or [None]:
             prefix = "窗口/" + window["name"] + "/" if window else ""
             required = []
-            if job["track"] in ("short", "long", "load"):
+            if job["track"] in ("short", "long", "load", "g1"):
                 required += ["s_result.csv" if s == "short" else "l_result.csv" for s in spans]
                 models = ("short", "long") if job["contract"].get("load_output") else spans
                 required += ["模型/" + s + "/meta.json" for s in models]
@@ -373,7 +379,7 @@ def finalize(folder, state, active):
     score = report.get("primary")
     checks = report.get("checks", {})
     required = {"causality", "coverage", "reload", "training_boundary", "source_unchanged"}
-    if state.get("schema", 0) >= 5 and state["track"] in ("short", "long", "load"):
+    if state.get("schema", 0) >= 5 and state["track"] in ("short", "long", "load", "g1"):
         required.add("deployment_output")
     if state["track"] in ("resource", "dispatch"):
         required.add("hard_constraints")

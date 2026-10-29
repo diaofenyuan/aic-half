@@ -22,13 +22,20 @@ def project_load(pred):
     return np.where(legal[..., None], a, projected)
 
 
-def truth_cube(data, origins, horizons):
-    pos = data.index.get_indexer(pd.DatetimeIndex(origins))
+def truth_cube(data, origins, horizons, window_end=None):
+    origins = pd.DatetimeIndex(origins)
+    horizons = np.asarray(list(horizons), dtype=int)
+    if (horizons <= 0).any():
+        raise ValueError("预测提前量必须为正")
+    pos = data.index.get_indexer(origins)
     if (pos < 0).any():
         raise ValueError("起报点超出输入网格")
-    ix = pos[:, None] + np.array(horizons)[None, :]
+    ix = pos[:, None] + horizons[None, :]
     y = np.full((*ix.shape, 2), np.nan)
     ok = ix < len(data.index)
+    if window_end is not None:
+        targets = origins.to_numpy()[:, None] + horizons[None, :] * np.timedelta64(C.STEP, "m")
+        ok &= targets <= pd.Timestamp(window_end).to_datetime64()
     y[ok] = data.labels.to_numpy()[ix[ok]]
     return y
 
@@ -44,9 +51,15 @@ def score_load(pred, truth):
     for i, name in enumerate(C.TARGETS):
         p, y = pred[..., i], truth[..., i]
         finite = np.isfinite(y)
+        if (y[finite] < 0.).any():
+            raise ValueError("负荷评分真值不得为负")
         valid, zero = finite & (y > 0.), finite & (y == 0.)
         score = float(100.*(1.-np.mean(np.abs(p[valid]-y[valid])/y[valid]))) if valid.any() else None
         out[name] = {"score": score, "nonzero_cells": int(valid.sum()), "zero_cells": int(zero.sum()),
+                     "missing_truth_cells": int((~finite).sum()),
+                  "total_cells": int(y.size),
+                  "observed_fraction": float(finite.mean()) if y.size else None,
+                  "score_status": "AVAILABLE" if valid.any() else "NO_POSITIVE_TRUTH" if finite.any() else "NO_OBSERVED_TRUTH",
                      "zero_mae": float(np.mean(np.abs(p[zero]))) if zero.any() else None,
                      "bias_mw": float(np.mean(p[finite]-y[finite])) if finite.any() else None}
         if score is not None:
@@ -62,16 +75,144 @@ def score_horizons(pred, truth):
             for a, b in groups if a < h}
 
 
+def score_prediction_csv(path, labels, origins, horizons, window_end=None):
+    """独立从实际提交宽表的列名和时间戳重建目标时刻，不复用模型预测数组。"""
+    origins=pd.DatetimeIndex(origins)
+    if not isinstance(horizons,int) or horizons<=0 or not labels.index.is_unique:
+        raise ValueError("CSV评分提前量或标签时间索引无效")
+    f=pd.read_csv(path)
+    expected=["datetime"]+[f"{t}_t+{h*C.STEP}_pred" for t in C.TARGETS for h in range(1,horizons+1)]
+    if list(f.columns)!=expected:
+        raise ValueError("预测CSV列名或提前量顺序不一致")
+    times=pd.DatetimeIndex(pd.to_datetime(f["datetime"],errors="raise"))
+    if not times.equals(origins):
+        raise ValueError("预测CSV起报网格不一致")
+    pred=np.stack([f[[f"{t}_t+{h*C.STEP}_pred" for h in range(1,horizons+1)]].to_numpy(float)
+                   for t in C.TARGETS],axis=2)
+    target_times=times.to_numpy()[:,None]+np.arange(1,horizons+1)[None,:]*np.timedelta64(C.STEP,"m")
+    truth=labels.loc[:,list(C.TARGETS)].reindex(pd.DatetimeIndex(target_times.reshape(-1))).to_numpy(float).reshape(pred.shape)
+    if window_end is not None:
+        truth=np.where((target_times<=pd.Timestamp(window_end).to_datetime64())[...,None],truth,np.nan)
+    return score_load(pred,truth),pred,truth
+
+
+def score_origin_window(pred, truth, origins, start, end):
+    """以起报点和目标时刻共同限定历史子窗口，避免尾部借用窗口外真值。"""
+    pred, truth = np.asarray(pred, float), np.asarray(truth, float)
+    origins = pd.DatetimeIndex(origins)
+    start, end = pd.Timestamp(start), pd.Timestamp(end)
+    if start > end or pred.shape != truth.shape or pred.ndim != 3 or pred.shape[0] != len(origins):
+        raise ValueError("子窗口评分范围或预测维度无效")
+    chosen = (origins >= start) & (origins <= end)
+    if not chosen.any():
+        return {"status": "NO_ORIGINS", "start": str(start), "end": str(end), "origins": 0}
+    times = origins[chosen].to_numpy()[:, None] + np.arange(1, pred.shape[1]+1)[None, :]*np.timedelta64(C.STEP, "m")
+    inside = (times >= start.to_datetime64()) & (times <= end.to_datetime64())
+    labels = np.where(inside[..., None], truth[chosen], np.nan)
+    forecast = pred[chosen]
+    return {"status": "COMPLETE", "start": str(start), "end": str(end), "origins": int(chosen.sum()),
+            "score": score_load(forecast, labels), "horizons": score_horizons(forecast, labels),
+            "diagnostics": load_diagnostics(forecast, labels, origins[chosen]),
+            "role": "historical_diagnostic_only_not_candidate_ranking"}
+
+
+def load_diagnostics(pred, truth, origins):
+    """按目标时刻和历史真实负荷区间解释误差，不参与模型输入。"""
+    pred, truth = np.asarray(pred, float), np.asarray(truth, float)
+    origins = pd.DatetimeIndex(origins)
+    if pred.shape != truth.shape or pred.ndim != 3 or pred.shape[0] != len(origins) or pred.shape[2] != len(C.TARGETS):
+        raise ValueError("负荷诊断维度与起报网格不一致")
+    if not np.isfinite(pred).all():
+        raise ValueError("负荷诊断拒绝非有限预测")
+    targets=origins.to_numpy()[:,None]+np.arange(1,pred.shape[1]+1)[None,:]*np.timedelta64(C.STEP,"m")
+    target_days=targets.astype("datetime64[D]")
+    ranges=((0.,30.,60.,100.,150.,200.,np.inf),(0.,100.,200.,300.,440.,np.inf))
+    result={}
+    for i,name in enumerate(C.TARGETS):
+        p,y=pred[...,i],truth[...,i]
+        all_valid=np.isfinite(y)&(y > 0.)
+        all_cells=int(all_valid.sum())
+        all_error=float(np.sum(np.abs(p[all_valid]-y[all_valid])/y[all_valid]))
+        def summarize(mask):
+            valid=mask & np.isfinite(y) & (y > 0.)
+            if not valid.any():
+                return {"score":None,"cells":0,"bias_mw":None,
+                        "fraction_of_scored_cells":0. if all_cells else None,
+                        "fraction_of_total_relative_error":0. if all_error else None}
+            error=np.abs(p[valid]-y[valid])/y[valid]
+            return {"score":float(100.*(1.-np.mean(error))),
+                    "cells":int(valid.sum()),"bias_mw":float(np.mean(p[valid]-y[valid])),
+                    "fraction_of_scored_cells":float(valid.sum()/all_cells),
+                    "fraction_of_total_relative_error":float(error.sum()/all_error) if all_error else None}
+        bins={}
+        for lo,hi in zip(ranges[i][:-1],ranges[i][1:]):
+            label=f"({lo:g},{hi:g}]"
+            bins[label]=summarize((y > lo) & (y <= hi))
+        daily={}
+        origin_daily={}
+        if len(origins):
+            for day in pd.date_range(origins.min().normalize(),origins.max().normalize(),freq="D"):
+                daily[str(day.date())]=summarize(target_days == day.to_datetime64().astype("datetime64[D]"))
+                origin_daily[str(day.date())]=summarize(np.broadcast_to((origins.normalize()==day)[:,None],y.shape))
+        # 末尾截断使不同起报点的提前量数量不等；完整起报点指标仅作透明诊断。
+        complete=np.isfinite(y).all(axis=1)
+        complete_mask=np.broadcast_to(complete[:,None],y.shape)
+        complete_score=summarize(complete_mask)
+        complete_score.update(origins=int(complete.sum()),total_origins=len(origins))
+        result[name]={"by_observed_target_mw":bins,"by_target_date":daily,
+                      "by_origin_date":origin_daily,"complete_horizon_origins":complete_score,
+                      "information_role":"historical_scoring_only"}
+    return result
+
+
 def score_resources(pred, truth):
-    p, y = np.asarray(pred), np.asarray(truth)
-    valid = np.isfinite(p) & np.isfinite(y)
-    if not valid.any():
-        return {"wape": None, "cells": 0}
-    error = p[valid]-y[valid]
-    denom = np.abs(y[valid]).sum()
-    return {"wape": float(np.abs(error).sum()/denom) if denom > 0 else None,
-            "bias": float(error.sum()/denom) if denom > 0 else None, "cells": int(valid.sum()),
-            "zero_false_volume": float(np.abs(p[valid & (y == 0)]).sum()*C.DT)}
+    p, y = np.asarray(pred, float), np.asarray(truth, float)
+    if p.shape != y.shape:
+        raise ValueError("资源预测与真值形状不一致")
+    observed = np.isfinite(y)
+    missing_prediction = observed & ~np.isfinite(p)
+    result = {"wape": None, "bias": None, "cells": int(observed.sum()),
+              "missing_truth_cells": int((~observed).sum()),
+              "missing_prediction_cells": int(missing_prediction.sum()),
+              "score_valid": False, "zero_false_volume": None}
+    # 评分范围只由真值决定，预测缺失不能缩小分母或改变候选排名。
+    if missing_prediction.any():
+        result["reason"] = "MISSING_PREDICTION_FOR_OBSERVED_TRUTH"
+        return result
+    if not observed.any():
+        result["reason"] = "NO_OBSERVED_TRUTH"
+        return result
+    error = p[observed]-y[observed]
+    denom = np.abs(y[observed]).sum()
+    result.update(wape=float(np.abs(error).sum()/denom) if denom > 0 else None,
+                  bias=float(error.sum()/denom) if denom > 0 else None,
+                  zero_false_volume=float(np.abs(p[observed & (y == 0)]).sum()*C.DT),
+                  score_valid=bool(denom > 0.))
+    if denom <= 0.:
+        result["reason"] = "ZERO_TRUTH_VOLUME"
+    return result
+
+
+def price_weighted_load(days):
+    """独立计算各日计划的电价加权负荷比，不推定线上分数换算。"""
+    daily = []
+    numerator = denominator = 0.
+    for day in days:
+        prices = np.asarray(day["prices"], float)
+        power = np.asarray(day["power"], float)
+        if prices.ndim != 1 or power.shape != (len(prices), len(C.UNITS)) or not np.isfinite(prices).all() or not np.isfinite(power).all():
+            raise ValueError("价格指标需要完整的计划电价和逐台负荷")
+        load = power.sum(axis=1)
+        num = float(prices @ load)
+        den = float(prices.mean() * load.sum())
+        ratio = num/den if den > 0. else None
+        daily.append({"issued_at": str(day["issued_at"]), "ratio": ratio,
+                      "price_mean": float(prices.mean()), "load_sum_mw": float(load.sum())})
+        numerator += num
+        denominator += den
+    return {"ratio": numerator/denominator if denominator > 0. else None,
+            "daily": daily, "basis": "published_plan_price_mean_over_96_steps",
+            "official_score_mapping": "unknown", "is_executed_revenue": False}
 
 
 def _optional_calibration_checks(day):
@@ -248,6 +389,18 @@ def _validate_day(day):
         joint=day.get('joint_control',{})
         checks['joint_control_complete']=bool(joint)
         checks['control_calibration_causality']=pd.Timestamp(control['train_end'])<pd.Timestamp(day['issued_at'])
+        risk=joint.get('reserve_risk')
+        if risk is not None:
+            target=np.asarray(risk.get('target_m3',[]),float)
+            valid_target=target.shape==(2,) and np.isfinite(target).all()
+            risk_end=pd.Timestamp(risk.get('max_observed_at'))
+            checks['reserve_risk_causality']=bool(valid_target and pd.notna(risk_end) and
+                risk_end<=pd.Timestamp(day['issued_at']))
+            scenario=risk.get('scenario')
+            if scenario is not None:
+                closed=pd.Timestamp(scenario.get('history_end'))
+                checks['reserve_risk_causality'] &= bool(pd.notna(closed) and
+                    closed<=pd.Timestamp(day['issued_at']) and scenario.get('coverage_guarantee') is False)
         support=joint.get('empirical_gas_support')
         if support is not None:
             equations=np.asarray(support['equations'],float)
@@ -261,11 +414,22 @@ def _validate_day(day):
         scenarios=joint.get('ramp_scenarios',[])
         previous_gas=np.asarray(day.get('previous_gas',[np.nan]*3),float)
         if len(scenarios):
-            mapped=q@np.asarray(scenarios).T
-            first=previous_gas@np.asarray(scenarios).T
-            change=np.abs(np.diff(np.vstack((first,mapped)),axis=0))
-            checks['mapping_sensitivity_capacity']=bool(np.isfinite(mapped).all() and (mapped<=sum(C.UNITS)+tol).all())
-            checks['mapping_sensitivity_ramp']=bool(np.isfinite(change).all() and (change<=C.POLICY['ramp'][1]+tol).all())
+            coefficients=np.asarray(scenarios,float)
+            available=bool(coefficients.ndim==2 and coefficients.shape[1]==3 and
+                           np.isfinite(coefficients).all() and np.isfinite(q).all())
+            sensitivity={'role':'diagnostic_only','available':available}
+            if available:
+                mapped=q@coefficients.T
+                initial_known=previous_gas.shape==(3,) and np.isfinite(previous_gas).all()
+                history=np.vstack((previous_gas@coefficients.T,mapped)) if initial_known else mapped
+                change=np.abs(np.diff(history,axis=0))
+                # 经验映射用于识别敏感性，实际功率的硬约束已经独立核验。
+                sensitivity.update(initial_gas_known=bool(initial_known),
+                    mapped_capacity_exceedances=int((mapped>sum(C.UNITS)+tol).sum()),
+                    mapped_ramp_exceedances=int((change>C.POLICY['ramp'][1]+tol).sum()),
+                    max_mapped_power_mw=float(np.max(mapped)),
+                    max_mapped_ramp_mw=float(np.max(change)) if change.size else None)
+            details['mapping_sensitivity']=sensitivity
         frontier=joint.get('price_frontier')
         if frontier is not None:
             prices=np.asarray(day.get('prices',[]),float)
@@ -288,7 +452,6 @@ def _validate_day(day):
         "official_reconstruction_reproduced":False}
     boundary_names=("initial_state_known","observed_anchor","anchor_safety")
     model_names=("net_resource_basis","gas_power","gas_power_calibration","optional_gas_caps",
-                 "historical_gas_support","mapping_sensitivity_capacity","mapping_sensitivity_ramp",
                  "optional_calibration_contract","optional_calibration_fidelity")
     details["local_check_groups"]={
         "observed_boundary_passed":all(checks.get(k,True) for k in boundary_names),
@@ -299,7 +462,7 @@ def _validate_day(day):
     initial={'initial_state_known','observed_anchor','anchor_safety'}
     direct={'finite_dispatch','gas_nonnegative','unit_capacity','unit_minimum','aggregate_ramp',
         'running_unit_ramp','publication_causality','effective_grid','process_resource_causality',
-        'missing_process_not_zero_filled','control_calibration_causality','group_mapping_causality',
+        'missing_process_not_zero_filled','control_calibration_causality','group_mapping_causality','reserve_risk_causality',
         'bridge_source_fidelity','bridge_source_causality','optional_calibration_causality'}
     assessment={'scope':'local_strict_project_model','official_holder_validation':'UNVERIFIED',
         'official_anchor_boundary_treatment':'NOT_DISCLOSED',
@@ -347,21 +510,29 @@ def validate_plan_sequence(days):
         return {"passed":False,"checks":checks,"problem":"INVALID_SEQUENCE:"+str(exc)}
 
 
-def audit_resource_forecasts(days, truth):
+def audit_resource_forecasts(days, truth, window_end=None):
     result={}
-    names=sorted({name for day in days for name in day["components"]})
+    names=sorted(set(truth.columns) | {name for day in days for name in day["components"]})
     for name in names:
         predicted,observed,daily_error=[],[],[]
+        incomplete_days=0
         for day in days:
-            if name not in day["components"]:
-                continue
-            p=np.asarray(day["components"][name],float)
-            y=truth.reindex(pd.DatetimeIndex(day["times"]))[name].to_numpy(float)
+            times=pd.DatetimeIndex(day["times"])
+            p=np.asarray(day["components"].get(name,np.full(len(times),np.nan)),float)
+            if p.shape != (len(times),):
+                raise ValueError("资源预测长度与发布时间网格不一致")
+            y=truth.reindex(times)[name].to_numpy(float)
+            if window_end is not None:
+                y=np.where(times <= pd.Timestamp(window_end),y,np.nan)
             predicted.extend(p);observed.extend(y)
-            if np.isfinite(y).all():
+            if np.isfinite(y).all() and np.isfinite(p).all():
                 daily_error.append(float(np.sum(p-y)*C.DT))
+            else:
+                incomplete_days+=1
         result[name]=dict(score_resources(predicted,observed),
                           cumulative_error_m3=daily_error,
+                          incomplete_daily_error_count=incomplete_days,
+                          target_time_end=str(pd.Timestamp(window_end)) if window_end is not None else None,
                           mean_abs_daily_error_m3=float(np.mean(np.abs(daily_error))) if daily_error else None)
     return result
 
@@ -408,7 +579,8 @@ def historical_replay(data,days):
     """独立事后差额代理；未来柜位/基准耗气仅在此评分器中读取。"""
     counts={"known_steps":0,"unknown_steps":0,"holder_low_steps":0,"holder_high_steps_before_release":0,
             "reference_holder_low_steps":0,"additional_holder_low_steps":0,
-            "proxy_deficit_m3h":0.,"reference_deficit_m3h":0.,"extra_deficit_m3h":0.}
+            "proxy_stock_shortfall_m3_hours":0.,"reference_stock_shortfall_m3_hours":0.,
+            "extra_stock_shortfall_m3_hours":0.}
     reset=[]
     for day in days:
         issue=pd.Timestamp(day["issued_at"])
@@ -444,9 +616,9 @@ def historical_replay(data,days):
             counts["holder_low_steps"]+=int(low.any())
             counts["reference_holder_low_steps"]+=int(reference_low.any())
             counts["additional_holder_low_steps"]+=int((low & ~reference_low).any())
-            counts["proxy_deficit_m3h"]+=float(deficit.sum()*C.DT)
-            counts["reference_deficit_m3h"]+=float(reference_deficit.sum()*C.DT)
-            counts["extra_deficit_m3h"]+=float(np.maximum(deficit-reference_deficit,0.).sum()*C.DT)
+            counts["proxy_stock_shortfall_m3_hours"]+=float(deficit.sum()*C.DT)
+            counts["reference_stock_shortfall_m3_hours"]+=float(reference_deficit.sum()*C.DT)
+            counts["extra_stock_shortfall_m3_hours"]+=float(np.maximum(deficit-reference_deficit,0.).sum()*C.DT)
             counts["holder_high_steps_before_release"]+=int((state > .90*np.array(C.CAPACITY)+2.).any())
             state=np.minimum(state,.90*np.array(C.CAPACITY))
             counts["known_steps"]+=1;known+=1
@@ -454,5 +626,6 @@ def historical_replay(data,days):
     counts.update(complete=counts["unknown_steps"]==0,basis="posthoc_historical_difference_proxy_no_pipeline_buffer",
                   official_reconstruction=False,executed_revenue=None,daily_coverage=reset,
                   scope="historical_proxy_diagnostic_not_official_violation_count",
+                  shortfall_unit="m3_hours_of_stock_gap_not_gas_flow",
                   instantaneous_flow_assumption="left_endpoint_hold_over_15min")
     return counts
