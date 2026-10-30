@@ -113,7 +113,10 @@ POLICY = {"source": "adopted_project_policy", "publication": "07:00", "availabil
           "min_load": .60, "solver_seconds": 10., "mip_gap": .01,
           "power_tolerance": .001, "gas_tolerance": 1., "stock_tolerance": 2.,
           "residual_days": 28, "vent_penalty_cny_m3": .10,
-          "switch_penalty_cny": 30., "terminal_constraint": False}
+          # 启停罚金 30→60：30 元太轻，求解器会为很小的收益反复切换机组构型。
+          # 21 天重解对比 10/60/120 三档，60 是唯一"计划净值与电价加权比双升"的点
+          # （净值 +0.352%、电价加权比 +0.00067），120 过头反而压收益。
+          "switch_penalty_cny": 60., "terminal_constraint": False}
 GAS_POWER_ACCEPTANCE={"max_wape":.10,"max_abs_bias":.05,"source":"local_engineering_gate"}
 GROUP_DISPATCH={"history_days":28,"holdout_days":7,"max_wape":.15,"max_abs_bias":.05,
                 "mapping_penalty":10.,"smooth_penalty":10.,"source":"historical_inferred_soft_objective"}
