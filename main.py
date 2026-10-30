@@ -243,6 +243,7 @@ def infer(ctx,quick=False,reuse=None,opt_only=False):
                 "anchor_disqualification_official_rule":"unspecified"},
             "upload_ready":coverage["passed"],"training_performed":not bool(reuse),"prediction_performed":not opt_only,
             "reused_models_from":str(reuse) if reuse else None,"recipe":short.recipe,
+            "share_calibration":C.SHARE_CALIBRATION,
             "prediction_score":{"status":"NO_OBSERVED_TEST_TRUTH","score":None,
                 "reason":"测试期负荷标签为空，不能计算本地1-MAPE或推断官网分数"},
             "prediction_grid":[str(origins[0]),str(origins[-1])],
@@ -297,6 +298,13 @@ def self_check(ctx):
     assert np.isclose(price_weighted_load([price_day])['ratio'],350./300.)
     sample=project_load(np.array([[-10.,300.],[210.,0.],[100.,150.],[0.,0.]]))
     assert (sample[:,0]>=0).all() and (sample[:,0]<=200).all() and (sample[:,1]>=sample[:,0]).all()
+    # 分组份额校准：高负荷段被"大机组满载"下界抬起，低负荷段按目标份额，关闭时逐值不变。
+    probe=np.array([[[80.,200.],[120.,300.],[200.,440.]]])
+    cal_s,cal_l=main_s.calibrate_group_share(probe,probe,C.SHARE_CALIBRATION)
+    assert np.allclose(cal_s[:,:,0],[61.,91.5,200.],atol=1e-6)
+    assert (cal_s[:,:,0]<=cal_s[:,:,1]).all() and (cal_s[:,:,1]<=cal_s[:,:,0]+240.).all()
+    off_s,off_l=main_s.calibrate_group_share(probe,probe,{"enabled":False})
+    assert np.allclose(off_s,probe) and np.allclose(off_l,probe)
     inputs={"available":np.tile([450000.,450000.],(96,1)),"split":np.tile([.5,.5],(96,1)),
             "optional_caps":np.zeros((96,2)),"budget_blast":np.full(96,900000.)}
     previous=np.array([30.,30.,30.,30.,75.,75.])

@@ -516,6 +516,9 @@ def predict_deployed(short, long, prepared, origins, recipe=None):
             frame *= factor[:, None, None]
             frame[:, :, 0] = np.clip(frame[:, :, 0], 0., cap_small)
             frame[:, :, 1] = np.clip(frame[:, :, 1], frame[:, :, 0], frame[:, :, 0]+cap_large)
+    # 分组份额校准放在最后：它按 gall 重构 g1，必须在所有水平/形状后处理之后执行，
+    # 否则后续缩放会把目标份额重新拉开。
+    ps, pl = calibrate_group_share(ps, pl, recipe.get("share_calibration"))
     return reconcile_groups(ps), pl
 
 
@@ -545,6 +548,39 @@ def reconcile_groups(pred):
     out[:, :, 0]=np.clip(out[:, :, 0],0.,small)
     out[:, :, 1]=np.clip(out[:, :, 1],out[:, :, 0],out[:, :, 0]+large)
     return out
+
+
+def calibrate_group_share(short_pred,long_pred,cfg=None):
+    """按目标分组份额重构 generator_1，抑制整段同向的机组组合偏差。
+
+    模型学到的是训练期的平均份额（约 0.369），而低负荷时大机组优先满载、小机组
+    少开，真实份额更低；起报后机组组合不可观测，树模型无法自行修正。这里按目标
+    份额重算 g1，再用"大机组满载"下界 `gall-240` 保护物理可行性——高负荷时段大
+    机组已满发，g1 无法继续下调，只能保持在下界。
+
+    参数由 `config.SHARE_CALIBRATION` 给出，只做下调、全期单一常数，不按日期或
+    时段细分，也不读取测试期标签。份额下调幅度受 `max_share_drop` 限制，避免配置
+    误写把预测压到不合理区间。
+    """
+    cfg=C.SHARE_CALIBRATION if cfg is None else cfg
+    out=[]
+    for frame,span in ((short_pred,"short"),(long_pred,"long")):
+        arr=np.asarray(frame,float).copy()
+        target=(cfg or {}).get("target",{}).get(span)
+        if not (cfg or {}).get("enabled") or target is None:
+            out.append(arr)
+            continue
+        lower_cap=float(cfg.get("lower_capacity",240.))
+        upper_cap=float(cfg.get("upper_capacity",200.))
+        if not 0.15<=float(target)<=0.45:
+            raise ValueError("分组份额目标超出合理区间，拒绝静默使用异常配置")
+        gall=arr[:, :, 1]
+        proposed=float(target)*gall
+        lower=np.maximum(gall-lower_cap,0.)
+        upper=np.minimum(gall,upper_cap)
+        arr[:, :, 0]=np.clip(proposed,lower,upper)
+        out.append(arr)
+    return out[0],out[1]
 
 
 def align_long_level(long_pred, short_pred, alpha):

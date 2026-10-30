@@ -679,7 +679,34 @@ def _solve_joint(inputs,initial,beta,stock0,prices,inventory=True,export_shortfa
             third=optimize(cost)
             stages.append({'objective':'existing_margin_and_revenue_cost','status_code':int(third.status),
                 'mip_gap':getattr(third,'mip_gap',None),'value':float(third.fun) if third.x is not None else None})
-            if third.x is not None:result=third
+            # 超时可返回较差可行解；优先保留满足最终约束的更优已有解。
+            final_constraint=rows.constraint()
+            incumbent_valid=_primal_validation(result.x,lo,hi,integer,final_constraint)['passed']
+            if third.x is not None and (not incumbent_valid or cost@third.x < cost@result.x-1e-7):
+                result=third
+                incumbent_valid=True
+            # 最终MILP限时未证最优时，固定已找到的离散状态细化连续量；不能放松前两级安全目标。
+            if incumbent_valid and (third.x is None or third.status != 0):
+                fixed_lo=lo.copy();fixed_hi=hi.copy()
+                fixed=np.flatnonzero(integer)
+                fixed_lo[fixed]=np.rint(result.x[fixed]);fixed_hi[fixed]=fixed_lo[fixed]
+                revenue_vector=np.zeros(size)
+                revenue_vector[p.ravel()]=np.repeat(np.asarray(prices)*250.,6)
+                revenue_floor=float(revenue_vector@result.x)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore',message='Unrecognized options detected:.*threads.*')
+                    refined=milp(cost,integrality=np.zeros_like(integer),bounds=Bounds(fixed_lo,fixed_hi),
+                        constraints=[final_constraint,LinearConstraint(revenue_vector,revenue_floor-.01,np.inf)],
+                        options={'time_limit':C.POLICY['solver_seconds'],
+                        'threads':C.CPU_THREADS})
+                if refined.x is not None:
+                    refined.primal_validation=_primal_validation(refined.x,lo,hi,integer,final_constraint)
+                    if not refined.primal_validation['passed'] or revenue_vector@refined.x<revenue_floor-.02:
+                        refined.x=None
+                improved=refined.x is not None and cost@refined.x < cost@result.x-1e-7
+                stages.append({'objective':'fixed_integer_economic_refinement','status_code':int(refined.status),
+                    'value':float(cost@refined.x) if refined.x is not None else None,'improved':bool(improved)})
+                if improved:result=refined
     else:
         result=optimize(cost)
     meta={'status_code':int(result.status),'message':str(result.message),'seconds':time.perf_counter()-tick,
@@ -693,6 +720,7 @@ def _solve_joint(inputs,initial,beta,stock0,prices,inventory=True,export_shortfa
     meta['status']='OPTIMAL' if result.status==0 else 'FEASIBLE_WITH_GAP'
     if recovery_export:meta['status']='EXPORT_RECOVERY_WITH_REPORTED_VIOLATIONS'
     x=result.x
+    if recovery_export:meta['recovery_economic_cost']=float(cost@x)
     out={'power':x[p],'gas':x[q],'stocks':x[h] if inventory else np.full((97,2),np.nan),
          'vent':x[recovery_vent] if recovery_export else np.zeros((96,2)),
          'export_shortfall_m3h':x[shortfall] if export_shortfall else np.zeros(96),
