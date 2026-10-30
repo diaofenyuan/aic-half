@@ -1,11 +1,9 @@
 """96步长期模型独立训练、保存及推理，复用无状态树训练原语。"""
-from main_s import train_load, predict_load, freeze_g1_prior
+from main_s import train_load, predict_load
 
 
 def train_long(prepared, recipe=None, quick=False, progress=None):
-    bundle=train_load(prepared, "long", recipe, quick, progress)
-    freeze_g1_prior(bundle,prepared)
-    return bundle
+    return train_load(prepared, "long", recipe, quick, progress)
 
 
 def predict_long(bundle, prepared, origins):

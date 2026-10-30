@@ -14,17 +14,18 @@ import main_l
 import main_opt
 import output
 from data_cleaning.pipeline import prepare_data, build_features
-from data_cleaning.quality import (truth_cube, score_load, score_horizons, validate_day,
+from data_cleaning.quality import (truth_cube, score_load, score_horizons, score_prediction_csv, score_origin_window, load_diagnostics, validate_day,
                                    validate_result_files, historical_replay, project_load, audit_resource_forecasts,
-                                   full_window_coverage)
+                                   price_weighted_load, score_resources, full_window_coverage)
 
 LOG=logging.getLogger("aic-half")
 
 
 def prediction_view(data,start):
-    """预测输入与评分标签分离，两个标签入口都整段遮挡。"""
+    # 评分真值留在原始对象，预测视图只暴露窗口前的标签，避免后续特征误读未来值。
     view=data.masked_copy(start,mask_use=True)
-    view.labels=data.labels.copy();view.labels.loc[pd.Timestamp(start):]=np.nan
+    view.labels=data.labels.copy()
+    view.labels.loc[view.labels.index>=pd.Timestamp(start),:]=np.nan
     return view
 
 
@@ -45,16 +46,54 @@ def evaluate_load(data,origins,recipe,quick=False):
     short=main_s.train_short(train,recipe,quick,LOG.info)
     long=main_l.train_long(train,recipe,quick,LOG.info)
     view=prediction_view(data,start)
-    ps,pl=main_s.predict_deployed(short,long,view,origins)
-    ys,yl=truth_cube(data,origins,range(1,9),window_end=end),truth_cube(data,origins,range(1,97),window_end=end)
+    ps,pl=main_s.predict_deployed(short,long,view,origins,recipe)
+    # 历史评分按导出CSV的6位精度计算，避免与实际提交文件产生细微差异。
+    ps,pl=np.round(ps,6),np.round(pl,6)
+    # 各历史窗统一以声明窗口末端截断目标时刻；目标真值不进入预测视图。
+    ys=truth_cube(data,origins,range(1,9),window_end=end)
+    yl=truth_cube(data,origins,range(1,97),window_end=end)
     ns=main_s.naive_profile(train,origins,range(1,9),train.index[-1])
     nl=main_s.naive_profile(train,origins,range(1,97),train.index[-1])
     metrics={"short":score_load(ps,ys),"long":score_load(pl,yl),
              "short_horizons":score_horizons(ps,ys),"long_horizons":score_horizons(pl,yl),
              "naive_short":score_load(ns,ys),"naive_long":score_load(nl,yl),
-             "scoring_window":{"start":str(start),"end":str(end),"target_times_clipped":True},
-             "max_training_target":str(train.index[-1]),"information":"process_only;21day_target_blackout"}
+             "short_diagnostics":load_diagnostics(ps,ys,origins),
+             "long_diagnostics":load_diagnostics(pl,yl,origins),
+             "score_contract":{"target_time_end":str(end),"tail":"within_window",
+                 "zero_target":"separate_from_mape","target_weight":"equal_local_assumption",
+                 "official_subscore_mapping":"unknown"},
+             "max_training_target":str(train.index[-1]),"information":"process_only;validation_target_blackout"}
+    metrics["available_history_tail_sensitivity"]={
+        "short":score_load(ps,truth_cube(data,origins,range(1,9))),
+        "long":score_load(pl,truth_cube(data,origins,range(1,97))),
+        "role":"diagnostic_only_not_candidate_ranking"}
+    # 最近的半决赛训练段单独报告，原窗口仍是固定主指标，测试集不参与选模。
+    for stage,begin,stop,role in C.STAGES:
+        if stage=="half_train" and role=="train":
+            begin=max(start,pd.Timestamp(begin));stop=min(end,pd.Timestamp(stop))
+            if begin<=stop:
+                metrics["recent_training_window"]={"stage":stage,
+                    "short":score_origin_window(ps,ys,origins,begin,stop),
+                    "long":score_origin_window(pl,yl,origins,begin,stop)}
+    metrics["local_prediction_objective"]=(2*metrics["short"]["macro_score"]+3*metrics["long"]["macro_score"])/5
     return short,long,ps,pl,metrics
+
+
+def validate_prediction_csv_scores(root,data,origins,predictions,metrics):
+    """从导出宽表独立重建标签时间并核对历史评分口径。"""
+    origins=pd.DatetimeIndex(origins)
+    results={}
+    for span,filename,h,pred in (("short","s_result.csv",8,predictions[0]),
+                                  ("long","l_result.csv",96,predictions[1])):
+        score,csv_pred,csv_truth=score_prediction_csv(Path(root)/filename,data.labels,origins,h,origins[-1])
+        expected_truth=truth_cube(data,origins,range(1,h+1),window_end=origins[-1])
+        passed=(np.array_equal(csv_pred,pred) and np.array_equal(csv_truth,expected_truth,equal_nan=True) and
+                all(score[t]["score"]==metrics[span][t]["score"] for t in C.TARGETS))
+        if not passed:
+            raise ValueError(f"{span}历史评分与导出CSV不一致")
+        results[span]={"passed":True,"time_alignment":"origin_plus_column_offset",
+                       "basis":"independent_csv_and_reference_labels","official_aggregation":"unknown"}
+    return results
 
 
 def run_backtest(ctx,quick=False):
@@ -68,17 +107,21 @@ def run_backtest(ctx,quick=False):
         resource=main_opt.fit_resources(train,quick,LOG.info)
         view=prediction_view(data,origins[0])
         schedule,days,opt=main_opt.optimize_daily(resource,view,origins,quick,LOG.info)
-        replay=historical_replay(data,days)
+        opt["price_weighted_load"]=price_weighted_load(days)
+        replay=historical_replay(data.prefix(origins[-1]),days)
         metrics.append({"fold":spec["name"],**score,"optimization":opt,"historical_replay":replay,
-                        "resource_validation":audit_resource_forecasts(days,main_opt.resource_labels(data))})
+                        "resource_validation":audit_resource_forecasts(days,main_opt.resource_labels(data),
+                                                                       window_end=origins[-1])})
         fold_dir=ctx["root"]/spec["name"]
         (fold_dir/"模型").mkdir(parents=True)
         output.save_models(fold_dir/"模型",short,long,resource,{"role":"development","source":ctx["hashes"]})
         output.write_results(fold_dir,origins,ps,pl,schedule)
+        metrics[-1]["csv_score_validation"]=validate_prediction_csv_scores(fold_dir,data,origins,(ps,pl),score)
         restored_s,restored_l,_,_=output.load_models(fold_dir)
         probe=origins[::251]
-        rs,rl=main_s.predict_deployed(restored_s,restored_l,view,probe)
-        reload_error={"short":float(np.max(np.abs(rs-ps[::251]))),"long":float(np.max(np.abs(rl-pl[::251])))}
+        restored_ps,restored_pl=main_s.predict_deployed(restored_s,restored_l,view,probe)
+        reload_error={"short":float(np.max(np.abs(restored_ps-ps[::251]))),
+                      "long":float(np.max(np.abs(restored_pl-pl[::251])))}
         if max(reload_error.values())>1e-6:
             raise ValueError("历史验证模型重载不一致")
         metrics[-1]["reload_max_difference"]=reload_error
@@ -115,9 +158,10 @@ def reload_check(ctx,short,long,resource,data,origins,training_contract=None):
             raise ValueError(f"{name}保存重载不一致")
     before=main_s.predict_deployed(short,long,data,probe)
     after=main_s.predict_deployed(loaded_s,loaded_l,data,probe)
-    for i,name in enumerate(("deployed_short","deployed_long")):
-        differences[name]=float(np.max(np.abs(before[i]-after[i])))
-        if differences[name]>1e-6:raise ValueError("部署预测保存重载不一致")
+    differences["deployed_short"]=float(np.max(np.abs(before[0]-after[0])))
+    differences["deployed_long"]=float(np.max(np.abs(before[1]-after[1])))
+    if max(differences["deployed_short"],differences["deployed_long"])>.000001:
+        raise ValueError("部署预测保存重载不一致")
     issue=pd.DatetimeIndex(origins)[0].normalize()+pd.Timedelta(hours=7)
     a=main_opt.forecast_resources(resource,data,issue)
     z=main_opt.forecast_resources(loaded_r,data,issue)
@@ -182,6 +226,7 @@ def infer(ctx,quick=False,reuse=None,opt_only=False):
         LOG.info("推理：%s个起报点；测试标签不计算本地分数",len(origins))
         ps,pl=main_s.predict_deployed(short,long,view,origins)
     schedule,days,opt=main_opt.optimize_daily(resource,view,origins,quick,LOG.info)
+    opt["price_weighted_load"]=price_weighted_load(days)
     if opt_only:
         s=schedule.copy()
         s.datetime=pd.to_datetime(s.datetime).dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -204,6 +249,9 @@ def infer(ctx,quick=False,reuse=None,opt_only=False):
                 "anchor_disqualification_official_rule":"unspecified"},
             "upload_ready":coverage["passed"],"training_performed":not bool(reuse),"prediction_performed":not opt_only,
             "reused_models_from":str(reuse) if reuse else None,"recipe":short.recipe,
+            "share_calibration":C.SHARE_CALIBRATION,
+            "prediction_score":{"status":"NO_OBSERVED_TEST_TRUTH","score":None,
+                "reason":"测试期负荷标签为空，不能计算本地1-MAPE或推断官网分数"},
             "prediction_grid":[str(origins[0]),str(origins[-1])],
             "optimization_grid":[str(schedule.datetime.iloc[0]),str(schedule.datetime.iloc[-1])],
             "quality":data.quality,"data_sources":data.sources,"source":ctx["hashes"],
@@ -228,33 +276,48 @@ def self_check(ctx):
     altered.frame.loc[altered.index>t,cols]=0.
     changed=build_features(altered)
     assert np.allclose(base.loc[:t],changed.loc[:t],equal_nan=True)
-    masked=prediction_view(data,data.index[-192])
+    cutoff=data.index[-192]
+    masked=prediction_view(data,cutoff)
     assert np.allclose(base,build_features(masked),equal_nan=True)
-    assert masked.labels.loc[data.index[-192]:].isna().all().all()
-    assert data.labels.loc[data.index[-192]:].notna().any().any()
+    assert masked.labels.loc[cutoff:].isna().all().all()
+    assert masked.labels.loc[:cutoff-pd.Timedelta(minutes=15)].equals(data.labels.loc[:cutoff-pd.Timedelta(minutes=15)])
+    assert data.labels.loc[cutoff:].notna().any().any()
     try:
         score_load(np.array([[[np.nan,1.]]]),np.array([[[1.,1.]]]))
     except ValueError:
         pass
     else:
         raise AssertionError("非有限预测不能通过缩小评分分母获得假增益")
-    from data_cleaning.quality import score_resources, audit_resource_forecasts
-    score_origins=data.index[-4:-1]
-    limited=truth_cube(data,score_origins,[1,2],window_end=score_origins[-1])
-    assert np.isnan(limited[-1]).all() and np.isnan(limited[-2,1]).all()
-    assert np.allclose(limited[0,0],data.labels.loc[score_origins[1]],equal_nan=True)
-    missing_resource=score_resources([10.,np.nan],[10.,100.])
-    assert missing_resource['wape'] is None and not missing_resource['score_valid']
-    assert missing_resource['cells']==2 and missing_resource['missing_prediction_cells']==1
-    mixed_resource=score_resources([12.,5.,np.nan],[10.,0.,np.nan])
-    assert mixed_resource['score_valid'] and np.isclose(mixed_resource['wape'],.7)
-    assert mixed_resource['zero_false_volume']==5.*C.DT
-    missing_day=audit_resource_forecasts([{'times':score_origins[:2],'components':{}}],
-        pd.DataFrame({'resource':[10.,100.]},index=score_origins[:2]))['resource']
-    assert not missing_day['score_valid'] and missing_day['missing_prediction_cells']==2
     assert not any("holder" in x or "generator" in x or "load_" in x for x in base.columns)
+    observed_score=score_resources([20.,100.],[100.,100.])
+    missing_score=score_resources([np.nan,100.],[100.,100.])
+    assert observed_score['wape']==.4 and missing_score['wape'] is None
+    assert not missing_score['score_valid'] and missing_score['cells']==2 and missing_score['missing_prediction_cells']==1
+    zero_score=score_resources([10.,100.],[0.,100.])
+    assert zero_score['wape']==.1 and zero_score['zero_false_volume']==2.5
+    audit_times=data.index[-4:-2]
+    audit_truth=pd.DataFrame({'budget_blast':[100.,100.]},index=audit_times)
+    partial=[{'times':[audit_times[0]],'components':{'budget_blast':[100.]}},
+             {'times':[audit_times[1]],'components':{}}]
+    audit=audit_resource_forecasts(partial,audit_truth)['budget_blast']
+    assert audit['wape'] is None and audit['missing_prediction_cells']==1
+    bounded=audit_resource_forecasts(partial,audit_truth,window_end=audit_times[0])['budget_blast']
+    assert bounded['wape']==0. and bounded['cells']==1 and bounded['missing_truth_cells']==1
+    tiny_origins=data.index[-3:-1]
+    limited=truth_cube(data,tiny_origins,[1,2],window_end=tiny_origins[-1])
+    assert np.isnan(limited[0,1]).all() and np.isnan(limited[1]).all()
+    price_day={'issued_at':'2025-06-01 07:00:00','prices':[1.,3.],
+               'power':np.array([[50.,0.,0.,0.,0.,0.],[100.,0.,0.,0.,0.,0.]])}
+    assert np.isclose(price_weighted_load([price_day])['ratio'],350./300.)
     sample=project_load(np.array([[-10.,300.],[210.,0.],[100.,150.],[0.,0.]]))
     assert (sample[:,0]>=0).all() and (sample[:,0]<=200).all() and (sample[:,1]>=sample[:,0]).all()
+    # 分组份额校准：高负荷段被"大机组满载"下界抬起，低负荷段按目标份额，关闭时逐值不变。
+    probe=np.array([[[80.,200.],[120.,300.],[200.,440.]]])
+    cal_s,cal_l=main_s.calibrate_group_share(probe,probe,C.SHARE_CALIBRATION)
+    assert np.allclose(cal_s[:,:,0],[61.,91.5,200.],atol=1e-6)
+    assert (cal_s[:,:,0]<=cal_s[:,:,1]).all() and (cal_s[:,:,1]<=cal_s[:,:,0]+240.).all()
+    off_s,off_l=main_s.calibrate_group_share(probe,probe,{"enabled":False})
+    assert np.allclose(off_s,probe) and np.allclose(off_l,probe)
     inputs={"available":np.tile([450000.,450000.],(96,1)),"split":np.tile([.5,.5],(96,1)),
             "optional_caps":np.zeros((96,2)),"budget_blast":np.full(96,900000.)}
     previous=np.array([30.,30.,30.,30.,75.,75.])
@@ -268,7 +331,26 @@ def self_check(ctx):
     # 历史组合可能未出现单一气种；合法可用量不应被经验最低份额拒绝。
     support={'available':True,'equations':[[-1.,0.,.02],[0.,-1.,.02],[1.,1.,-.15]],
         'source':'synthetic_historical_share','train_end':'2025-05-31 23:45:00'}
-    solved,solver=main_opt.solve_milp(inputs,previous,beta,stock,np.full(96,.53),support=support)
+    # 核验仍按聚合硬上限 30/66；正常计划生成沿用 30MW 小机组边界（不排除合法启停），
+    # 总负荷正常生成使用选定回档配方的 60MW 裕度。
+    assert C.POLICY['ramp']==(30.,66.) and C.POLICY['generate_ramp']==(30.,60.)
+    ramp_issue=pd.Timestamp('2025-06-01 07:00:00')
+    ramp_prior=np.array([30.,30.,30.,30.,72.,72.])
+    ramp_power=np.tile([37.5,37.5,37.5,37.5,90.,90.],(96,1))
+    ramp_stock=np.tile(stock,(97,1))
+    ramp_day={'gas':np.tile([1100000.,0.,0.],(96,1)),'power':ramp_power,
+        'previous_power':ramp_prior,'available':np.tile([550000.,550000.],(96,1)),
+        'split':np.tile([.5,.5],(96,1)),'stocks':ramp_stock,'vent':np.zeros((96,2)),
+        'beta':beta,'anchor':stock,'anchor_observed':True,
+        'initial_state':{'basis':'synthetic_observed_unit_state'},'resource_mode':'net_inferred',
+        'issued_at':str(ramp_issue),'max_observed_at':str(ramp_issue),
+        'times':pd.date_range(ramp_issue+pd.Timedelta(minutes=15),periods=96,freq='15min'),
+        'optional_caps':np.zeros((96,2)),
+        'bridge':{'gas_m3h':[1100000.,0.,0.],'available_m3h':[550000.,550000.],'split':[.5,.5]}}
+    ramp_check=validate_day(ramp_day)
+    assert ramp_check['passed'] and np.isclose(ramp_check['details']['max_aggregate_change_mw'][1],66.)
+    solved,solver=main_opt.solve_milp(inputs,previous,beta,stock,np.full(96,.53),
+                                      support=support,scenarios=[beta*10.])
     if solved is None:
         raise AssertionError(solver)
     day=dict(inputs,**solved,previous_power=previous,beta=beta,anchor=stock,anchor_observed=True,
@@ -288,6 +370,25 @@ def self_check(ctx):
         issued_at='2025-06-01 07:00:00',max_observed_at='2025-06-01 07:00:00',
         bridge={'gas_m3h':np.zeros(3),'available_m3h':off_inputs['available'][0],'split':off_inputs['split'][0]})
     assert validate_day(off_day)['passed'] and (off['power'].sum(axis=1)>=30.-.001).any()
+    overflow_inputs={'available':np.tile([0.,10000.],(96,1)),'split':np.tile([1.,0.],(96,1)),
+        'optional_caps':np.zeros((96,2)),'budget_blast':np.zeros(96),'previous_gas':np.zeros(3)}
+    overflow_stock=np.array([150000.,179000.])
+    overflow,overflow_solver=main_opt._solve_joint(overflow_inputs,np.zeros(6),beta,overflow_stock,
+                                                   np.zeros(96),recovery_export=True)
+    if overflow is None:raise AssertionError('恢复分支应允许超过规划上限后按90%自动放散')
+    replay_stock,replay_vent=main_opt._replay_stocks(overflow_stock,overflow_inputs,overflow['gas'])
+    assert np.allclose(overflow['stocks'],replay_stock,atol=C.POLICY['stock_tolerance'],rtol=0.)
+    assert np.allclose(overflow['vent'],replay_vent,atol=C.POLICY['gas_tolerance'],rtol=0.)
+    assert np.isclose(overflow['stocks'][1,1],180000.) and overflow['vent'][0,1]>0.
+    overflow_day=dict(overflow_inputs,**overflow,previous_power=np.zeros(6),beta=beta,
+        anchor=overflow_stock-C.DT*overflow_inputs['available'][0],anchor_observed=True,
+        initial_state={'basis':'synthetic_observed_all_units_off'},resource_mode='net_inferred',
+        issued_at='2025-06-01 07:00:00',max_observed_at='2025-06-01 07:00:00',fallback_used=True,
+        bridge={'gas_m3h':np.zeros(3),'available_m3h':overflow_inputs['available'][0],'split':[1.,0.]})
+    overflow_check=validate_day(overflow_day)
+    assert not overflow_check['passed'] and overflow_check['checks']['independent_holder_safety']
+    assert overflow_check['checks']['holder_balance'] and overflow_check['checks']['overflow_rule']
+    assert not overflow_check['checks']['planning_bounds']
     zero_view=data.prefix(data.index[-1]);zero_view.frame=zero_view.frame.tail(97).copy()
     zero_view.labels=zero_view.labels.reindex(zero_view.index)
     gas_columns=[name for name in zero_view.frame if name.startswith(('gas_','gas_user_'))]
@@ -301,6 +402,7 @@ def self_check(ctx):
     from copy import deepcopy
     controlled=deepcopy(day)
     controlled['prices']=np.full(96,.53)
+    controlled['previous_gas']=np.array([900000.,0.,0.])
     controlled['control_calibration']={'version':C.DISPATCH_CONTROL['version'],'train_end':'2025-05-31 23:45:00',
         'optional_use_calibration':deepcopy(C.OPTIONAL_USE_CALIBRATION)}
     optional_pred={'budget_converter':np.full(96,25000.)}
@@ -326,6 +428,15 @@ def self_check(ctx):
     tampered_bound['inventory_precheck']['normal_plan_infeasible_proven']=True
     assert not validate_day(tampered_bound)['checks']['inventory_precheck_fidelity']
     assert validate_day(controlled)['details']['historical_gas_support']['outside_steps']==96
+    assert validate_day(controlled)['details']['mapping_sensitivity']['mapped_capacity_exceedances']>0
+    controlled['joint_control']['reserve_risk']={'target_m3':[150000.,100000.],
+        'max_observed_at':controlled['issued_at'],
+        'scenario':{'history_end':controlled['issued_at'],'coverage_guarantee':False}}
+    assert validate_day(controlled)['checks']['reserve_risk_causality']
+    future_risk=deepcopy(controlled)
+    future_risk['joint_control']['reserve_risk']['scenario']['history_end']=str(
+        pd.Timestamp(controlled['issued_at'])+pd.Timedelta(minutes=15))
+    assert not validate_day(future_risk)['checks']['reserve_risk_causality']
     bad_optional=deepcopy(controlled);bad_optional['optional_caps'][0,1]+=10.
     assert not validate_day(bad_optional)['checks']['optional_calibration_fidelity']
     future_optional=deepcopy(controlled)
@@ -367,15 +478,19 @@ def self_check(ctx):
     assert not validate_day(day)["checks"]["holder_balance"]
     report={"status":"SELF_CHECK_PASSED","features":len(base.columns),"checks":[
         "future_perturbation","target_and_gas_blackout","label_object_blackout","reject_nonfinite_score",
-        "score_target_window_boundary","reject_missing_resource_prediction","resource_zero_and_missing_truth",
         "optimistic_inventory_infeasibility_bound","independent_infeasibility_claim_mutation",
-        "reject_missing_daily_resource_component","no_holder_load_features","capacity_projection",
+        "no_holder_load_features","capacity_projection",
+        "resource_missing_prediction_rejected","resource_missing_day_rejected","resource_zero_truth_false_volume","historical_target_window_end",
+        "independent_price_weighted_load",
         "synthetic_milp","independent_balance_mutation","group_refinement_fixed_resources_and_terminal",
         "joint_control_validation","independent_benefit_floor_mutation","initial_boundary_failure_attribution",
+        "mapping_sensitivity_diagnostic_only","legal_66mw_aggregate_ramp","recovery_ramp_66_generation_ramp_60",
+        "reserve_risk_future_closure_rejected","recovery_automatic_overflow_and_failure_reporting",
         "process_resource_causality_mutation","no_fixed_gas_ratio","local_initial_condition_vs_official_unknown",
         "all_off_to_minimum_unit_startup","observed_zero_bridge_not_replaced_by_forecast",
         "optional_prefix_zero_vs_missing","optional_calibration_value_and_future_mutation"],
         "solver":solver,"synthetic_validation":check,"group_refinement":refined["refinement"]}
+    output.assert_source(ctx)
     output.write_report(ctx,report)
     return report
 

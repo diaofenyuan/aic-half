@@ -526,15 +526,11 @@ def _primal_validation(x,lower,upper,integer,constraint):
 
 
 def _solve_joint(inputs,initial,beta,stock0,prices,inventory=True,export_shortfall=False,
-                mapping=None,support=None,scenarios=(),risk=None,price_ratio=None,benefit_floor=None,recovery_export=False,
-                scenario_relax_steps=0,terminal_command=None):
+                mapping=None,support=None,scenarios=(),risk=None,price_ratio=None,benefit_floor=None,recovery_export=False):
     if inventory and export_shortfall:
         raise ValueError('库存模型不得借用导出缺气松弛')
     if recovery_export and (not inventory or export_shortfall):
         raise ValueError('库存恢复只允许作为显式的库存轨迹导出分支')
-    if (not isinstance(scenario_relax_steps,int) or not 0<=scenario_relax_steps<=96 or
-        ((scenario_relax_steps or terminal_command is not None) and not recovery_export)):
-        raise ValueError('经验情景前段调整和末条固定仅允许用于显式恢复导出')
     n=96; cap=np.asarray(C.UNITS);beta=np.asarray(beta)
     p=np.arange(576).reshape(n,6);on=np.arange(576,1152).reshape(n,6)
     q=np.arange(1152,1440).reshape(n,3);h=np.arange(1440,1634).reshape(97,2)
@@ -551,6 +547,10 @@ def _solve_joint(inputs,initial,beta,stock0,prices,inventory=True,export_shortfa
     if recovery_export:size+=96
     safety_gap=np.arange(size,size+192).reshape(96,2) if recovery_export else None
     if recovery_export:size+=192
+    recovery_vent=np.arange(size,size+192).reshape(96,2) if recovery_export else None
+    if recovery_export:size+=192
+    vent_active=np.arange(size,size+192).reshape(96,2) if recovery_export else None
+    if recovery_export:size+=192
     cost=np.zeros(size);lo=np.zeros(size);hi=np.full(size,np.inf);integer=np.zeros(size)
     hi[p]=cap;hi[on]=1.;integer[on]=1.;hi[switch]=1.
     hi[q[:,1:]]=inputs['optional_caps']
@@ -559,27 +559,30 @@ def _solve_joint(inputs,initial,beta,stock0,prices,inventory=True,export_shortfa
     if price_ratio is not None:
         cost[p]=-(np.asarray(prices)-price_ratio)[:,None]*1000*C.DT
     cost[switch]=C.POLICY['switch_penalty_cny'];cost[q]=1e-6
-    if terminal_command is not None:
-        terminal_power=np.asarray(terminal_command['power'],float)
-        terminal_gas=np.asarray(terminal_command['gas'],float)
-        if terminal_power.shape!=(6,) or terminal_gas.shape!=(3,) or not np.isfinite(np.r_[terminal_power,terminal_gas]).all():
-            raise ValueError('恢复末条指令形状或数值错误')
-        lo[p[-1]]=hi[p[-1]]=terminal_power
-        lo[q[-1]]=hi[q[-1]]=terminal_gas
     if inventory:
         lo[h]=np.asarray(C.CAPACITY)*.20;hi[h]=np.asarray(C.CAPACITY)*.85
         lo[h[0]]=stock0;hi[h[0]]=stock0
         if recovery_export:
             # 已知不安全初态可能无法在首步恢复；软变量只衡量失败，独立核验仍按原边界判定。
             lo[h[1:]]=-np.inf
+            hi[h[1:]]=np.asarray(C.CAPACITY)*.90
             cost[recovery_slack]=max(float(np.max(prices)),.01)*1000.*beta[0]*96.
             hi[unsafe_step]=1.;integer[unsafe_step]=1.
-            # 由最大电功率反推的耗气上界可给出合法库存下界，避免任意放大大M。
+            hi[vent_active]=1.;integer[vent_active]=1.
+            cost[recovery_vent]=C.POLICY['vent_penalty_cny_m3']*C.DT
+            # 由最大电功率反推柜位下界；每步先考虑90%自动放散，再计算下一步边界。
             maximum_blast=sum(C.UNITS)/beta[0]
-            minimum_stock=np.asarray(stock0)+C.DT*np.cumsum(np.asarray(inputs['available'])-
-                np.asarray(inputs['split'])*maximum_blast,axis=0)
+            minimum_stock=np.empty((n,2))
+            previous_lower=np.asarray(stock0,float).copy()
+            for k in range(n):
+                previous_lower=np.minimum(previous_lower+C.DT*(np.asarray(inputs['available'])[k]-
+                    np.asarray(inputs['split'])[k]*maximum_blast),.90*np.asarray(C.CAPACITY))
+                minimum_stock[k]=previous_lower
             lo[h[1:]]=minimum_stock
             safety_big_m=np.maximum(.15*np.asarray(C.CAPACITY)-minimum_stock,0.)+C.POLICY['stock_tolerance']
+            vent_big_m=np.maximum(np.asarray(inputs['available']),0.)+np.maximum(
+                np.asarray(stock0)-.90*np.asarray(C.CAPACITY),0.)/C.DT
+            hi[recovery_vent]=vent_big_m
     else: hi[h]=0.
     # 保持确定性资源可行域，期末仅计机会成本，不强加旧的期末气量或库存硬约束。
     cost[tail]=float(np.max(prices))*1000*C.DT
@@ -596,7 +599,6 @@ def _solve_joint(inputs,initial,beta,stock0,prices,inventory=True,export_shortfa
     rows=LinearRows(size)
     if benefit_floor is not None:
         rows.add([(p[k,i],float(prices[k])*250.) for k in range(n) for i in range(6)],low=benefit_floor)
-    q0=np.asarray(inputs.get('previous_gas',[np.nan]*3),float)
     # 正常计划使用生成裕度，恢复分支用已采纳的硬上限；离散启停不能再扣除0.001MW。
     ramp_limits=C.POLICY['ramp'] if recovery_export else C.POLICY['generate_ramp']
     for k in range(n):
@@ -629,51 +631,39 @@ def _solve_joint(inputs,initial,beta,stock0,prices,inventory=True,export_shortfa
         if trusted:
             terms=[(p[k,i],1.) for i in range(4)]+[(q[k,j],-small_beta[j]) for j in range(3)]
             for sign in (-1.,1.): rows.add([(i,v*sign) for i,v in terms]+[(err[k],-1.)],high=0.)
-        # 各情景共用同一份已发布决策，禁止使用事后可调整的耗气来虚构稳健可行性。
-        for b in scenarios:
-            b=np.asarray(b)
-            rows.add([(q[k,j],b[j]) for j in range(3)],high=440.)
-            # 不改变实际功率爬坡；仅恢复前段不强制经验映射的额外爬坡情景。
-            if k<scenario_relax_steps:
-                continue
-            terms=[(q[k,j],b[j]) for j in range(3)]
-            if k:
-                terms += [(q[k-1,j],-b[j]) for j in range(3)];prior=0.
-            elif np.isfinite(q0).all(): prior=float(q0@b)
-            else: continue
-            rows.add(terms,low=prior-ramp_limits[1],high=prior+ramp_limits[1])
-        # 历史气种占比只能说明经验支持范围，不能覆盖官方“无固定配比”的可用气量契约。
-        # 小机组组按真实决策功率核验爬坡，经验映射继续作为软目标。
+        # 历史映射情景只作敏感性诊断，不以推测映射替代决策功率的容量与爬坡约束。
         if inventory:
             for g in range(2):
                 bound=C.DT*inputs['available'][k,g]
-                rows.add([(h[k+1,g],1.),(h[k,g],-1.),(q[k,0],C.DT*inputs['split'][k,g])],low=bound,high=bound)
+                balance=[(h[k+1,g],1.),(h[k,g],-1.),(q[k,0],C.DT*inputs['split'][k,g])]
+                if recovery_export:
+                    balance.append((recovery_vent[k,g],C.DT))
+                rows.add(balance,low=bound,high=bound)
                 if recovery_export:
                     rows.add([(h[k+1,g],1.),(recovery_slack[k,g],1.)],low=.20*C.CAPACITY[g])
                     rows.add([(h[k+1,g],1.),(unsafe_step[k],safety_big_m[k,g])],low=.15*C.CAPACITY[g])
                     rows.add([(h[k+1,g],1.),(safety_gap[k,g],1.)],low=.15*C.CAPACITY[g])
+                    # 放散只可在柜位达到90%上限时发生，避免用人工放散伪造较低柜位。
+                    rows.add([(recovery_vent[k,g],1.),(vent_active[k,g],-vent_big_m[k,g])],high=0.)
+                    big_m=max(.90*C.CAPACITY[g]-minimum_stock[k,g],0.)+C.POLICY['stock_tolerance']
+                    rows.add([(h[k+1,g],1.),(vent_active[k,g],-big_m)],low=.90*C.CAPACITY[g]-big_m)
                 if reserve is not None:
                     rows.add([(h[k+1,g],1.),(reserve[k,g],1.)],low=risk['target_m3'][g])
     rows.add([(q[-1,0],beta[0]),(tail,-1.)],high=float(inputs['budget_blast'][-1])*beta[0])
     tick=time.perf_counter()
     stages=[]
-    def optimize(objective,fixed_binary=None):
+    def optimize(objective):
         constraint=rows.constraint()
-        lower,upper=lo,hi
-        if fixed_binary is not None:
-            lower=lo.copy();upper=hi.copy();ids=np.flatnonzero(integer)
-            lower[ids]=upper[ids]=np.rint(np.asarray(fixed_binary)[ids])
         with warnings.catch_warnings():
             warnings.filterwarnings('ignore',message='Unrecognized options detected:.*threads.*')
-            result=milp(objective,integrality=integer,bounds=Bounds(lower,upper),constraints=constraint,
+            result=milp(objective,integrality=integer,bounds=Bounds(lo,hi),constraints=constraint,
                 options={'time_limit':C.POLICY['solver_seconds'],'mip_rel_gap':C.DISPATCH_CONTROL['mip_gap'],'threads':C.CPU_THREADS})
         if result.x is not None:
-            result.primal_validation=_primal_validation(result.x,lower,upper,integer,constraint)
+            result.primal_validation=_primal_validation(result.x,lo,hi,integer,constraint)
             if not result.primal_validation['passed']:
                 result.x=None
                 result.message=str(result.message)+'; rejected_invalid_primal_point'
         return result
-    cost_source='full_mip';cost_global_certified=False
     if recovery_export:
         objective=np.zeros(size);objective[unsafe_step]=1.
         first=optimize(objective)
@@ -690,60 +680,59 @@ def _solve_joint(inputs,initial,beta,stock0,prices,inventory=True,export_shortfa
             if second.x is not None:result=second
             debt=float(np.maximum(.15*np.asarray(C.CAPACITY)-result.x[h[1:]],0.).sum())
             rows.add([(int(i),1.) for i in safety_gap.ravel()],high=debt+.01)
-            if scenario_relax_steps:
-                # SciPy的MIP阶段不继承上一阶段可行解；先固定已知整数状态优化连续量。
-                # 另试“恢复前段新状态、其余时段原基线状态”，不改变完整模型的约束。
-                cost_source='safety_incumbent'
-                seeds=[('fixed_incumbent',result.x.copy())]
-                if terminal_command is not None and 'reference_power' in terminal_command:
-                    reference=np.asarray(terminal_command['reference_power'],float)
-                    if reference.shape!=(96,6) or not np.isfinite(reference).all():
-                        raise ValueError('恢复参考启停状态形状错误')
-                    hybrid=result.x.copy()
-                    hybrid[on[scenario_relax_steps:]]=(reference[scenario_relax_steps:]>=.6*cap-.001).astype(float)
-                    seeds.append(('fixed_hybrid',hybrid))
-                for label,seed in seeds:
-                    polished=optimize(cost,seed)
-                    stages.append({'objective':label,'status_code':int(polished.status),
-                        'mip_gap':getattr(polished,'mip_gap',None),'value':float(polished.fun) if polished.x is not None else None,
-                        'optimality_scope':'fixed_integer_schedule_only'})
-                    if polished.x is not None and cost@polished.x<cost@result.x-1e-7:
-                        result=polished;cost_source=label
             third=optimize(cost)
             stages.append({'objective':'existing_margin_and_revenue_cost','status_code':int(third.status),
                 'mip_gap':getattr(third,'mip_gap',None),'value':float(third.fun) if third.x is not None else None})
-            if third.x is not None and (not scenario_relax_steps or cost@third.x<cost@result.x-1e-7):
-                result=third;cost_source='full_mip'
-            cost_global_certified=bool(third.x is not None and third.status==0 and
-                (getattr(third,'mip_gap',None) or 0.)<=1e-9 and abs(cost@result.x-third.fun)<=.01)
+            # 超时可返回较差可行解；优先保留满足最终约束的更优已有解。
+            final_constraint=rows.constraint()
+            incumbent_valid=_primal_validation(result.x,lo,hi,integer,final_constraint)['passed']
+            if third.x is not None and (not incumbent_valid or cost@third.x < cost@result.x-1e-7):
+                result=third
+                incumbent_valid=True
+            # 最终MILP限时未证最优时，固定已找到的离散状态细化连续量；不能放松前两级安全目标。
+            if incumbent_valid and (third.x is None or third.status != 0):
+                fixed_lo=lo.copy();fixed_hi=hi.copy()
+                fixed=np.flatnonzero(integer)
+                fixed_lo[fixed]=np.rint(result.x[fixed]);fixed_hi[fixed]=fixed_lo[fixed]
+                revenue_vector=np.zeros(size)
+                revenue_vector[p.ravel()]=np.repeat(np.asarray(prices)*250.,6)
+                revenue_floor=float(revenue_vector@result.x)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore',message='Unrecognized options detected:.*threads.*')
+                    refined=milp(cost,integrality=np.zeros_like(integer),bounds=Bounds(fixed_lo,fixed_hi),
+                        constraints=[final_constraint,LinearConstraint(revenue_vector,revenue_floor-.01,np.inf)],
+                        options={'time_limit':C.POLICY['solver_seconds'],
+                        'threads':C.CPU_THREADS})
+                if refined.x is not None:
+                    refined.primal_validation=_primal_validation(refined.x,lo,hi,integer,final_constraint)
+                    if not refined.primal_validation['passed'] or revenue_vector@refined.x<revenue_floor-.02:
+                        refined.x=None
+                improved=refined.x is not None and cost@refined.x < cost@result.x-1e-7
+                stages.append({'objective':'fixed_integer_economic_refinement','status_code':int(refined.status),
+                    'value':float(cost@refined.x) if refined.x is not None else None,'improved':bool(improved)})
+                if improved:result=refined
     else:
         result=optimize(cost)
     meta={'status_code':int(result.status),'message':str(result.message),'seconds':time.perf_counter()-tick,
           'inventory_constraints':inventory,'export_resource_shortfall_allowed':export_shortfall,
           'mip_gap':getattr(result,'mip_gap',None),'joint_dispatch':True}
     meta['recovery_export_only']=bool(recovery_export)
-    meta['empirical_ramp_relaxed_prefix_steps']=scenario_relax_steps
     meta['primal_validation']=getattr(result,'primal_validation',None)
     meta['generated_ramp_limits_mw']=list(ramp_limits)
     if recovery_export:meta['recovery_priority_stages']=stages
-    if recovery_export:
-        meta['cost_search_source']=cost_source
-        meta['cost_global_optimality_certified']=cost_global_certified
     if result.x is None: return None,meta
     meta['status']='OPTIMAL' if result.status==0 else 'FEASIBLE_WITH_GAP'
     if recovery_export:meta['status']='EXPORT_RECOVERY_WITH_REPORTED_VIOLATIONS'
     x=result.x
+    if recovery_export:meta['recovery_economic_cost']=float(cost@x)
     out={'power':x[p],'gas':x[q],'stocks':x[h] if inventory else np.full((97,2),np.nan),
-         'vent':np.zeros((96,2)),'export_shortfall_m3h':x[shortfall] if export_shortfall else np.zeros(96),
+         'vent':x[recovery_vent] if recovery_export else np.zeros((96,2)),
+         'export_shortfall_m3h':x[shortfall] if export_shortfall else np.zeros(96),
          'joint_control':{'terminal_resource_excess_mw':float(x[tail]),'group_mapping_used':trusted,
                           'empirical_gas_support':support,'ramp_scenarios':[list(b) for b in scenarios],
                           'reserve_risk':risk,'price_ratio_parameter':price_ratio,'benefit_floor_cny':benefit_floor}}
     if recovery_export:
         out['recovery_export']={'active':True,'export_only':True,
-            'empirical_ramp_relaxed_prefix_steps':scenario_relax_steps,
-            'terminal_command_fixed':terminal_command is not None,
-            'original_ramp_scenarios':[list(b) for b in scenarios],
-            'fixed_terminal_command':{'power':terminal_power.tolist(),'gas':terminal_gas.tolist()} if terminal_command is not None else None,
             'planning_inventory_shortfall_m3':x[recovery_slack],
             'objective_basis':'unsafe_steps_then_safety_deficit_then_existing_margin_and_revenue',
             'minimum_unsafe_steps_found':int(round(float(x[unsafe_step].sum()))),
@@ -752,58 +741,6 @@ def _solve_joint(inputs,initial,beta,stock0,prices,inventory=True,export_shortfa
                 (s.get('mip_gap') or 0.)<=1e-9 for s in stages[:2])),
             'safe_bounds_unchanged':True,'slack_is_not_physical_gas_supply':True}
     return out,meta
-
-
-def recovery_rank(context,solution):
-    """用独立核验器评价恢复导出；不豁免实际机组边界和守恒。"""
-    value=dict(context,**solution,fallback_used=True)
-    value['stocks'],value['vent']=_replay_stocks(np.asarray(context['bridge_stock']),context,solution['gas'])
-    validation=validate_day(value)
-    allowed={'normal_dispatch_plan','normal_inventory_plan','anchor_safety','independent_holder_safety',
-        'planning_bounds','mapping_sensitivity_ramp'}
-    protected=[key for key,passed in validation['checks'].items() if not passed and key not in allowed]
-    stocks=np.asarray(value['stocks'],float)
-    if protected or not np.isfinite(stocks).all():
-        return None,{'protected_failures':protected,'problems':validation['problems']}
-    unsafe=validation['details']['holder_boundary_diagnostics']['post_execution_unsafe_steps']
-    deficit=float(np.maximum(.15*np.asarray(C.CAPACITY)-stocks[1:],0.).sum())
-    return (unsafe,deficit),{'unsafe_steps':unsafe,'safety_deficit_m3_steps':deficit,
-        'problems':validation['problems'],'protected_failures':[]}
-
-
-def solve_recovery_export(inputs,initial,beta,stock0,prices,context,**options):
-    """正常计划无解后比较恢复路径；经验情景仍完整归档并独立判定失败。"""
-    baseline,meta=_solve_joint(inputs,initial,beta,stock0,prices,inventory=True,recovery_export=True,**options)
-    if baseline is None:return None,meta
-    base_rank,base_check=recovery_rank(context,baseline)
-    trace={'version':'physical_recovery_prefix_v1','baseline':base_check,'selected':'baseline',
-        'information':'same publication prefix only; no future observations',
-        'original_scenarios_retained_for_validation':True}
-    inherited_low=bool((np.asarray(stock0)<.15*np.asarray(C.CAPACITY)-C.POLICY['stock_tolerance']).any())
-    if base_rank is not None and base_rank[0]>0 and inherited_low and options.get('scenarios'):
-        stocks,_=_replay_stocks(np.asarray(stock0),inputs,baseline['gas'])
-        bounds=np.asarray(C.CAPACITY);tol=C.POLICY['stock_tolerance']
-        unsafe=((stocks[1:]<.15*bounds-tol)|(stocks[1:]>.90*bounds+tol)).any(axis=1)
-        if not unsafe[0]:
-            meta['recovery_selection']=trace
-            baseline['recovery_export']['selection']=trace
-            return baseline,meta
-        first_safe=np.flatnonzero(~unsafe)
-        prefix=int(first_safe[0]) if len(first_safe) else 96
-        terminal={'power':baseline['power'][-1].copy(),'gas':baseline['gas'][-1].copy(),
-            'reference_power':baseline['power'].copy()}
-        candidate,attempt=_solve_joint(inputs,initial,beta,stock0,prices,inventory=True,recovery_export=True,
-            scenario_relax_steps=prefix,terminal_command=terminal,**options)
-        trace['candidate_solver']=deepcopy(attempt);trace['relaxed_prefix_steps']=prefix
-        if candidate is not None:
-            rank,check=recovery_rank(context,candidate);trace['candidate']=check
-            terminal_ok=(np.max(np.abs(candidate['power'][-1]-terminal['power']))<=1e-6 and
-                np.max(np.abs(candidate['gas'][-1]-terminal['gas']))<=1e-6)
-            if rank is not None and rank<base_rank and terminal_ok:
-                baseline=candidate;meta=attempt;trace['selected']='physical_prefix'
-    meta['recovery_selection']=trace
-    baseline['recovery_export']['selection']=trace
-    return baseline,meta
 
 
 def solve_milp(*args, **kwargs):
@@ -931,24 +868,9 @@ def optimize_daily(bundle,data,origins,quick=False,progress=None):
         inputs['prices']=price.copy()
         inputs['control_calibration']={'version':control['version'],'train_end':control['train_end'],
             'optional_use_calibration':deepcopy(control['recipe']['optional_use_calibration'])}
-        context=dict(inputs,previous_power=initial,anchor=anchor,anchor_observed=anchor_ok,
-            bridge_stock=bridge,beta=beta,initial_state=initial_meta,
-            gas_power_validation=bundle.diagnostics['gas_power']['holdout'],
-            bridge={'start':str(issue),'end':str(inputs['times'][0]),'gas_m3h':q0,
-                'available_m3h':bridge_available,'split':bridge_split,'vent_m3':bridge_vent,
-                'resource_components':bridge_source},
-            state_reset_m3=anchor-previous_state if previous_state is not None else None)
-        context['state_transition']={
-            'inventory_source':'observed_at_publication','observed_at':str(issue),
-            'previous_plan_stock_at_issue_m3':None if previous_state is None else previous_state.copy(),
-            'command_source':('previous_published_command' if previous_gas is not None else
-                              'observed_prefix_initialization' if np.isfinite(q0).all() else 'unobserved_initial_command'),
-            'reset_is_material_flow':False,'reset_is_identified_resource_error':False,
-            'historical_anchor_matches_optimized_execution':None}
         inventory=bool(np.isfinite(bridge).all() and inputs["resource_mode"]=="net_inferred")
         precheck=inventory_feasibility_bound(inputs,initial,beta,bridge) if inventory else {
             'bound_available':False,'normal_plan_infeasible_proven':False}
-        context['inventory_precheck']=precheck
         options=dict(mapping=mapping,support=support,scenarios=scenarios,risk=inventory_risk(data,issue))
         if precheck['normal_plan_infeasible_proven']:
             solution=None
@@ -960,7 +882,7 @@ def optimize_daily(bundle,data,origins,quick=False,progress=None):
         fallback=not inventory or solution is None or bool(warnings)
         if solution is None and inventory:
             recovery_options=dict(options,risk=None)
-            solution,recovery_solver=solve_recovery_export(inputs,initial,beta,bridge,price,context,**recovery_options)
+            solution,recovery_solver=solve_milp(inputs,initial,beta,bridge,price,inventory=True,recovery_export=True,**recovery_options)
             solver['recovery_export_solver']=recovery_solver
             if solution is not None:
                 warnings.append('仅导出：库存模型无解，优先恢复柜位；松弛量仅记录失败，不作为实际供气或可行计划')
@@ -979,7 +901,22 @@ def optimize_daily(bundle,data,origins,quick=False,progress=None):
             warnings.append("无可行导出解，采用明确标记的因果保持指令")
         if fallback:
             solution["stocks"],solution["vent"]=_replay_stocks(bridge,inputs,solution["gas"])
-        day=dict(context,**solution,solver=solver,warnings=warnings,fallback_used=fallback)
+        day=dict(inputs,**solution,previous_power=initial,anchor=anchor,anchor_observed=anchor_ok,
+                 bridge_stock=bridge,beta=beta,solver=solver,initial_state=initial_meta,
+                 gas_power_validation=bundle.diagnostics["gas_power"]["holdout"],
+                 bridge={"start":str(issue),"end":str(inputs["times"][0]),"gas_m3h":q0,
+                         "available_m3h":bridge_available,"split":bridge_split,"vent_m3":bridge_vent,
+                         'resource_components':bridge_source},
+                 state_reset_m3=anchor-previous_state if previous_state is not None else None,
+                 warnings=warnings,fallback_used=fallback)
+        day['state_transition']={
+            'inventory_source':'observed_at_publication','observed_at':str(issue),
+            'previous_plan_stock_at_issue_m3':None if previous_state is None else previous_state.copy(),
+            'command_source':('previous_published_command' if previous_gas is not None else
+                              'observed_prefix_initialization' if np.isfinite(q0).all() else 'unobserved_initial_command'),
+            'reset_is_material_flow':False,'reset_is_identified_resource_error':False,
+            'historical_anchor_matches_optimized_execution':None}
+        day['inventory_precheck']=precheck
         day["validation"]=validate_day(day)
         mapping=bundle.diagnostics.get("group_mapping")
         if mapping is None:

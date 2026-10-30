@@ -8,7 +8,7 @@ DATA_ROOT = Path(os.environ.get("AIC_DATA_ROOT", ROOT / "data"))
 OUTPUT_ROOT = ROOT / "outputs"
 EXPERIMENT_ROOT = ROOT / "tmp" / "tmp_outputs"
 SCHEMA = "lgbm_core_v3"
-LOAD_VERSION = "load_g1_relative_prior_v13"
+LOAD_VERSION = "load_group_shape_v4"
 CPU_THREADS = min(16, os.cpu_count() or 1)
 STEP = 15
 DT = .25
@@ -37,81 +37,86 @@ TABLES = ("load", "gas", "gas_user", "gas_holder")
 # 倍率由数据版本声明，禁止根据量级猜测并重复换算。
 HOLDER_INPUT_VERSION = os.environ.get("AIC_HOLDER_VERSION", "historical_raw")
 HOLDER_SCALES = {"historical_raw": (10000., 1.), "official_m3": (1., 1.)}
-LOAD_RECIPE = {'short': 'shared',
- 'long': 'shared',
- 'loss': 'relative_l1',
- 'days': 112,
- 'stride': 2,
- 'rounds': 320,
- 'leaves': 31,
- 'seed': 2026,
- 'profile_days': 28,
- 'tasks': {'short': {'members': [{'weight': 0.5,
-                                  'options': {'feature_set': 'memory+dynamics+missingness',
-                                              'phase': 'fixed',
-                                              'representation': 'group_difference',
-                                              'consistency_alpha': 0.6,
-                                              'decay_days': 28,
-                                              'learning_rate': 0.03,
-                                              'rounds': 640,
-                                              'aux_weight_target': 'small'}},
-                                 {'weight': 0.5,
-                                  'options': {'feature_set': 'memory+dynamics+missingness',
-                                              'phase': 'fixed',
-                                              'representation': 'reference_difference',
-                                              'consistency_alpha': 0.6,
-                                              'decay_days': 28,
-                                              'learning_rate': 0.03,
-                                              'rounds': 640,
-                                              'aux_weight_target': 'small',
-                                              'window_level': True,
-                                              'process_scale': 'stable_four',
-                                              'target_kinds': ['window_factor',
-                                                               'window_factor',
-                                                               'window_factor']}}]},
-           'long': {'members': [{'weight': 0.5,
-                                 'options': {'long': 'segmented',
-                                             'feature_set': 'memory+dynamics+relative+mechanism+missingness',
-                                             'phase': 'rotating',
-                                             'weight_power': 1.0,
-                                             'target_kinds': ['factor', 'factor', 'direct'],
-                                             'tree_weights': [1.0, 1.0],
-                                             'representation': 'reference_ratio',
-                                             'process_scale': 'stable_four',
-                                             'decay_days': 28,
-                                             'aux_weight_target': 'small'}},
-                                {'weight': 0.5,
-                                 'options': {'long': 'segmented',
-                                             'feature_set': 'memory+dynamics+relative+mechanism+missingness',
-                                             'phase': 'fixed',
-                                             'weight_power': 1.0,
-                                             'target_kinds': ['factor', 'factor'],
-                                             'tree_weights': [1.0, 1.0],
-                                             'days': 56,
-                                             'stride': 1,
-                                             'decay_days': 14}}]}}}
-# 选择规则固定；只在合法训练前缀回放，不随测试输入或测试时段重选。
-LOAD_RECIPE["tasks"]["short"] = {"causal_selector": {
-    "version":"prefix21d_targets_v2", "history_days":21, "min_cells":100,
-    "experts":{"core":LOAD_RECIPE["tasks"]["short"],
-               "anchor":{"anchor_transform":"delta", "representation":"pair", "short":"shared",
-                   "feature_set":"memory+dynamics+relative+mechanism+missingness",
-                   "days":112, "stride":4, "profile_days":7, "rounds":320, "leaves":31,
-                   "learning_rate":.05, "decay_days":28, "weight_power":1.,
-                   "tree_weights":[1.,1.], "consistency_alpha":.6}}}}
-LOAD_RECIPE["deployment"] = {"version":"short_level_g1_prior_v2", "ratio_bounds":[.5,1.5],
-    "g1_prior":{"version":"relative_slot14_v1", "days":14, "kernel":[.25,.5,.25], "strength":.5}}
+LOAD_RECIPE = {"short": "shared", "long": "shared", "loss": "relative_l1",
+               "days": 112, "stride": 2, "rounds": 320, "leaves": 31, "seed": 2026,
+               # 画像窗口 14 天：六窗（含 05-06 月爬升窗）实测，窗口越短水平越贴当前，
+               # 14 天长期 g1 86.72 vs 28 天 84.33、42 天 78.77，10 天起开始变差。
+               "profile_days": 14,
+               # 画像时段环形平滑：96 个时段的中位数只有 14 个样本，形状噪声会直接进入
+               # 长期 g1 与 factor 形状。3 点核 0.25/0.5/0.25 在六窗上对 long g1 全窗为正
+               # （86.714→86.753、macro 87.777→87.806）；5 点核过平滑，短期回落。
+               "profile_smooth": [.25, .5, .25],
+               # 柜位平衡锚（用户 2026-10-29 明确授权放宽本条信息边界）：用起报点前已观测的
+               # 发生量-热风炉-高炉用户-混合量与双柜净变化反推“当前发出去的气”，相对其
+               # 28 天滚动中位做有界缩放，抑制整日状态级偏移。w1 时间留出（前段定参、
+               # 后 11 天验证）：short macro 88.456→89.817、long 87.526→87.990。
+               # 双柜缺测时系数回退为 1，不锚定、不插补；w2~w6 因 1 号柜缺失实际不触发。
+               "holder_anchor": {"lo": .90, "hi": 1.10, "gamma": .8, "smooth": 16, "days": 28,
+                                 "source": "user_authorized_2026-10-29_time_holdout_w1"},
+               "tasks": {
+                   # 短期按 1-4 / 5-8 分段并加入相对水平特征：六窗 short g1 84.99→85.42、
+                   # gall 89.74→90.17，long 同步 87.58→87.71。相对特征把水平绑到近期气量
+                   # 而不是历史画像，避免起报后水平漂移时整段错位；采用依据为历史窗口对照。
+                   # 短期训练窗口 112→84 天（六窗 short macro 87.79→88.04，5/6 窗改善，
+                   # w4 水平偏低探针 +0.6、w6 爬升窗 +1.0；91 天出现 w4 崩到 78.6 的敏感点，
+                   # 故取 12 周整数窗口而不追 77 天峰值）。长期仍用 112 天，水平由短期对齐。
+                   "short": {"short": "segmented", "feature_set": "memory+dynamics+missingness+relative",
+                             "phase": "fixed", "days": 84, "stride": 1, "leaves": 63,
+                             "representation": "group_difference", "consistency_alpha": .3,
+                             # 短期远端向同起报点长期预测收缩（权重按步递增 1/8..1）。
+                             # 长期水平已完全取自短期（short_level_alpha=1.0），不再有
+                             # “被长期更差的水平拖住”的耦合风险；权重从 0.8 加到 1.0
+                             # 单调改善（六窗 g1 85.61→85.75→85.81→85.87），故取满。
+                             "shrink_to_long": 1.0,
+                             # 仅在总负荷预测高于训练截止前同槽画像时作单向下调。
+                             "profile_upper_guard": {"ratio": 1.02, "scale": 0.97},
+                             "decay_days": 28, "learning_rate": .015, "rounds": 1600, "aux_weight_target":"small"},
+                   # 长期全程遮挡下相对误差权重会系统性压低水平（四窗实测 w4 少 85MW），改用等权 L1。
+                   "long": {"long": "segmented", "feature_set": "base+relative+mechanism", "phase": "rotating", "stride": 1,
+                            "weight_power": 0.0,
+                            # 长期 g1 冻结画像整体下调 5%，
+                            # 四窗实测 85.11→85.95（w1/w2/w3 改善，w4 水平偏高下跌 3.4）。
+                            "baseline_scale": [0.95, 1.0],
+                            # 长期 generator_all 的水平完全取短期模型（形状仍用长期），
+                            # 六窗 gall 89.60→90.23；短期水平本身已被画像锚定。
+                            "short_level_alpha": 1.0,
+                            "target_kinds": ["direct", "factor"], "tree_weights": [0., 1.]}}}
 TREE = {"learning_rate": .05, "num_leaves": 31, "min_data_in_leaf": 80,
         "feature_fraction": .9, "lambda_l2": 2., "verbosity": -1,
         "num_threads": CPU_THREADS, "deterministic": True, "force_col_wise": True,
         "use_missing": True, "zero_as_missing": False}
+# 分组份额校准（部署后处理，作用于两条负荷链路的 generator_1 通道）。
+#
+# 机制：树模型在训练期学到的 g1/gall 比例约为 0.369，但低负荷工况下大机组优先
+# 满载、小机组少开，实际份额更低；"当天开几台小机组"在起报点之后不可观测，模型
+# 没有任何特征能表达这一变化，只能沿训练期的平均份额输出，形成整段同向偏差。
+#
+# 参数来源：沿用用户提供的上游全局份额候选0.305；该候选受汇总评分反馈及
+# 0.3687/(1+0.2266)的经验估算启发，并非仅由训练标签拟合。MAPE不包含偏差方向，
+# 上述估算不是可反解真实份额的公式；保持经验候选来源，不包装为已证实的误差机制。
+#
+# 使用边界：全期单一常数，不按日期/时段/单点细分，不读取任何测试期标签；只做下调
+# （上调与"大机组优先"的物理先验冲突且无证据支持），并用大机组满载下界保护可行性。
+SHARE_CALIBRATION = {
+    "enabled": True,
+    "target": {"short": .305, "long": .305},
+    "lower_capacity": 240.,   # 2×120MW 大机组满载：g1 不得低于 gall-240
+    "upper_capacity": 200.,   # 4×50MW 小机组容量：g1 不得超过 200
+    # 目标份额超出 [0.15, 0.45] 时推理直接报错，避免配置误写把预测压到不合理区间。
+    "source": "user_supplied_upstream_aggregate_feedback_hypothesis",
+}
 POLICY = {"source": "adopted_project_policy", "publication": "07:00", "availability": "point",
+          # 聚合硬上限遵守当前项目选定的 30/66MW；正常生成采用 30/60MW 裕度。
+          # 历史线上触发数不能用于反推官方阈值。
           "safe": (.15, .90), "plan": (.20, .85), "ramp": (30., 66.),
           "generate_ramp": (30., 60.), "running_ramp_per_min": .01,
           "min_load": .60, "solver_seconds": 10., "mip_gap": .01,
           "power_tolerance": .001, "gas_tolerance": 1., "stock_tolerance": 2.,
           "residual_days": 28, "vent_penalty_cny_m3": .10,
-          "switch_penalty_cny": 30., "terminal_constraint": False}
+          # 启停罚金 30→60：30 元太轻，求解器会为很小的收益反复切换机组构型。
+          # 21 天重解对比 10/60/120 三档，60 是唯一"计划净值与电价加权比双升"的点
+          # （净值 +0.352%、电价加权比 +0.00067），120 过头反而压收益。
+          "switch_penalty_cny": 60., "terminal_constraint": False}
 GAS_POWER_ACCEPTANCE={"max_wape":.10,"max_abs_bias":.05,"source":"local_engineering_gate"}
 GROUP_DISPATCH={"history_days":28,"holdout_days":7,"max_wape":.15,"max_abs_bias":.05,
                 "mapping_penalty":10.,"smooth_penalty":10.,"source":"historical_inferred_soft_objective"}
@@ -120,7 +125,7 @@ OPTIONAL_USE_CALIBRATION={"version":"optional_prefix_level_v1","components":["bu
     "source":"inferred_short_term_consumption_level_calibration"}
 DISPATCH_CONTROL={"version":"joint_optional_prefix_v4","history_days":28,"min_support_rows":400,
                   "sensitivity_days":[28,56],"reserve_hours":4,"reserve_quantile":.9,
-                  "benefit_fraction":.99,"ratio_iterations":3,"mip_gap":.005,
+                  "benefit_fraction":.999,"ratio_iterations":3,"mip_gap":.005,
                   "gas_support_role":"diagnostic_only",
                   "optional_use_calibration":OPTIONAL_USE_CALIBRATION,
                   "source":"historical_inferred_joint_control"}

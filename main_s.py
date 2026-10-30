@@ -1,12 +1,13 @@
 """独立负荷树模型：共享数值原语，短长期训练结果严格分离。"""
 from dataclasses import dataclass, field
+from copy import deepcopy
 import time
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
 import config as C
 from data_cleaning.pipeline import build_features, horizon_block, process_series
-from data_cleaning.quality import project_load, truth_cube, score_load
+from data_cleaning.quality import project_load
 
 
 @dataclass
@@ -18,19 +19,18 @@ class LoadBundle:
     recipe: dict = field(default_factory=dict)
     train_end: str = ""
     diagnostics: list = field(default_factory=list)
-    members: list = field(default_factory=list)
-    experts: dict = field(default_factory=dict)
 
 
 def fit_booster(X, y, names, times, *, loss="l1", rounds=320, seed=2026, leaves=31,
                 weight_scale=None, original_y=None, decay_days=None, learning_rate=None,
-                weight_power=1., weight_target=None):
+                weight_power=1., weight_target=None, state_target=None):
     valid = np.isfinite(y)
     X, y, times = X[valid], y[valid], np.asarray(times)[valid]
     if len(y) < 100:
         raise ValueError(f"有效训练标签不足：{len(y)}")
     observed = y if original_y is None else np.asarray(original_y)[valid]
     weight = np.ones(len(y), dtype=float)
+    state_balance = None
     if loss == "relative_l1":
         # 1MW以下分母截断仅用于训练稳定；评分仍使用非零真值的原始分母。
         denominator = observed if weight_target is None else np.asarray(weight_target)[valid]
@@ -43,6 +43,22 @@ def fit_booster(X, y, names, times, *, loss="l1", rounds=320, seed=2026, leaves=
             # 近期权重仅改变已选负荷配方的训练损失，资源模型默认不启用。
             age=(pd.Timestamp(times.max())-pd.DatetimeIndex(times)).total_seconds()/86400.
             weight *= np.exp2(-np.asarray(age)/decay_days)
+        if state_target is not None:
+            # 仅用内层训练期统计状态频次，限制稀少状态的放大倍数，避免借用留出标签。
+            state = np.asarray(state_target)[valid]
+            ids = np.digitize(state, [50., 100., 150.])
+            inner_end = pd.Timestamp(times.max())-pd.Timedelta(days=8)
+            available = np.isfinite(state) & (times < inner_end.to_datetime64())
+            counts = np.bincount(ids[available], minlength=4)
+            largest = max(int(counts.max()), 1)
+            factors = np.ones(4)
+            for i in range(4):
+                if counts[i]:
+                    factors[i] = min(2., np.sqrt(largest/counts[i]))
+            weight *= np.where(np.isfinite(state), factors[ids], 1.)
+            state_balance = {"edges_mw": [50., 100., 150.], "counts": counts.tolist(),
+                             "factors": factors.tolist(), "max_factor": 2.,
+                             "count_before": str(inner_end), "missing_state_factor": 1.}
         weight /= weight.mean()
     split = pd.Timestamp(times.max()) - pd.Timedelta(days=7)
     valid_rows = times >= split.to_datetime64()
@@ -65,6 +81,7 @@ def fit_booster(X, y, names, times, *, loss="l1", rounds=320, seed=2026, leaves=
     return final, {"rows": len(y), "rounds": best_round, "loss": loss,
                    "learning_rate": params["learning_rate"], "num_leaves": params["num_leaves"],
                    "weight_power":weight_power,"weight_target":"original" if weight_target is None else "score_aligned_auxiliary",
+                   "state_balance": state_balance,
                    "zero_label_rows": int((observed == 0.).sum()),
                    "min_target_time": str(pd.Timestamp(times.min())),
                    "max_target_time": str(pd.Timestamp(times.max())), "inner_split": str(split)}
@@ -182,25 +199,50 @@ def load_horizon_block(prepared,base,positions,horizons,feature_set):
 def horizon_groups(span, kind):
     if kind == "shared":
         return [list(range(1, 9 if span == "short" else 97))]
-    if span == "long" and kind == "segmented":
+    if kind == "segmented":
+        if span == "short":
+            # 短期近端与远端的误差结构和最优复杂度不同；实测两段优于共享、单步优于两段
+            # （六窗 short macro 87.36→87.40→88.17，long 同步 87.58→87.68→87.91，
+            #  w6 爬升窗 gall +0.99；代价是 w1/w4 的 g1 各 -0.5 左右）。
+            return [[h] for h in range(1, 9)]
         return [list(range(1, 9)), list(range(9, 33)), list(range(33, 97))]
     raise ValueError(f"不支持的提前量结构：{span}/{kind}")
 
 
-def profile_pack(prepared, cutoff, days=28):
+def _slot_profile(prepared, cutoff, days):
+    """按日内时段取中位数，得到画像取值与整体水平。"""
     history = prepared.labels.loc[:cutoff].tail(days*96)
     large = history.generator_all-history.generator_1
     labels = history.assign(generator_large=large)
     slots = labels.index.hour*4+labels.index.minute//15
     fallback = labels.median()
     values = labels.groupby(slots).median().reindex(range(96)).fillna(fallback)
-    if not np.isfinite(values.to_numpy()).all():
+    return labels, values.to_numpy(), fallback.to_numpy()
+
+
+def _slot_smooth(values, kernel):
+    """环形平滑 96 个日内时段，降低小样本中位数的形状噪声，并保持整体水平不变。"""
+    v = np.asarray(values, float)
+    k = np.asarray(kernel, float)
+    pad = len(k)//2
+    padded = np.concatenate((v[-pad:], v, v[:pad]))
+    smoothed = np.apply_along_axis(lambda c: np.convolve(c, k, mode="valid"), 0, padded)
+    total = smoothed.sum(axis=0)
+    return np.where(total > 0., smoothed*(v.sum(axis=0)/np.where(total > 0., total, 1.))[None, :], smoothed)
+
+
+def profile_pack(prepared, cutoff, days=28, smooth=None):
+    """画像包：最近 days 天的日内时段中位数与整体水平。"""
+    labels, values, levels = _slot_profile(prepared, cutoff, days)
+    if smooth:
+        values = _slot_smooth(values, smooth)
+    if not np.isfinite(values).all():
         raise ValueError("历史画像缺少有效支持")
-    levels = fallback.to_numpy()
     enabled = levels > 1.
     shape = np.ones((96, 3))
-    shape[:, enabled] = np.maximum(values.to_numpy()[:, enabled]/levels[enabled], .01)
-    return {"values": values.to_numpy().tolist(), "shape": shape.tolist(),
+    shape[:, enabled] = np.maximum(values[:, enabled]/levels[enabled], .01)
+    slots = labels.index.hour*4+labels.index.minute//15
+    return {"values": values.tolist(), "shape": shape.tolist(),
             "shape_enabled": enabled.tolist(), "support": labels.groupby(slots).count().reindex(range(96), fill_value=0).to_numpy().tolist(),
             "cutoff": str(pd.Timestamp(cutoff)), "days": days,
             "source": "training_prefix_only", "zero_labels_retained": True}
@@ -224,13 +266,7 @@ def required_targets(spec, span):
     representation = spec.get("representation", "pair")
     if representation == "pair":
         targets = [0, 1]
-    elif representation in ("reference_difference", "reference_ratio"):
-        if not np.array_equal(spec.get("tree_weights", [1., 1.]), [1., 1.]):
-            raise ValueError("参考水平结构必须保留全部预测头")
-        return [0, 1, 2]
     elif representation == "group_difference":
-        targets = [1, 2]
-    elif representation == "group_ratio":
         targets = [1, 2]
     else:
         raise ValueError("未知机组组表示")
@@ -239,34 +275,10 @@ def required_targets(spec, span):
 
 
 def train_load(prepared, span, recipe=None, quick=False, progress=None):
-    recipe = dict(recipe or C.LOAD_RECIPE)
+    recipe = deepcopy(recipe or C.LOAD_RECIPE)
+    # 部署校准随本次模型冻结，复用模型不跟随当前全局配置悄然换参。
+    recipe.setdefault("share_calibration", deepcopy(C.SHARE_CALIBRATION))
     spec = load_recipe(recipe, span)
-    if spec.get("causal_selector"):
-        return train_regime_load(prepared, span, recipe, quick, progress)
-    if spec.get("anchor_transform"):
-        return train_anchored_load(prepared, span, recipe, quick, progress)
-    if spec.get("members"):
-        prepared.require_training(prepared.index[-1])
-        maximum = 8 if span == "short" else 96
-        bundle = LoadBundle(span, list(range(1, maximum+1)), [], recipe=deepcopy_recipe(recipe),
-                            train_end=str(prepared.index[-1]))
-        bundle.recipe.update(load_version=C.LOAD_VERSION,
-            frozen_profile=profile_pack(prepared, prepared.index[-1], spec.get("profile_days", 28)),
-            effective_budget={"quick": bool(quick), "threads": C.CPU_THREADS, "kind": "fixed_ensemble"})
-        weights = np.asarray([item["weight"] for item in spec["members"]], float)
-        if len(weights) != 2 or not np.isfinite(weights).all() or (weights <= 0.).any() or not np.isclose(weights.sum(), 1.):
-            raise ValueError("固定组合必须包含两个正权重分量，且权重和为1")
-        for index, item in enumerate(spec["members"]):
-            if item["options"].get("members"):
-                raise ValueError("不允许嵌套研究组合")
-            child_recipe = deepcopy_recipe(recipe)
-            child_recipe["tasks"][span] = deepcopy_recipe(item["options"])
-            child = train_load(prepared, span, child_recipe, quick, progress)
-            bundle.members.append((float(item["weight"]), child))
-            bundle.diagnostics.extend(dict(d, member_index=index) for d in child.diagnostics)
-        return bundle
-    if spec.get("window_level", False):
-        return train_window_load(prepared, span, recipe, quick, progress)
     cutoff = prepared.index[-1]
     prepared.require_training(cutoff)
     base = build_load_features(prepared, spec.get("feature_set", "base"))
@@ -279,7 +291,7 @@ def train_load(prepared, span, recipe=None, quick=False, progress=None):
     bundle.recipe = dict(recipe, effective_budget={"quick": bool(quick), "days": days,
         "stride": stride, "origins": len(pos), "max_rounds": rounds, "threads": C.CPU_THREADS,
         "first_origin": str(prepared.index[pos[0]]), "last_origin": str(prepared.index[pos[-1]])})
-    pack = profile_pack(prepared, cutoff, spec.get("profile_days", 28))
+    pack = profile_pack(prepared, cutoff, spec.get("profile_days", 28), spec.get("profile_smooth"))
     bundle.recipe["frozen_profile"] = pack
     kinds = spec.get("target_kinds", ["direct", "direct"])
     kinds = kinds + ["direct"]*(3-len(kinds))
@@ -292,18 +304,6 @@ def train_load(prepared, span, recipe=None, quick=False, progress=None):
         "auxiliary_weight_target":spec.get('aux_weight_target','original'),
         "factor_conversion": "label=y_mw/S;weight=relative_weight*S",
         "auxiliary_target": "generator_all-generator_1;both_labels_required"}
-    if spec.get("representation") in ("group_ratio", "reference_ratio"):
-        bundle.recipe["loss_definition"].update(
-            auxiliary_target="generator_1/generator_all; both labels required; both-zero maps to zero",
-            ratio_conversion="relative g1 weight multiplied by true total MW during training only")
-    if spec.get("process_scale"):
-        bundle.recipe["loss_definition"].update(
-            factor_conversion="label=y_mw/(shape*process_scale);weight=relative_weight*shape*process_scale",
-            process_scale="causal four-furnace trailing 4-step median / 1e6; invalid or zero uses identity; raw fuel unchanged")
-    if spec.get("representation") == "reference_ratio":
-        bundle.recipe["loss_definition"].update(
-            reference_heads="0=unscaled_total_reference;1=process_scaled_total;2=small_fraction;small=head0*head2",
-            process_scale_targets=[1],reference_shape_target=1)
     shape_rows = np.ones((len(pos), 96, 3), dtype="float32")
     shape_sources = []
     if "factor" in kinds:
@@ -312,7 +312,7 @@ def train_load(prepared, span, recipe=None, quick=False, progress=None):
         for block in np.unique(block_ids):
             rows = block_ids == block
             end = first_day+pd.Timedelta(days=int(block)*3)-pd.Timedelta(minutes=15)
-            block_pack = profile_pack(prepared, end, spec.get("profile_days", 28))
+            block_pack = profile_pack(prepared, end, spec.get("profile_days", 28), spec.get("profile_smooth"))
             shape_rows[rows] = np.asarray(block_pack["shape"], "float32")
             shape_sources.append({"block_start": str(end+pd.Timedelta(minutes=15)), "shape_cutoff": str(end)})
     for group in horizon_groups(span, spec[span]):
@@ -324,36 +324,24 @@ def train_load(prepared, span, recipe=None, quick=False, progress=None):
         labels = np.full((len(indices), 3), np.nan)
         labels[available, :2] = prepared.labels.iloc[indices[available]].to_numpy()
         labels[:, 2] = labels[:, 1]-labels[:, 0]
-        original_small = labels[:, 0].copy()
-        reference_mode = spec.get("representation") in ("reference_difference", "reference_ratio")
-        ratio_mode = spec.get("representation") in ("group_ratio", "reference_ratio")
-        if ratio_mode:
-            with np.errstate(invalid="ignore", divide="ignore"):
-                labels[:, 2] = labels[:, 0]/labels[:, 1]
-            labels[(labels[:, 0] == 0.) & (labels[:, 1] == 0.), 2] = 0.
-        if reference_mode:
-            labels[:, 0] = labels[:, 1]
         target_slots = pd.DatetimeIndex(times).hour*4+pd.DatetimeIndex(times).minute//15
         for ti in targets:
             if ti < 2 and weights[ti] == 0.:
                 continue
             tick = time.perf_counter()
             y = labels[:, ti]
-            scale = np.tile(target_process_scale(prepared, spec, ti)[pos], len(group)) if not (ti == 2 and ratio_mode) else np.ones(len(y))
+            scale = np.ones(len(y))
             if kinds[ti] == "factor":
-                shape_ti = 1 if reference_mode and ti == 0 else ti
-                scale *= shape_rows[np.tile(np.arange(len(pos)), len(group)), target_slots, shape_ti]
-            original = original_small if ti == 2 and ratio_mode else y
-            conversion = np.maximum(labels[:, 1], 1.) if ti == 2 and ratio_mode else 1.
+                scale = shape_rows[np.tile(np.arange(len(pos)), len(group)), target_slots, ti]
             model, diag = fit_booster(X, y/scale, names, times, loss=spec["loss"], rounds=rounds,
-                seed=spec["seed"], leaves=spec["leaves"], weight_scale=scale*conversion, original_y=original,
+                seed=spec["seed"], leaves=spec["leaves"], weight_scale=scale, original_y=y,
                 decay_days=spec.get("decay_days"), learning_rate=spec.get("learning_rate"),
                 weight_power=spec.get('weight_power',1.),
-                weight_target=original_small if ti==2 and spec.get('aux_weight_target')=='small' else None)
+                weight_target=labels[:,0] if ti==2 and spec.get('aux_weight_target')=='small' else None,
+                state_target=labels[:,0] if span=='short' else None)
             bundle.models.append((ti, group, model))
             bundle.features = names
-            bundle.diagnostics.append(dict(diag, target=("generator_all_reference" if reference_mode and ti == 0 else "generator_1_fraction" if ti == 2 and ratio_mode
-                else (*C.TARGETS, "generator_large")[ti]),
+            bundle.diagnostics.append(dict(diag, target=(*C.TARGETS, "generator_large")[ti],
                 horizons=group, structure=kinds[ti], shape_sources=shape_sources if kinds[ti] == "factor" else [],
                 seconds=round(time.perf_counter()-tick, 3)))
             if progress:
@@ -362,127 +350,11 @@ def train_load(prepared, span, recipe=None, quick=False, progress=None):
     return bundle
 
 
-def train_window_load(prepared, span, recipe, quick=False, progress=None):
-    """以完整未来窗口的相对损失中位水平作标签，降低逐提前量标签噪声。"""
-    if span != "short":
-        raise ValueError("窗口整体水平仅用于已采用的短期分量")
-    spec = load_recipe(recipe, span)
-    cutoff = prepared.index[-1]
-    prepared.require_training(cutoff)
-    base = build_load_features(prepared, spec.get("feature_set", "base"))
-    stride = max(8, spec["stride"]) if quick else spec["stride"]
-    days = min(56, spec["days"]) if quick else spec["days"]
-    rounds = min(60, spec["rounds"]) if quick else spec["rounds"]
-    pos = training_positions(prepared.index, days, stride, spec.get("phase", "fixed"))
-    maximum = 8 if span == "short" else 96
-    bundle = LoadBundle(span, list(range(1, maximum+1)), [], recipe=deepcopy_recipe(recipe), train_end=str(cutoff))
-    bundle.recipe.update(load_version=C.LOAD_VERSION, frozen_profile=profile_pack(prepared, cutoff, spec.get("profile_days", 28)),
-        effective_budget={"quick": bool(quick), "days": days, "stride": stride, "origins": len(pos),
-                          "max_rounds": rounds, "threads": C.CPU_THREADS},
-        loss_definition={"window_level": "weighted_median(y/scale); weights=scale/relative_denominator**power; scale=shape*causal_process_scale_if_enabled",
-                         "zero_labels_retained": True, "partial_label_windows_used": False})
-    if spec.get("representation") == "reference_difference":
-        bundle.recipe["loss_definition"].update(
-            reference_heads="0=unscaled_total_reference;1=process_scaled_total;2=unscaled_large;small=head0-head2",
-            process_scale_targets=[1],reference_shape_target=1)
-    shapes = np.ones((len(pos), 96, 3), dtype="float32")
-    first_day = prepared.index[pos[0]].normalize()
-    blocks = np.asarray((prepared.index[pos].normalize()-first_day).days//3)
-    sources = []
-    for block in np.unique(blocks):
-        end = first_day+pd.Timedelta(days=int(block)*3)-pd.Timedelta(minutes=15)
-        shapes[blocks == block] = np.asarray(profile_pack(prepared, end, spec.get("profile_days", 28))["shape"])
-        sources.append({"block_start": str(end+pd.Timedelta(minutes=15)), "shape_cutoff": str(end)})
-    targets = required_targets(spec, span)
-    power = spec.get("weight_power", 1.)
-    for group in horizon_groups(span, spec[span]):
-        mid = group[(len(group)-1)//2]
-        X, names = load_horizon_block(prepared, base, pos, [mid], spec.get("feature_set", "base"))
-        ix = pos[:, None]+np.asarray(group)[None, :]
-        available = ix < len(prepared.index)
-        y = np.full((*ix.shape, 3), np.nan)
-        y[available, :2] = prepared.labels.to_numpy()[ix[available]]
-        y[..., 2] = y[..., 1]-y[..., 0]
-        original_small = y[..., 0].copy()
-        reference_mode = spec.get("representation") == "reference_difference"
-        if reference_mode:
-            y[..., 0] = y[..., 1]
-        future = pd.DatetimeIndex(np.repeat(prepared.index[pos].to_numpy(), len(group)))+pd.to_timedelta(np.tile(group, len(pos))*15, unit="min")
-        slots = (future.hour*4+future.minute//15).to_numpy().reshape(ix.shape)
-        times = (prepared.index[pos]+pd.Timedelta(minutes=15*max(group))).to_numpy()
-        for ti in targets:
-            raw = y[..., ti]
-            shape_ti = 1 if reference_mode and ti == 0 else ti
-            scale = shapes[np.arange(len(pos))[:, None], slots, shape_ti]*target_process_scale(prepared, spec, ti)[pos, None]
-            weight_target = original_small if ti == 2 and spec.get("aux_weight_target") == "small" else raw
-            complete = np.isfinite(raw).all(axis=1) & np.isfinite(weight_target).all(axis=1)
-            positive = weight_target[np.isfinite(weight_target) & (weight_target > 0.)]
-            zero_denominator = max(float(np.median(positive)) if len(positive) else 1., 1.)
-            denominator = np.where(weight_target == 0., zero_denominator, np.maximum(np.abs(weight_target), 1.))
-            weights = scale/denominator**power
-            levels = raw/scale
-            order = np.argsort(levels, axis=1)
-            ordered_values = np.take_along_axis(levels, order, axis=1)
-            ordered_weights = np.take_along_axis(weights, order, axis=1)
-            total_weight = ordered_weights.sum(axis=1)
-            indices = np.argmax(np.cumsum(ordered_weights, axis=1) >= total_weight[:, None]/2., axis=1)
-            target = ordered_values[np.arange(len(pos)), indices]
-            original = raw.mean(axis=1)
-            target[~complete] = np.nan
-            original[~complete] = np.nan
-            positive_mean = original[np.isfinite(original) & (original > 0.)]
-            mean_zero = max(float(np.median(positive_mean)) if len(positive_mean) else 1., 1.)
-            mean_denominator = np.where(original == 0., mean_zero, np.maximum(np.abs(original), 1.))
-            conversion = total_weight*mean_denominator**power
-            model, diag = fit_booster(X, target, names, times, loss=spec["loss"], rounds=rounds,
-                seed=spec["seed"], leaves=spec["leaves"], original_y=original, weight_scale=conversion,
-                weight_power=power, decay_days=spec.get("decay_days"), learning_rate=spec.get("learning_rate"))
-            bundle.models.append((ti, group, model)); bundle.features = names
-            bundle.diagnostics.append(dict(diag, target="generator_all_reference" if reference_mode and ti == 0 else (*C.TARGETS, "generator_large")[ti],
-                horizons=group, structure="window_factor", shape_sources=sources,
-                target_aggregation="full_window_relative_weighted_median"))
-            if progress:
-                progress(f"{span} t={ti} window_factor h={group[0]}..{group[-1]} {diag['rows']}行 {diag['rounds']}轮")
-    return bundle
-
-
-def target_process_scale(prepared, spec, target):
-    """参考水平和机组组关系保持原尺度，过程修正仅作用于实际全厂目标。"""
-    if spec.get("representation") in ("reference_difference", "reference_ratio") and target != 1:
-        return np.ones(len(prepared.index))
-    return process_scale(prepared, spec)
-
-
-def process_scale(prepared, spec):
-    """用起报点已知过程水平换算标签，缺测或零量只回退单位尺度，不补写燃料。"""
-    mode = spec.get("process_scale")
-    if not mode:
-        return np.ones(len(prepared.index))
-    if mode != "stable_four":
-        raise ValueError("过程尺度配方不兼容")
-    columns = [f"gas_blast_furnace_{i}" for i in (1,2,4,5)]
-    values = prepared.frame[columns].sum(axis=1, min_count=len(columns))
-    current = values.rolling(4, min_periods=4).median().to_numpy()
-    # 百万立方米每小时只用于数值归一化，不是气电换算系数。
-    return np.where(np.isfinite(current) & (current > 0.), current/1e6, 1.)
-
-
-def deepcopy_recipe(recipe):
-    from copy import deepcopy
-    return deepcopy(recipe)
-
-
 def reconcile(values, spec):
     pred = values[..., :2].copy()
     representation = spec.get("representation", "pair")
     if representation == "group_difference":
         pred[..., 0] = values[..., 1]-values[..., 2]
-    elif representation == "reference_difference":
-        pred[..., 0] = values[..., 0]-values[..., 2]
-    elif representation == "reference_ratio":
-        pred[..., 0] = values[..., 0]*np.clip(values[..., 2], 0., 1.)
-    elif representation == "group_ratio":
-        pred[..., 0] = values[..., 1]*np.clip(values[..., 2], 0., 1.)
     return pred
 
 
@@ -514,8 +386,6 @@ def predict_components(bundle, prepared, origins):
     if pd.Timestamp(bundle.train_end) >= origins[0]:
         raise ValueError("模型标签截止必须早于起报窗口")
     spec = load_recipe(bundle.recipe, bundle.span)
-    if spec.get("anchor_transform"):
-        return predict_anchored_components(bundle, prepared, origins)
     base = build_load_features(prepared, spec.get("feature_set", "base"))
     positions = prepared.index.get_indexer(origins)
     if (positions < 0).any():
@@ -529,25 +399,23 @@ def predict_components(bundle, prepared, origins):
     values = baseline.copy()
     kinds = spec.get("target_kinds", ["direct", "direct"])
     kinds = kinds+["direct"]*(3-len(kinds))
-    reference_mode = spec.get("representation") in ("reference_difference", "reference_ratio")
     for lo in range(0, len(positions), 256):
         pos = positions[lo:lo+256]
         for ti, group, model in bundle.models:
-            actual_group = [group[(len(group)-1)//2]] if kinds[ti] == "window_factor" else group
-            X, names = load_horizon_block(prepared,base,pos,actual_group,spec.get('feature_set','base'))
+            X, names = load_horizon_block(prepared,base,pos,group,spec.get('feature_set','base'))
             if names != bundle.features or model.feature_name() != names:
                 raise ValueError("模型特征顺序不兼容")
-            pred = model.predict(X, num_threads=C.TREE["num_threads"]).reshape(len(actual_group), len(pos)).T
-            if kinds[ti] == "window_factor":
-                pred = np.repeat(pred, len(group), axis=1)
-            if kinds[ti] in ("factor", "window_factor"):
-                shape_ti = 1 if reference_mode and ti == 0 else ti
-                pred *= np.asarray(pack["shape"])[slots[lo:lo+len(pos)][:, np.array(group)-1], shape_ti]
-            if not (ti == 2 and spec.get("representation") in ("group_ratio", "reference_ratio")):
-                pred *= target_process_scale(prepared, spec, ti)[pos, None]
+            pred = model.predict(X, num_threads=C.TREE["num_threads"]).reshape(len(group), len(pos)).T
+            if kinds[ti] == "factor":
+                pred *= np.asarray(pack["shape"])[slots[lo:lo+len(pos)][:, np.array(group)-1], ti]
             values[lo:lo+len(pos), np.array(group)-1, ti] = pred
     weights = np.asarray(spec.get("tree_weights", [1., 1.]))
     values[..., :2] = values[..., :2]*weights+(1.-weights)*baseline[..., :2]
+    scale = spec.get("baseline_scale")
+    if scale is not None:
+        # 1-MAPE 对高估的惩罚重于低估：按赛题指标形状给冻结画像做轻微水平修正，
+        # 系数在四窗历史验证上确定，只作用于该任务的输出，不改变训练与特征。
+        values[..., :2] = values[..., :2]*np.asarray(scale, float)[:2]
     return values
 
 
@@ -558,18 +426,6 @@ def predict_load(bundle, prepared, origins):
         raise ValueError("起报点必须非空、递增且不重复")
     if origins[0] <= pd.Timestamp(bundle.train_end) or not origins.isin(prepared.index).all():
         raise ValueError("请求起报点必须位于训练截止之后且存在于输入网格")
-    if bundle.recipe.get("load_version") != C.LOAD_VERSION:
-        raise ValueError("负荷模型版本不兼容")
-    validate_regime_bundle(bundle)
-    if bundle.experts:
-        predictions = {name:predict_load(child,prepared,origins) for name,child in bundle.experts.items()}
-        sources = bundle.recipe["regime_selection"]["target_sources"]
-        return project_load(np.stack([predictions[name][...,i] for i,name in enumerate(sources)],axis=-1))
-    if bundle.members:
-        if any(child.span != bundle.span or child.train_end != bundle.train_end for _, child in bundle.members):
-            raise ValueError("组合分量跨度或训练截止不一致")
-        result = sum(weight*predict_load(child, prepared, origins) for weight, child in bundle.members)
-        return project_load(result)
     alpha = spec.get("consistency_alpha", 0.) if bundle.span == "short" else 0.
     all_origins = origins
     if alpha:
@@ -597,9 +453,7 @@ def naive_profile(prepared, origins, horizons, cutoff):
 
 
 def train_short(prepared, recipe=None, quick=False, progress=None):
-    bundle=train_load(prepared, "short", recipe, quick, progress)
-    freeze_g1_prior(bundle,prepared)
-    return bundle
+    return train_load(prepared, "short", recipe, quick, progress)
 
 
 def predict_short(bundle, prepared, origins):
@@ -608,323 +462,156 @@ def predict_short(bundle, prepared, origins):
     return predict_load(bundle, prepared, origins)
 
 
-def anchor_inputs(prepared):
-    """过程上下文仅取完整分量的向后观测，不填造缺失燃料。"""
+def holder_anchor_factor(prepared, origins, cfg):
+    """柜位平衡反推的发电水平相对 28 天同刻中位的比值（有界锚定系数）。
+
+    只用起报点及以前已观测的发生量、热风炉、高炉用户、混合量与双柜变化：
+    单柜净变化是已发生的观测量，不读未来。双柜任一缺测时比值不可用，回退为 1
+    （不锚定、不插补）。系数只做有界缩放，不改变形状，也不写回任何输入。
+    """
+    if not cfg:
+        return None
     f = prepared.frame
-    blast = f[[f"gas_blast_furnace_{i}" for i in (1,2,4,5)]].sum(axis=1, min_count=4)
-    heaters = f[[f"gas_air_heater_{i}" for i in range(1,6)]].sum(axis=1, min_count=5)
-    coke = process_series(prepared).coke_available_proxy
-    return pd.DataFrame({"blast":blast, "heaters":heaters, "coke":coke}).rolling(4,min_periods=4).median()
+    blast_cols = [f"gas_blast_furnace_{i}" for i in range(1, 6)]
+    heater_cols = [f"gas_air_heater_{i}" for i in range(1, 6)]
+    user_cols = [f"gas_user_blast_furnace_user{i}" for i in range(1, 5)]
+    blast = f[blast_cols].sum(axis=1, min_count=len(blast_cols))
+    heater = f[heater_cols].sum(axis=1, min_count=len(heater_cols))
+    user = f[user_cols].sum(axis=1, min_count=len(user_cols))
+    mixed = f["gas_into_gas_mixed_blast_furnace"]
+    hold = f[list(C.HOLDERS)].sum(axis=1, min_count=2)
+    # 部分发生量不是完整供气；当前或上一柜位缺失时不能沿用滚动窗口中的旧值缩放。
+    valid = blast.notna() & heater.notna() & user.notna() & mixed.notna() & hold.notna() & hold.shift(1).notna()
+    balance = (blast-heater-user-mixed-hold.diff()/C.DT).where(valid)
+    implied = balance.rolling(int(cfg.get("smooth", 16)), min_periods=4).mean().where(valid)
+    ref = implied.rolling(int(cfg.get("days", 28))*96, min_periods=96).median()
+    ratio = (implied/ref).reindex(pd.DatetimeIndex(origins)).to_numpy(float)
+    ratio = np.where(np.isfinite(ratio), ratio, 1.)
+    return np.clip(ratio, float(cfg["lo"]), float(cfg["hi"]))**float(cfg["gamma"])
 
 
-def anchor_pack(prepared, cutoff, days=7, inputs=None):
-    pack = profile_pack(prepared, cutoff, days)
-    history = (anchor_inputs(prepared) if inputs is None else inputs).loc[:cutoff].tail(days*96)
-    references = history.median().where(history.count() >= 24)
-    pack.update(anchor_inputs=references.to_numpy().tolist(), anchor_input_support=history.count().tolist(),
-        anchor_input_basis="causal complete-component 4-step median; >=24 observations; no fuel imputation")
-    return pack
+def predict_deployed(short, long, prepared, origins, recipe=None):
+    """正式推理、回测和自动选优共用同一出口，防止漏评已采用的后处理。"""
+    if long.span != "long":
+        raise ValueError("长期入口拒绝短期模型")
+    recipe = short.recipe if recipe is None else recipe
+    calibration = short.recipe.get("share_calibration")
+    if calibration is None or calibration != long.recipe.get("share_calibration"):
+        raise ValueError("短长期模型缺少一致的冻结份额校准参数")
+    ps = predict_short(short, prepared, origins)
+    pl = predict_load(long, prepared, origins)
+    spec_l = recipe.get("tasks", {}).get("long", {})
+    spec_s = recipe.get("tasks", {}).get("short", {})
+    pl = align_long_level(pl, ps, spec_l.get("short_level_alpha", 0.))
+    ps = shrink_short_to_long(ps, pl, spec_s.get("shrink_to_long", 0.))
+    guard = short.recipe.get("tasks", {}).get("short", {}).get("profile_upper_guard")
+    if not isinstance(guard, dict) or not (guard.get("ratio", 0.) >= 1. and 0. < guard.get("scale", 0.) <= 1.):
+        raise ValueError("短期模型缺少兼容的画像上沿校正参数")
+    origin_index = pd.DatetimeIndex(origins)
+    slots = np.stack([(origin_index + pd.Timedelta(minutes=15*h)).hour*4 +
+                      (origin_index + pd.Timedelta(minutes=15*h)).minute//15
+                      for h in range(1, 9)], axis=1)
+    reference = np.asarray(short.recipe["frozen_profile"]["values"])[slots, 1]
+    # 画像冻结于训练截止前；仅降低明显高于同槽画像的短期预测。
+    ps = ps * np.where((reference > 0.) & (ps[:, :, 1] > guard["ratio"]*reference), guard["scale"], 1.)[:, :, None]
+    # 柜位平衡锚：把当日“实际发出去的气”落实成水平系数，抑制整日状态级偏移。
+    factor = holder_anchor_factor(prepared, origins, recipe.get("holder_anchor"))
+    if factor is not None:
+        cap_small, cap_large = float(sum(C.UNITS[:4])), float(sum(C.UNITS[4:]))
+        for frame in (ps, pl):
+            frame *= factor[:, None, None]
+            frame[:, :, 0] = np.clip(frame[:, :, 0], 0., cap_small)
+            frame[:, :, 1] = np.clip(frame[:, :, 1], frame[:, :, 0], frame[:, :, 0]+cap_large)
+    # 分组份额校准放在最后：它按 gall 重构 g1，必须在所有水平/形状后处理之后执行，
+    # 否则后续缩放会把目标份额重新拉开。
+    ps, pl = calibrate_group_share(ps, pl, recipe.get("share_calibration", calibration))
+    return reconcile_groups(ps), pl
 
 
-def anchored_block(X, names, positions, origins, horizons, profiles, ages, inputs, references, target):
-    """同一合法输入配不同已知目标截止点，学习目标长期不可见时的变化。"""
-    n = len(positions); rows = np.tile(np.arange(n),len(horizons))
-    future = pd.DatetimeIndex(np.tile(origins.to_numpy(),len(horizons)))+pd.to_timedelta(np.repeat(horizons,n)*15,unit="min")
-    slots = future.hour*4+future.minute//15
-    levels = np.maximum(profiles[rows,slots,target],1.)
-    with np.errstate(divide="ignore",invalid="ignore"):
-        ratios = inputs / references
-    ratios[~np.isfinite(ratios) | (references <= 0.)] = np.nan
-    extended = np.column_stack((X,levels,np.tile(ages,len(horizons)),ratios[rows])).astype("float32")
-    return extended,names+["anchor_value_mw","anchor_age_days","anchor_ratio_blast","anchor_ratio_heaters","anchor_ratio_coke"],levels,future.to_numpy()
+def shrink_short_to_long(short_pred, long_pred, weight):
+    """把短期预测按提前量向长期（同起报点、同目标时刻）线性收缩。
+
+    短期 8 步在远端已明显衰减（四窗实测 h=7、8 的误差贡献最大），而长期在同一起报点
+    给出的是更稳的"形状×水平"估计；按 h=1..8 递增的权重做凸组合，相当于给短期
+    远端加一个先验。权重为 0 时保持原状，为 1 时 h=8 完全采用长期值。
+    """
+    if not weight or weight <= 0.:
+        return short_pred
+    short=np.asarray(short_pred,float)
+    long=np.asarray(long_pred,float)
+    steps=short.shape[1]
+    if long.shape[0]!=short.shape[0] or long.shape[2]!=short.shape[2] or long.shape[1]<steps:
+        raise ValueError("短期与长期预测的起报点或目标维度不一致")
+    ramp=np.linspace(float(weight)/steps,float(weight),steps)[None,:,None]
+    return reconcile_groups(short*(1.-ramp)+long[:,:steps,:]*ramp)
 
 
-def train_anchored_load(prepared, span, recipe, quick=False, progress=None):
-    spec = load_recipe(recipe,span); transform = spec["anchor_transform"]
-    if span != "short" or transform != "delta" or spec.get("representation") != "pair":
-        raise ValueError("负荷水平锚点配方不兼容")
-    cutoff = prepared.index[-1]; prepared.require_training(cutoff)
-    base = build_load_features(prepared,spec["feature_set"])
-    process = anchor_inputs(prepared)
-    stride = max(16,spec["stride"]) if quick else spec["stride"]
-    days = min(56,spec["days"]) if quick else spec["days"]
-    rounds = min(60,spec["rounds"]) if quick else spec["rounds"]
-    initial = training_positions(prepared.index,days,stride,"rotating")
-    initial = initial[initial >= 28*96]
-    rng = np.random.default_rng(spec["seed"])
-    gaps = (rng.integers(0,22,len(initial))[:,None]+np.array([0,5,11,16]))%22
-    positions = np.repeat(initial,4); gaps = gaps.reshape(-1)
-    origin = prepared.index[positions]
-    anchor_cutoffs = origin.normalize()-pd.to_timedelta(gaps,unit="D")-pd.Timedelta(minutes=15)
-    assert (anchor_cutoffs < origin).all()
-    profiles = np.zeros((len(positions),96,3),dtype="float32")
-    references = np.full((len(positions),3),np.nan)
-    pack_records = []
-    for end in anchor_cutoffs.unique():
-        pack = anchor_pack(prepared,end,spec["profile_days"],process)
-        mask = anchor_cutoffs == end
-        profiles[mask] = np.asarray(pack["values"])
-        references[mask] = np.asarray(pack["anchor_inputs"],float)
-        pack_records.append(str(end))
-    ages = np.asarray((origin-anchor_cutoffs).total_seconds()/86400.)
-    current = process.to_numpy()[positions]
-    maximum = 8
-    bundle = LoadBundle(span,list(range(1,maximum+1)),[],recipe=deepcopy_recipe(recipe),train_end=str(cutoff))
-    bundle.recipe.update(load_version=C.LOAD_VERSION,frozen_profile=anchor_pack(prepared,cutoff,spec["profile_days"],process),
-        effective_budget={"quick":bool(quick),"days":days,"stride":stride,"origins":len(initial),
-            "anchor_cases":len(positions),"max_rounds":rounds,"threads":C.CPU_THREADS},
-        loss_definition={"transform":transform,"anchor_floor_mw":1.,"zero_labels_retained":True,
-            "delta_conversion":"y-A; relative MW loss weight unchanged", "synthetic_gap_days":[0,21],
-            "gap_sampling":"4 distinct uniformly shifted ages per origin, seed fixed",
-            "anchor_cutoffs":pack_records,"outer_validation_anchor_frozen":True})
-    for group in horizon_groups(span,spec[span]):
-        horizons = group
-        X,names = load_horizon_block(prepared,base,positions,horizons,spec["feature_set"])
-        ix = np.concatenate([positions+h for h in horizons]);available = ix < len(prepared.index)
-        raw = np.full((len(ix),2),np.nan);raw[available] = prepared.labels.to_numpy()[ix[available]]
-        for target in (0,1):
-            extended,features,scale,times = anchored_block(X,names,positions,origin,horizons,profiles,ages,current,references,target)
-            y = raw[:,target]
-            labels = y-scale
-            model,diag = fit_booster(extended,labels,features,times,loss="relative_l1",rounds=rounds,
-                seed=spec["seed"],leaves=spec["leaves"],original_y=y,
-                weight_scale=np.ones(len(y)),
-                decay_days=spec.get("decay_days"),learning_rate=spec.get("learning_rate"))
-            bundle.models.append((target,group,model));bundle.features = features
-            bundle.diagnostics.append(dict(diag,target=C.TARGETS[target],horizons=group,
-                training_horizons=horizons,structure="frozen_absolute_level_"+transform,
-                max_anchor_cutoff=str(anchor_cutoffs.max()),max_anchor_age_days=float(ages.max())))
-            if progress:
-                progress(f"{span} t={target} anchor_{transform} h={group[0]}..{group[-1]} {diag['rows']}行 {diag['rounds']}轮")
-    return bundle
-
-
-def predict_anchored_components(bundle,prepared,origins):
-    spec = load_recipe(bundle.recipe,bundle.span);transform = spec["anchor_transform"]
-    if bundle.span != "short" or transform != "delta":
-        raise ValueError("负荷水平锚点变换错误")
-    pack = bundle.recipe["frozen_profile"]
-    if pack["cutoff"] != bundle.train_end or "anchor_inputs" not in pack:
-        raise ValueError("负荷水平锚点来源或过程上下文缺失")
-    positions = prepared.index.get_indexer(origins)
-    if (positions < 0).any():raise ValueError("缺少起报网格")
-    base = build_load_features(prepared,spec["feature_set"])
-    process = anchor_inputs(prepared).to_numpy()
-    values = np.zeros((len(origins),len(bundle.horizons),3))
-    for lo in range(0,len(origins),256):
-        pos = positions[lo:lo+256];origin = origins[lo:lo+256]
-        profiles = np.broadcast_to(np.asarray(pack["values"]),(len(pos),96,3))
-        references = np.broadcast_to(np.asarray(pack["anchor_inputs"],float),(len(pos),3))
-        ages = np.asarray((origin-pd.Timestamp(bundle.train_end)).total_seconds()/86400.)
-        for target,group,model in bundle.models:
-            X,names = load_horizon_block(prepared,base,pos,group,spec["feature_set"])
-            extended,features,scale,_ = anchored_block(X,names,pos,origin,group,profiles,ages,process[pos],references,target)
-            if features != bundle.features or model.feature_name() != features:
-                raise ValueError("锚点模型特征顺序不一致")
-            pred = model.predict(extended,num_threads=C.CPU_THREADS)
-            pred = pred+scale
-            values[lo:lo+len(pos),np.asarray(group)-1,target] = pred.reshape(len(group),len(pos)).T
-    return values
-
-
-REGIME_ROUTES = (("core","core"),("anchor","core"),("core","anchor"),("anchor","anchor"))
-
-
-def choose_regime(scores, minimum):
-    valid = {"/".join(route):scores["/".join(route)] for route in REGIME_ROUTES
-        if scores["/".join(route)].get("macro_score") is not None and
-        all(scores["/".join(route)][t]["nonzero_cells"] >= minimum for t in C.TARGETS)}
-    if not valid:
-        return ["core","core"]
-    best = max(valid,key=lambda key:valid[key]["macro_score"])
-    return best.split("/")
-
-
-def select_regime(prepared, span, recipe, quick=False, progress=None):
-    """只在训练前缀最后21天回放，整段遮挡回放标签后决定两目标来源。"""
-    if span != "short":raise ValueError("当前因果选择只用于独立短期链路")
-    policy = deepcopy_recipe(load_recipe(recipe,span)["causal_selector"])
-    if policy.get("version") != "prefix21d_targets_v2" or policy.get("history_days") != 21 or set(policy["experts"]) != {"core","anchor"}:
-        raise ValueError("因果选择配方不兼容")
-    cutoff = prepared.index[-1];prepared.require_training(cutoff)
-    start = cutoff-pd.Timedelta(days=21)+pd.Timedelta(minutes=15)
-    train = prepared.prefix(start-pd.Timedelta(minutes=15))
-    origins = pd.date_range(start,cutoff,freq="15min")
-    view = prepared.masked_copy(start,mask_use=True);view.labels=view.labels.copy();view.labels.loc[start:]=np.nan
-    truth = truth_cube(prepared,origins,range(1,9))
-    predictions = {}; models = {}
-    for name in ("core","anchor"):
-        child_recipe = deepcopy_recipe(recipe);child_recipe["tasks"][span] = deepcopy_recipe(policy["experts"][name])
-        models[name] = train_load(train,span,child_recipe,quick,progress)
-        predictions[name] = predict_load(models[name],view,origins)
-    scores = {}
-    for route in REGIME_ROUTES:
-        pred = project_load(np.stack([predictions[name][...,i] for i,name in enumerate(route)],axis=-1))
-        scores["/".join(route)] = score_load(pred,truth)
-    sources = choose_regime(scores,policy["min_cells"])
-    decision = {"version":policy["version"],"policy":policy,"target_sources":sources,"scores":scores,
-        "inner_start":str(start),"inner_end":str(cutoff),"inner_train_end":str(train.index[-1]),
-        "max_label_used_at":str(cutoff),"outer_targets_used":False,"inner_target_blackout":True,
-        "future_targets_past_cutoff_excluded":True,"selection_performed_at":str(cutoff)}
-    if progress:progress(f"short 因果目标选择：小机组={sources[0]}，全厂={sources[1]}")
-    return decision,models
-
-
-def train_regime_load(prepared, span, recipe, quick=False, progress=None):
-    tick = time.perf_counter()
-    decision,inner = select_regime(prepared,span,recipe,quick,progress)
-    del inner
-    experts = {}
-    for name in sorted(set(decision["target_sources"])):
-        resolved = deepcopy_recipe(recipe);resolved["tasks"][span] = deepcopy_recipe(decision["policy"]["experts"][name])
-        experts[name] = train_load(prepared,span,resolved,quick,progress)
-    if len(experts) == 1:
-        bundle = next(iter(experts.values()))
-        bundle.recipe["regime_selection"] = decision
-    else:
-        bundle = LoadBundle(span,list(range(1,9)),[],recipe=deepcopy_recipe(recipe),train_end=str(prepared.index[-1]),experts=experts)
-        bundle.recipe.update(load_version=C.LOAD_VERSION,regime_selection=decision,
-            frozen_profile=profile_pack(prepared,prepared.index[-1]),effective_budget={"quick":bool(quick),"threads":C.CPU_THREADS})
-        bundle.diagnostics = [dict(d,selected_expert=name) for name,child in experts.items() for d in child.diagnostics]
-    bundle.recipe["regime_training_seconds"] = time.perf_counter()-tick
-    validate_regime_bundle(bundle)
-    return bundle
-
-
-def validate_regime_bundle(bundle):
-    selection = bundle.recipe.get("regime_selection")
-    if selection is None:
-        if bundle.experts or load_recipe(bundle.recipe,bundle.span).get("causal_selector"):
-            raise ValueError("缺少因果目标选择记录")
-        return
-    policy = selection.get("policy",{})
-    if bundle.span != "short" or selection.get("version") != "prefix21d_targets_v2" or policy.get("version") != selection["version"]:
-        raise ValueError("因果选择版本或任务错误")
-    if set(policy.get("experts",{})) != {"core","anchor"} or policy.get("history_days") != 21 or policy.get("min_cells") != 100:
-        raise ValueError("因果选择策略契约错误")
-    cutoff = pd.Timestamp(bundle.train_end);start = pd.Timestamp(selection["inner_start"])
-    if (pd.Timestamp(selection["inner_end"]) != cutoff or pd.Timestamp(selection["max_label_used_at"]) > cutoff or
-        start != cutoff-pd.Timedelta(days=21)+pd.Timedelta(minutes=15) or
-        pd.Timestamp(selection["inner_train_end"]) != start-pd.Timedelta(minutes=15) or
-        selection.get("outer_targets_used") is not False or selection.get("inner_target_blackout") is not True or
-        selection.get("future_targets_past_cutoff_excluded") is not True or
-        pd.Timestamp(selection["selection_performed_at"]) != cutoff):
-        raise ValueError("因果选择时间边界错误")
-    sources = selection.get("target_sources")
-    if set(selection.get("scores",{})) != {"/".join(route) for route in REGIME_ROUTES}:
-        raise ValueError("因果回放缺少完整目标组合")
-    if sources != choose_regime(selection["scores"],policy["min_cells"]):
-        raise ValueError("因果目标来源与前缀回放分数不一致")
-    if bundle.experts:
-        if bundle.models or bundle.members or set(bundle.experts) != set(sources) or len(bundle.experts) != 2:
-            raise ValueError("因果专家覆盖错误")
-        children = bundle.experts
-    else:
-        if len(set(sources)) != 1:raise ValueError("混合目标缺少实际专家")
-        children = {sources[0]:bundle}
-    for name,child in children.items():
-        if child.span != bundle.span or child.train_end != bundle.train_end:
-            raise ValueError("因果专家训练截止不一致")
-        actual = load_recipe(child.recipe,child.span)
-        if any(actual.get(k) != v for k,v in policy["experts"][name].items()):
-            raise ValueError("因果专家实际配方不一致")
-
-
-
-def g1_prior_pack(prepared,cutoff,policy):
-    """冻结相对绝对损失的槽位加权中位数，零标签按树训练相同规则保留。"""
-    if policy!=C.LOAD_RECIPE["deployment"]["g1_prior"]:
-        raise ValueError("小机组先验配方不兼容")
-    history=prepared.labels.loc[:pd.Timestamp(cutoff),"generator_1"].tail(policy["days"]*96)
-    history=history.where(np.isfinite(history))
-    def weighted_median(values):
-        values=values.dropna().to_numpy(float)
-        if not len(values):return np.nan
-        values=np.sort(values)
-        positive=values[values>0.]
-        zero_denominator=max(float(np.median(positive)) if len(positive) else 1.,1.)
-        weights=1./np.maximum(np.abs(values),1.)
-        weights[values==0.]=1./zero_denominator
-        return float(values[np.searchsorted(np.cumsum(weights),weights.sum()/2.)])
-    fallback=weighted_median(history)
-    if not np.isfinite(fallback):raise ValueError("小机组先验缺少有效历史标签")
-    slots=history.index.hour*4+history.index.minute//15
-    values=history.groupby(slots).apply(weighted_median).reindex(range(96)).fillna(fallback).to_numpy()
-    smoothed=sum(weight*np.roll(values,index-1) for index,weight in enumerate(policy["kernel"]))
-    return {"version":policy["version"],"cutoff":str(pd.Timestamp(cutoff)),"days":policy["days"],
-        "values_mw":smoothed.tolist(),"support":history.groupby(slots).count().reindex(range(96),fill_value=0).tolist(),
-        "max_label_used_at":str(history.dropna().index.max()),"source":"training_prefix_only",
-        "kernel":list(policy["kernel"]),"zero_labels_retained":True,
-        "loss":"relative_l1; denominator floor 1MW; zero weight uses slot median positive"}
-
-
-def freeze_g1_prior(bundle,prepared):
-    prepared.require_training(bundle.train_end)
-    bundle.recipe["g1_prior"]=g1_prior_pack(prepared,bundle.train_end,bundle.recipe["deployment"]["g1_prior"])
-
-
-def validate_g1_prior(bundle):
-    policy=C.LOAD_RECIPE["deployment"]["g1_prior"]
-    pack=bundle.recipe.get("g1_prior",{})
-    values=np.asarray(pack.get("values_mw",[]),float)
-    support=np.asarray(pack.get("support",[]),float)
-    observed_end=pd.to_datetime(pack.get("max_label_used_at"),errors="coerce")
-    if (bundle.recipe.get("deployment")!=C.LOAD_RECIPE["deployment"] or
-        pack.get("version")!=policy["version"] or pack.get("cutoff")!=bundle.train_end or
-        pack.get("days")!=policy["days"] or pack.get("kernel")!=policy["kernel"] or
-        pack.get("source")!="training_prefix_only" or pack.get("zero_labels_retained") is not True or
-        values.shape!=(96,) or not np.isfinite(values).all() or (values<0.).any() or
-        support.shape!=(96,) or not np.isfinite(support).all() or (support<0.).any() or
-        (support>policy["days"]).any() or not np.array_equal(support,np.floor(support)) or support.sum()==0. or
-        pd.isna(observed_end) or observed_end>pd.Timestamp(bundle.train_end)):
-        raise ValueError("小机组冻结先验来源、时间或数值契约错误")
-
-
-def validate_deployment_pair(short,long):
-    expected=C.LOAD_RECIPE["deployment"]
-    if (short.span!="short" or long.span!="long" or short.train_end!=long.train_end or
-        short.recipe.get("deployment")!=expected or long.recipe.get("deployment")!=expected):
-        raise ValueError("长短期部署配方、跨度或训练截止不一致")
-    for bundle in (short,long):validate_g1_prior(bundle)
-    if short.recipe["g1_prior"]!=long.recipe["g1_prior"]:
-        raise ValueError("相同训练截止的小机组先验不一致")
-
-
-def align_long_level(long_pred,short_pred):
-    """只校正全厂水平，保留长期形状和小机组预测；所有输入均为同起报点模型输出。"""
-    short=np.asarray(short_pred,float);out=np.asarray(long_pred,float).copy()
-    if (short.ndim!=3 or out.ndim!=3 or short.shape[1:]!=(8,2) or out.shape[1:]!=(96,2) or
-        short.shape[0]!=out.shape[0] or not np.isfinite(short).all() or not np.isfinite(out).all()):
-        raise ValueError("长短期预测形状错误或包含非有限值")
-    reference=out[:,:,1].mean(axis=1)
-    current=short[:,:,1].mean(axis=1)
-    ratio=np.clip(current/np.maximum(reference,1e-6),.5,1.5)
-    out[:,:,1]*=ratio[:,None]
-    # 保留独立的小机组预测，只收敛全厂容量关系，避免用总量校正反向移动小机组。
-    out[:,:,1]=np.clip(out[:,:,1],out[:,:,0],out[:,:,0]+sum(C.UNITS[4:]))
+def reconcile_groups(pred):
+    """把预测约束回机组容量关系：小机组 0~200MW，总负荷不低于小机组且不超 +240MW。"""
+    out=np.asarray(pred,float).copy()
+    small=float(sum(C.UNITS[:4]))
+    large=float(sum(C.UNITS[4:]))
+    out[:, :, 0]=np.clip(out[:, :, 0],0.,small)
+    out[:, :, 1]=np.clip(out[:, :, 1],out[:, :, 0],out[:, :, 0]+large)
     return out
 
 
-def predict_deployed(short,long,prepared,origins):
-    """训练验证、正式推理、模型复用及逐格重推理共用同一部署出口。"""
-    validate_deployment_pair(short,long)
-    ps=predict_short(short,prepared,origins)
-    pl=predict_load(long,prepared,origins)
-    aligned=align_long_level(pl,ps)
-    return regularize_g1(ps,short,origins),regularize_g1(aligned,long,origins)
+def calibrate_group_share(short_pred,long_pred,cfg=None):
+    """按目标分组份额重构 generator_1，抑制整段同向的机组组合偏差。
+
+    模型学到的是训练期的平均份额（约 0.369），而低负荷时大机组优先满载、小机组
+    少开，真实份额更低；起报后机组组合不可观测，树模型无法自行修正。这里按目标
+    份额重算 g1，再用"大机组满载"下界 `gall-240` 保护物理可行性——高负荷时段大
+    机组已满发，g1 无法继续下调，只能保持在下界。
+
+    参数由 `config.SHARE_CALIBRATION` 给出，只做下调、全期单一常数，不按日期或
+    时段细分，也不读取测试期标签。份额下调幅度受 `max_share_drop` 限制，避免配置
+    误写把预测压到不合理区间。
+    """
+    cfg=C.SHARE_CALIBRATION if cfg is None else cfg
+    out=[]
+    for frame,span in ((short_pred,"short"),(long_pred,"long")):
+        arr=np.asarray(frame,float).copy()
+        target=(cfg or {}).get("target",{}).get(span)
+        if not (cfg or {}).get("enabled") or target is None:
+            out.append(arr)
+            continue
+        lower_cap=float(cfg.get("lower_capacity",240.))
+        upper_cap=float(cfg.get("upper_capacity",200.))
+        if not 0.15<=float(target)<=0.45:
+            raise ValueError("分组份额目标超出合理区间，拒绝静默使用异常配置")
+        gall=arr[:, :, 1]
+        proposed=float(target)*gall
+        lower=np.maximum(gall-lower_cap,0.)
+        upper=np.minimum(gall,upper_cap)
+        arr[:, :, 0]=np.clip(proposed,lower,upper)
+        out.append(arr)
+    return out[0],out[1]
 
 
-def regularize_g1(pred,bundle,origins):
-    """只约束不稳定的组间分配，保留全厂预测及其水平联动结果。"""
-    validate_g1_prior(bundle)
-    out=np.asarray(pred,float).copy();origins=pd.DatetimeIndex(origins)
-    if (out.shape!=(len(origins),len(bundle.horizons),2) or not np.isfinite(out).all() or
-        origins.empty or origins[0]<=pd.Timestamp(bundle.train_end)):
-        raise ValueError("小机组正则化输入的形状、时间或数值错误")
-    slots=np.stack([(origins+pd.Timedelta(minutes=15*h)).hour*4+
-                    (origins+pd.Timedelta(minutes=15*h)).minute//15 for h in bundle.horizons],axis=1)
-    prior=np.asarray(bundle.recipe["g1_prior"]["values_mw"])[slots]
-    strength=bundle.recipe["deployment"]["g1_prior"]["strength"]
-    small=(1.-strength)*out[...,0]+strength*prior
-    out[...,0]=np.clip(small,np.maximum(0.,out[...,1]-sum(C.UNITS[4:])),np.minimum(sum(C.UNITS[:4]),out[...,1]))
+def align_long_level(long_pred, short_pred, alpha):
+    """用短期模型的当前水平校正长期 generator_all 的水平。
+
+    长期是"形状×水平"结构，水平由 GBDT 从起报点特征给出；遇到供气或机组结构
+    变化时反应滞后（四窗实测 w4 的长期 gall 比真值低约 30MW）。短期模型在同一
+    因果边界内直接看到起报点前的气量与机组状态，因此用它的 8 步均值与长期 96 步
+    均值之比做一次有界混合：alpha=0 保持原状，alpha=1 完全改用短期水平。
+    只作用于 generator_all；generator_1 的冻结画像水平单独由 baseline_scale 控制。
+    """
+    if not alpha or alpha <= 0.:
+        return long_pred
+    short=np.asarray(short_pred,float)
+    out=np.asarray(long_pred,float).copy()
+    if short.shape[0]!=out.shape[0] or short.shape[2]!=out.shape[2]:
+        raise ValueError("短期与长期预测的起报点或目标维度不一致")
+    reference=out[:,:,1].mean(axis=1)
+    current=short[:,:,1].mean(axis=1)
+    ratio=np.clip(current/np.maximum(reference,1e-6),.5,1.5)
+    out[:,:,1]*=(1.+float(alpha)*(ratio-1.))[:,None]
+    # 缩放后必须仍满足机组容量与"总负荷不低于小机组负荷、大机组不超过 240MW"的
+    # 硬关系，否则三表导出契约会拒绝（l_result 的 capacity_relations）。
+    cap_small=float(sum(C.UNITS[:4]))
+    cap_large=float(sum(C.UNITS[4:]))
+    out[:,:,0]=np.clip(out[:,:,0],0.,cap_small)
+    out[:,:,1]=np.clip(out[:,:,1],out[:,:,0],out[:,:,0]+cap_large)
     return out

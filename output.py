@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import lightgbm as lgb
 import config as C
-from main_s import LoadBundle, load_recipe, required_targets, validate_regime_bundle, validate_deployment_pair
+from main_s import LoadBundle, load_recipe, required_targets
 from main_opt import ResourceBundle
 from data_cleaning.pipeline import file_hash
 from data_cleaning.quality import validate_result_files, validate_day, validate_plan_sequence, full_window_coverage
@@ -76,29 +76,20 @@ def assert_source(ctx):
 
 
 def _save_load_bundles(root,short,long):
-    validate_deployment_pair(short,long)
-    def save_one(b,relative):
+    records_by_span={}
+    for b in (short,long):
         if b.recipe.get("load_version")!=C.LOAD_VERSION:
             raise ValueError("负荷模型版本不兼容，禁止静默迁移")
-        folder=root/relative
+        folder=root/b.span
         folder.mkdir(parents=True,exist_ok=True)
         records=[]
         for number,(ti,group,model) in enumerate(b.models):
             name=f"tree_{number:03d}.txt"
             (folder/name).write_text(model.model_to_string(),encoding="utf-8")
-            records.append({"target_index":ti,"horizons":group,"file":str(relative/name),"sha256":file_hash(folder/name)})
-        meta={"features":b.features,"horizons":b.horizons,"recipe":b.recipe,
-              "train_end":b.train_end,"models":records,"diagnostics":b.diagnostics}
-        validate_regime_bundle(b)
-        if b.experts:
-            meta["experts"]={name:save_one(child,relative/name) for name,child in b.experts.items()}
-        if b.members:
-            if b.models:
-                raise ValueError("组合根节点不能混入独立预测树")
-            meta["members"]=[{"weight":weight,"bundle":save_one(child,relative/f"member_{i:02d}")}
-                             for i,(weight,child) in enumerate(b.members)]
-        return meta
-    return {b.span:save_one(b,Path(b.span)) for b in (short,long)}
+            records.append({"target_index":ti,"horizons":group,"file":f"{b.span}/{name}","sha256":file_hash(folder/name)})
+        records_by_span[b.span]={"features":b.features,"horizons":b.horizons,"recipe":b.recipe,
+                                "train_end":b.train_end,"models":records,"diagnostics":b.diagnostics}
+    return records_by_span
 
 
 def _load_bundles(root,meta):
@@ -107,7 +98,9 @@ def _load_bundles(root,meta):
     if (meta.get("preprocessing_sha256")!=file_hash(C.CODE_ROOT/"data_cleaning/pipeline.py") or
         meta.get("load_implementation_sha256")!=file_hash(C.CODE_ROOT/"main_s.py")):
         raise ValueError("负荷特征或推理实现已改变，拒绝复用不兼容模型")
-    def load_one(span,m,allow_members=True,allow_experts=True):
+    bundles=[]
+    for span in ("short","long"):
+        m=meta["load"][span]
         b=LoadBundle(span,m["horizons"],m["features"],recipe=m["recipe"],train_end=m["train_end"],diagnostics=m["diagnostics"])
         expected=list(range(1,9 if span=="short" else 97))
         if b.horizons!=expected or b.recipe.get("load_version")!=C.LOAD_VERSION:
@@ -119,32 +112,6 @@ def _load_bundles(root,meta):
             a=np.asarray(pack.get(key,[]),float)
             if a.shape!=(96,3) or not np.isfinite(a).all() or (key=="shape" and (a<=0.).any()):
                 raise ValueError("负荷画像或形状契约错误")
-        experts=m.get("experts",{})
-        if experts:
-            if not allow_experts or m["models"] or m.get("members"):
-                raise ValueError("目标选择专家层级错误")
-            b.experts={name:load_one(span,child,True,False) for name,child in experts.items()}
-            validate_regime_bundle(b)
-            return b
-        members=m.get("members",[])
-        declared=load_recipe(b.recipe,span).get("members",[])
-        if members or declared:
-            weights=np.asarray([item["weight"] for item in members],float)
-            if (not allow_members or m["models"] or len(members)!=2 or len(declared)!=2 or
-                not np.isfinite(weights).all() or (weights<=0.).any() or not np.isclose(weights.sum(),1.)):
-                raise ValueError("固定组合分量、层级或权重契约错误")
-            for record,rule in zip(members,declared):
-                if record["weight"]!=rule["weight"]:
-                    raise ValueError("组合归档权重与实际配方不一致")
-                child=load_one(span,record["bundle"],False,False)
-                if child.train_end!=b.train_end:
-                    raise ValueError("组合分量训练截止不一致")
-                child_spec=load_recipe(child.recipe,span)
-                if any(child_spec.get(k)!=v for k,v in rule["options"].items()):
-                    raise ValueError("组合分量的实际配方不一致")
-                b.members.append((record["weight"],child))
-            validate_regime_bundle(b)
-            return b
         covered=np.zeros((len(expected),3),int)
         for record in m["models"]:
             path=(root/record["file"]).resolve()
@@ -162,10 +129,7 @@ def _load_bundles(root,meta):
         needed[required_targets(load_recipe(b.recipe,span),span)]=1
         if not (covered==needed[None,:]).all():
             raise ValueError("模型分量覆盖缺失、冗余或重复")
-        validate_regime_bundle(b)
-        return b
-    bundles=[load_one(span,meta["load"][span]) for span in ("short","long")]
-    validate_deployment_pair(*bundles)
+        bundles.append(b)
     return bundles
 
 
@@ -303,21 +267,26 @@ def verify_zip(root):
 def verify_prediction_replay(root,report,origins,short,long):
     """逐格重算归档预测，格式合法或重新压缩都不能掩盖手改结果。"""
     from data_cleaning.pipeline import prepare_data
-    from main_s import predict_deployed,g1_prior_pack
+    from main_s import predict_deployed,profile_pack
     data=prepare_data(include_test=True)
     source_matches=bool(report.get("data_sources")) and report["data_sources"]==data.sources
     cutoff_ok=all(bool(b.diagnostics) and pd.Timestamp(b.train_end)<origins[0] and
         pd.Timestamp(b.train_end)<=pd.Timestamp(C.TRAIN_END) and
         all(pd.Timestamp(d["max_target_time"])<=pd.Timestamp(b.train_end) for d in b.diagnostics)
         for b in (short,long))
-    prior_ok=bool(source_matches and cutoff_ok and all(
-        b.recipe.get("g1_prior")==g1_prior_pack(data,b.train_end,b.recipe["deployment"]["g1_prior"])
+    profile_ok=bool(source_matches and cutoff_ok and all(
+        b.recipe.get("frozen_profile")==profile_pack(data.prefix(b.train_end),b.train_end,
+            load_recipe(b.recipe,b.span).get("profile_days",28),
+            load_recipe(b.recipe,b.span).get("profile_smooth"))
         for b in (short,long)))
+    calibration_ok=bool(short.recipe.get("share_calibration") is not None and
+        short.recipe.get("share_calibration")==long.recipe.get("share_calibration"))
     result={"passed":False,"input_sources_match":source_matches,"training_cutoffs_passed":cutoff_ok,
-        "g1_prior_reconstructed_from_raw_training_labels":prior_ok,
+        "frozen_profile_reconstructed_from_raw_training_labels":profile_ok,
+        "frozen_share_calibration_pair_consistent":calibration_ok,
         "training_performed":False,"scope":"all_exported_forecast_cells","csv_rounding_tolerance":.00000051,
         "short":{},"long":{}}
-    if not source_matches or not cutoff_ok or not prior_ok:
+    if not source_matches or not cutoff_ok or not profile_ok or not calibration_ok:
         return result
     view=data.masked_copy(origins[0],mask_use=True)
     view.labels=view.labels.copy();view.labels.loc[origins[0]:]=np.nan
