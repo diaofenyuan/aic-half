@@ -135,6 +135,26 @@ def training_boundary(bundle, cutoff):
     return walk(bundle.diagnostics) and walk(getattr(bundle, "process_meta", {}))
 
 
+def _regime_coverage(truth):
+    """窗口真值所在的负荷档位占比：说明窗口均分究竟覆盖了哪些工况。
+    只描述评分真值，不进入模型输入，也不用于候选排名。"""
+    import numpy as np
+    y = np.asarray(truth, float)
+    edges = {"generator_1": (0., 60., 100., 150., 200.), "generator_all": (0., 300., 330., 360., 400.)}
+    out = {"role": "truth_regime_coverage_diagnostic_only", "targets": {}}
+    for index, name in enumerate(("generator_1", "generator_all")):
+        v = y[..., index]
+        finite = np.isfinite(v)
+        bounds = edges[name]
+        shares = {}
+        for lo, hi in zip(bounds[:-1], bounds[1:]):
+            shares[f"({lo:g},{hi:g}]"] = float((finite & (v > lo) & (v <= hi)).sum() / max(1, finite.sum()))
+        shares["zero_truth"] = float((finite & (v == 0.)).sum() / max(1, finite.sum()))
+        out["targets"][name] = {"observed_cells": int(finite.sum()), "shares": shares,
+                                "mean_mw": float(np.mean(v[finite])) if finite.any() else None}
+    return out
+
+
 def reusable_load(job, span, current):
     parent = Path(job["parent_output"]) if job.get("parent_output") else None
     if parent is None or not (parent / "模型" / span / "meta.json").is_file():
@@ -245,6 +265,42 @@ def evaluate(job, cache=None):
                          "available_history_tail_sensitivity": available_tail,
                          "effective_budget": bundle.recipe.get("effective_budget"), **reuse_info[span],
                          "target_dates": {}}
+        # 评分参考包：同一批预测在多种聚合口径、提前量、日级分布与误差分解下的表现。
+        # 主指标不变，只补齐判断“这个本地分数代表哪种工况”所需的诊断。
+        metrics[span]["reference_pack"] = quality.score_reference_pack(pred, truth, origins)
+        metrics[span]["regime_coverage"] = _regime_coverage(truth)
+        # 与冻结画像基线（不训练）的分档对比：关键低真值档里模型是否真的优于基线。
+        metrics[span]["naive_band_comparison"] = quality.compare_bands(pred, naive, truth)
+        # 单窗得分的日块抽样不确定性：几分的窗口差异是否超出噪声必须先看这个。
+        metrics[span]["score_uncertainty"] = quality.score_uncertainty(pred, truth, origins)
+        # 与父方案的配对差值：只有父方案在同一窗口保存过预测时才可算，否则显式标注。
+        paired = {"status": "NO_PARENT_PREDICTIONS", "role": "diagnostic_only"}
+        parent_window = Path(job["parent_output"]) if job.get("parent_output") else None
+        if parent_window is not None:
+            saved_prediction = parent_window / f"{span}_predictions.npz"
+            if saved_prediction.is_file():
+                prior = np.load(saved_prediction, allow_pickle=False)
+                prior_prediction = np.asarray(prior["prediction"], float)
+                prior_truth = np.asarray(prior["truth"], float)
+                if prior_prediction.shape != pred.shape:
+                    paired = {"status": "SHAPE_MISMATCH", "role": "diagnostic_only",
+                              "parent_shape": list(prior_prediction.shape)}
+                elif not np.array_equal(prior_truth, truth, equal_nan=True):
+                    paired = {"status": "TRUTH_MISMATCH", "role": "diagnostic_only"}
+                else:
+                    paired = quality.paired_delta_uncertainty(pred, prior_prediction, truth, origins)
+        metrics[span]["paired_delta"] = paired
+        # 尾部口径敏感性：本地默认在窗口末端截断目标时刻；若官方按整段提前量评分，
+        # 差异必须单列。窗口紧邻数据末尾时无法检验，据实报告 0 个额外真值格。
+        extended_truth = quality.truth_cube(truth_data, origins, range(1, h + 1))
+        extended_score = quality.score_load(pred, extended_truth)
+        metrics[span]["tail_boundary_sensitivity"] = {
+            "role": "diagnostic_only_not_candidate_ranking",
+            "extra_truth_cells": int(np.isfinite(extended_truth).sum() - np.isfinite(truth).sum()),
+            "extended": {t: extended_score[t]["score"] for t in C.TARGETS},
+            "delta": {t: (None if score[t]["score"] is None or extended_score[t]["score"] is None
+                          else float(extended_score[t]["score"] - score[t]["score"])) for t in C.TARGETS},
+            "note": "窗口后标签只用于事后评分，不进入训练、特征或选模"}
         for stage, begin, stop, role in C.STAGES:
             if stage == "half_train" and role == "train":
                 begin, stop = max(start, pd.Timestamp(begin)), min(end, pd.Timestamp(stop))
@@ -355,6 +411,100 @@ def evaluate(job, cache=None):
     return {"status": "COMPLETE", "primary": objective, "checks": checks, "metrics": metrics,
             "comparison": comparison, "experimental": True, "submittable": False,
             "official_acceptance_status": "unknown", "field_safety_certified": False}
+
+
+def window_score_sensitivity(reports):
+    """单窗口敏感度：逐窗分数、去掉该窗后的均值和均值的最大偏移。
+    基线任务没有对照包，只有再次比较候选时才能算配对收益，因此这里改用本次自身分数，
+    回答“总分依赖哪一个窗口”，不改任何排名口径。"""
+    import numpy as np
+    out = {"role": "own_window_sensitivity_diagnostic_only", "spans": {}}
+    for span in ("short", "long"):
+        if not all(span in r.get("metrics", {}) for r in reports.values()):
+            continue
+        out["spans"][span] = {}
+        for target in ("generator_1", "generator_all"):
+            scores = {name: r["metrics"][span]["score"][target]["score"] for name, r in reports.items()}
+            values = [v for v in scores.values() if isinstance(v, (int, float))]
+            if len(values) < 2 or len(values) != len(scores):
+                continue
+            mean = float(np.mean(values))
+            leave_out = {name: float(np.mean([v for k, v in scores.items() if k != name])) for name in scores}
+            shifts = {name: leave_out[name] - mean for name in scores}
+            out["spans"][span][target] = {
+                "window_scores": scores, "mean": mean, "leave_one_out_mean": leave_out,
+                "leave_one_out_shift": shifts,
+                "max_abs_shift": float(max(abs(v) for v in shifts.values())),
+                "most_influential_window": max(shifts, key=lambda k: abs(shifts[k])),
+                "range": float(max(values) - min(values)),
+                "worst_window": min(scores, key=scores.get), "best_window": max(scores, key=scores.get)}
+    return out
+
+
+def event_day_reference(reports):
+    """事件日占比与窗口均值的条件参考：日级 1-MAPE<80 记为事件日（逐目标分别统计）。
+    本地均值只有在事件日占比相近时才可比较；本块只描述工况条件，不改主指标，
+    也不代表官方聚合或线上分数预测。"""
+    out = {"role": "event_day_reference_diagnostic_only",
+           "definition": "事件日=某起报日期整日池化 1-MAPE<80（本地约定，逐目标统计）",
+           "caveat": "目标期事件日数量未知；本表只说明本地均值的工况条件，不预测线上分数",
+           "spans": {}}
+    for span in ("short", "long"):
+        span_rows = {}
+        for target in ("generator_1", "generator_all"):
+            rows = []
+            for name, report in reports.items():
+                days = (report.get("metrics", {}).get(span, {}).get("reference_pack", {})
+                        .get("days", {}).get("targets", {}).get(target, {})
+                        .get("by_target_date") or {})
+                scores = [item.get("score") for item in days.values()
+                          if isinstance(item.get("score"), (int, float))]
+                if len(scores) < 5:
+                    continue
+                rows.append({"window": name, "days": len(scores),
+                             "event_share": sum(1 for s in scores if s < 80.) / len(scores),
+                             "equal_day_mean": sum(scores) / len(scores),
+                             "min_day": min(scores)})
+            if rows:
+                rows.sort(key=lambda r: r["event_share"])
+                span_rows[target] = {"rows": rows}
+        if span_rows:
+            out["spans"][span] = span_rows
+    return out
+
+
+def reference_band(reports, sensitivity):
+    """把逐窗分数、日级下尾、完整提前量覆盖与零值格数合成一条可直接引用的参考带。
+    只描述本地历史分布，不是线上分数预测，也不替代主指标。"""
+    import numpy as np
+    out = {"role": "local_reference_band_diagnostic_only",
+           "note": "本地历史窗口分布，不代表测试期或官网分数", "targets": {}}
+    for span, targets in sensitivity.get("spans", {}).items():
+        for target, row in targets.items():
+            day_p10, day_median, complete, zero, cells = [], [], [], 0, 0
+            for report in reports.values():
+                pack = report.get("metrics", {}).get(span, {}).get("reference_pack", {})
+                quant = pack.get("days", {}).get("targets", {}).get(target, {}).get("target_date_quantiles", {})
+                if quant.get("p10") is not None:
+                    day_p10.append(quant["p10"])
+                    day_median.append(quant["median"])
+                agg = pack.get("aggregation", {}).get("targets", {}).get(target, {})
+                if agg.get("complete_horizon") is not None:
+                    complete.append(agg["complete_horizon"])
+                zero += int(agg.get("zero_truth") or 0)
+                cells += int(agg.get("cells") or 0)
+            scores = list(row["window_scores"].values())
+            out["targets"][f"{span}:{target}"] = {
+                "window_count": len(scores), "mean": row["mean"], "min": float(min(scores)),
+                "max": float(max(scores)), "range": row["range"], "worst_window": row["worst_window"],
+                "best_window": row["best_window"],
+                "max_single_window_shift": row["max_abs_shift"],
+                "most_influential_window": row["most_influential_window"],
+                "day_p10_min": float(min(day_p10)) if day_p10 else None,
+                "day_median_min": float(min(day_median)) if day_median else None,
+                "complete_horizon_mean": float(np.mean(complete)) if complete else None,
+                "zero_truth_cells": zero, "scored_cells": cells}
+    return out
 
 
 def paired_window_sensitivity(reports, reference):
@@ -473,11 +623,69 @@ def evaluate_windows(job):
                 score = report["metrics"][span]["score"]
                 row[span] = {target: score[target]["score"] for target in ("generator_1", "generator_all")}
                 row[span + "_macro"] = score["macro_score"]
+                # 多口径与工况覆盖只进汇总表，便于逐窗对照；主指标仍是逐格 1-MAPE。
+                pack = report["metrics"][span].get("reference_pack", {}).get("aggregation", {}).get("targets", {})
+                if pack:
+                    row[span + "_variants"] = {target: {k: v.get(k) for k in
+                        ("cell_mean", "origin_mean", "day_equal_mean", "wape_score", "smape",
+                         "complete_horizon", "zero_as_full_error", "zero_truth")}
+                        for target, v in pack.items()}
+                regime = report["metrics"][span].get("regime_coverage", {}).get("targets", {})
+                if regime:
+                    row[span + "_regime"] = {target: {"mean_mw": v.get("mean_mw"), **v.get("shares", {})}
+                                             for target, v in regime.items()}
+                share = report["metrics"][span].get("reference_pack", {}).get("decomposition", {})
+                if share:
+                    row[span + "_decomposition"] = {k: (share.get("overall") or {}).get(k) for k in
+                        ("mean_abs_share_mw", "mean_abs_level_mw", "share_attribution", "bias_share_mw", "bias_level_mw")}
+                    row[span + "_decomposition"]["mean_abs_share_gap"] = share.get("mean_abs_share_gap")
+                tail = report["metrics"][span].get("tail_boundary_sensitivity", {})
+                if tail:
+                    row[span + "_tail"] = {"extra_truth_cells": tail.get("extra_truth_cells"),
+                                           "delta": tail.get("delta")}
+                vs = report["metrics"][span].get("naive_band_comparison", {})
+                if vs.get("targets"):
+                    row[span + "_vs_naive"] = {
+                        target: {"model": v.get("model_score"), "baseline": v.get("baseline_score"),
+                                 "band_delta": {b: x.get("delta") for b, x in (v.get("by_observed_target_mw") or {}).items()},
+                                 "model_error_share": {b: x.get("model_error_share")
+                                                       for b, x in (v.get("by_observed_target_mw") or {}).items()}}
+                        for target, v in vs["targets"].items() if isinstance(v, dict) and v.get("model_score") is not None}
+                unc = report["metrics"][span].get("score_uncertainty", {}).get("targets", {})
+                if unc:
+                    row[span + "_uncertainty"] = {
+                        target: {"se": v.get("standard_error"), "half_width": v.get("half_width"), "days": v.get("days")}
+                        for target, v in unc.items() if isinstance(v, dict) and v.get("standard_error") is not None}
+                pair = report["metrics"][span].get("paired_delta", {})
+                if pair.get("targets"):
+                    row[span + "_paired"] = {
+                        target: {"delta": v.get("delta_point"), "se": v.get("delta_standard_error"),
+                                 "p2_5": v.get("delta_p2_5"), "p97_5": v.get("delta_p97_5")}
+                        for target, v in pair["targets"].items() if isinstance(v, dict) and v.get("delta_point") is not None}
+                elif pair.get("status"):
+                    row[span + "_paired"] = {"status": pair["status"]}
         summary["windows"][name] = row
     for span in ("short", "long"):
         if all(span in row for row in summary["windows"].values()):
             for target, suffix in (("generator_1", "g1"), ("generator_all", "gall")):
                 summary["mean"][span + "_" + suffix] = float(np.mean([row[span][target] for row in summary["windows"].values()]))
+            for key in ("cell_mean", "origin_mean", "day_equal_mean", "wape_score", "smape", "complete_horizon"):
+                values = [row[span + "_variants"][target][key] for row in summary["windows"].values()
+                          for target in ("generator_1", "generator_all")]
+                if all(v is not None for v in values):
+                    summary["mean"][span + "_" + key + "_macro"] = float(np.mean(values))
+    # 窗口均值的抽样不确定性：各窗是不同时段而非重复实验，按独立近似给出参考标准误。
+    uncertainty_summary = {}
+    for span in ("short", "long"):
+        for target in ("generator_1", "generator_all"):
+            key = span + "_uncertainty"
+            ses = [row[key][target]["se"] for row in summary["windows"].values()
+                   if key in row and isinstance(row[key].get(target), dict)]
+            if ses and len(ses) == len(summary["windows"]):
+                uncertainty_summary[f"{span}:{target}"] = {
+                    "windows": len(ses), "mean_single_window_se": float(np.mean(ses)),
+                    "se_of_window_mean": float(np.sqrt(np.mean(np.square(ses))) / np.sqrt(len(ses)))}
+    summary["window_mean_uncertainty"] = uncertainty_summary
     baseline = job.get("baseline_output")
     if baseline:
         reference = {}
@@ -486,6 +694,14 @@ def evaluate_windows(job):
             if path.is_file():
                 reference[name] = json.loads(path.read_text(encoding="utf-8"))
         summary["paired_sensitivity"] = paired_window_sensitivity(reports, reference)
+    else:
+        # 基线任务没有对照包：显式标注，避免该字段静默缺失被误读成“无敏感性”。
+        summary["paired_sensitivity"] = {"status": "NO_BASELINE_REFERENCE", "role": "diagnostic_only"}
+    # 单窗口敏感度与参考带对任何一次回放都可算，直接由本次逐窗结果生成。
+    sensitivity = window_score_sensitivity(reports)
+    summary["own_window_sensitivity"] = sensitivity
+    summary["reference_band"] = reference_band(reports, sensitivity)
+    summary["event_day_reference"] = event_day_reference(reports)
     if job["track"] in ("short","long","load","g1"):
         summary["historical_score_stability"] = historical_score_stability(reports)
     artifacts = {}

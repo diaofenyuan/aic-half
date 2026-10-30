@@ -69,10 +69,30 @@ def score_load(pred, truth):
 
 
 def score_horizons(pred, truth):
+    """按提前量分组的得分，并给出该组占全部相对误差的比例；只看分组得分会漏掉误差集中度。"""
+    pred, truth = np.asarray(pred, float), np.asarray(truth, float)
     h = pred.shape[1]
     groups = ((0, 4), (4, 8)) if h == 8 else ((0, 8), (8, 32), (32, 96))
-    return {f"{a+1}-{min(b,h)}": score_load(pred[:, a:min(b,h)], truth[:, a:min(b,h)])
-            for a, b in groups if a < h}
+    total = {}
+    for index, name in enumerate(C.TARGETS):
+        y = truth[..., index]
+        valid = np.isfinite(y) & (y > 0.)
+        total[name] = float(np.sum(np.abs(pred[..., index][valid] - y[valid]) / y[valid])) if valid.any() else 0.
+    out = {}
+    for a, b in groups:
+        if a >= h:
+            continue
+        stop = min(b, h)
+        row = score_load(pred[:, a:stop], truth[:, a:stop])
+        shares = {}
+        for index, name in enumerate(C.TARGETS):
+            y, p = truth[:, a:stop, index], pred[:, a:stop, index]
+            valid = np.isfinite(y) & (y > 0.)
+            share = float(np.sum(np.abs(p[valid] - y[valid]) / y[valid])) if valid.any() else 0.
+            shares[name] = float(share / total[name]) if total[name] > 0. else None
+        row["error_share"] = shares
+        out[f"{a+1}-{stop}"] = row
+    return out
 
 
 def score_prediction_csv(path, labels, origins, horizons, window_end=None):
@@ -163,6 +183,335 @@ def load_diagnostics(pred, truth, origins):
                       "by_origin_date":origin_daily,"complete_horizon_origins":complete_score,
                       "information_role":"historical_scoring_only"}
     return result
+
+
+def _target_error(pred, truth, index):
+    """单目标的有效评分单元与相对误差；零负荷真值单列，不进 MAPE 分母。"""
+    p, y = np.asarray(pred, float)[..., index], np.asarray(truth, float)[..., index]
+    valid = np.isfinite(y) & (y > 0.)
+    err = np.where(valid, np.abs(p - y) / np.where(valid, y, 1.), np.nan)
+    return p, y, valid, err
+
+
+def _mean_or_none(values):
+    a = np.asarray(values, float)
+    return float(np.mean(a)) if a.size and np.isfinite(a).any() else None
+
+
+def aggregation_variants(pred, truth, origins):
+    """同一批预测在多种聚合口径下的得分，量化“窗口均值”对口径的敏感度。
+    官方聚合方式未公开，这里只做敏感性对照，不参与候选排名。"""
+    pred, truth = np.asarray(pred, float), np.asarray(truth, float)
+    origins = pd.DatetimeIndex(origins)
+    if pred.shape != truth.shape or pred.ndim != 3 or pred.shape[0] != len(origins):
+        raise ValueError("聚合口径对照需要与起报网格一致的预测和真值")
+    times = origins.to_numpy()[:, None] + np.arange(1, pred.shape[1] + 1)[None, :] * np.timedelta64(C.STEP, "m")
+    out = {"role": "aggregation_sensitivity_diagnostic_only", "official_aggregation": "unknown", "targets": {}}
+    for index, name in enumerate(C.TARGETS):
+        p, y, valid, err = _target_error(pred, truth, index)
+        row = {"cells": int(valid.sum()), "missing_truth": int((~np.isfinite(y)).sum()),
+               "zero_truth": int((np.isfinite(y) & (y == 0.)).sum())}
+        # 逐格等权即当前主指标；逐起报点、逐目标日等权模拟“按行或按日聚合”的官方口径。
+        row["cell_mean"] = float(100. * (1. - np.mean(err[valid]))) if valid.any() else None
+        per_origin = [np.mean(err[j][np.isfinite(err[j])]) if np.isfinite(err[j]).any() else np.nan
+                      for j in range(len(origins))]
+        row["origin_mean"] = float(100. * (1. - np.mean(np.asarray(per_origin, float)[np.isfinite(per_origin)]))) \
+            if np.isfinite(per_origin).any() else None
+        days = times.astype("datetime64[D]")
+        daily = [float(100. * (1. - np.mean(err[days == day][np.isfinite(err[days == day])])))
+                 for day in np.unique(days) if np.isfinite(err[days == day]).any()]
+        row["day_equal_mean"] = _mean_or_none(daily)
+        row["day_count"] = len(daily)
+        if valid.any() and np.sum(y[valid]) > 0.:
+            row["wape_score"] = float(100. * (1. - np.sum(np.abs(p[valid] - y[valid])) / np.sum(y[valid])))
+            scale = np.abs(p[valid]) + y[valid]
+            row["smape"] = float(100. * (1. - np.mean(2. * np.abs(p[valid] - y[valid]) / np.where(scale > 0., scale, 1.)))) \
+                if np.all(scale > 0.) else None
+        else:
+            row["wape_score"] = row["smape"] = None
+        # 末尾截断使各起报点提前量数量不等；完整提前量口径只保留全步都有真值的起报点。
+        complete = np.isfinite(y).all(axis=1)
+        complete_err = err[complete][np.isfinite(err[complete])]
+        row["complete_horizon"] = float(100. * (1. - np.mean(complete_err))) if complete_err.size else None
+        row["complete_horizon_origins"] = int(complete.sum())
+        # 官方零值处理未公开：零负荷真值若按满误差计，分数变化单独报告，不改主指标。
+        zero = np.isfinite(y) & (y == 0.)
+        zero_flagged = int((np.abs(p[zero]) > 1e-9).sum())
+        denominator = int(valid.sum()) + zero_flagged
+        if denominator:
+            total = float(np.sum(np.abs(p[valid] - y[valid]) / y[valid])) + float(zero_flagged)
+            row["zero_as_full_error"] = float(100. * (1. - total / denominator))
+            row["zero_flagged_cells"] = zero_flagged
+        else:
+            row["zero_as_full_error"] = row["zero_flagged_cells"] = None
+        out["targets"][name] = row
+    return out
+
+
+def lead_profiles(pred, truth):
+    """逐提前量得分，揭示被窗口均值掩盖的提前量结构差异。"""
+    pred, truth = np.asarray(pred, float), np.asarray(truth, float)
+    if pred.shape != truth.shape or pred.ndim != 3:
+        raise ValueError("提前量诊断需要形状一致的预测和真值")
+    out = {"role": "lead_profile_diagnostic_only", "targets": {}}
+    for index, name in enumerate(C.TARGETS):
+        rows = {}
+        for h in range(pred.shape[1]):
+            _, _, valid, err = _target_error(pred[:, h:h + 1], truth[:, h:h + 1], index)
+            rows[str(h + 1)] = {"cells": int(valid.sum()),
+                                "score": float(100. * (1. - np.mean(err[valid]))) if valid.any() else None,
+                                "mean_abs_error_mw": float(np.mean(np.abs(
+                                    pred[:, h, index][valid[..., 0] & np.isfinite(pred[:, h, index])]
+                                    - truth[:, h, index][valid[..., 0] & np.isfinite(pred[:, h, index])])))
+                                if valid.any() else None}
+        scores = [v["score"] for v in rows.values() if v["score"] is not None]
+        out["targets"][name] = {"leads": rows, "worst": min(scores) if scores else None,
+                                "best": max(scores) if scores else None}
+    return out
+
+
+def day_profiles(pred, truth, origins):
+    """按目标时刻日期与起报日期分组的得分分布，说明均值背后有多少下尾日。"""
+    pred, truth = np.asarray(pred, float), np.asarray(truth, float)
+    origins = pd.DatetimeIndex(origins)
+    if pred.shape != truth.shape or pred.ndim != 3 or pred.shape[0] != len(origins):
+        raise ValueError("日级诊断需要与起报网格一致的预测和真值")
+    times = origins.to_numpy()[:, None] + np.arange(1, pred.shape[1] + 1)[None, :] * np.timedelta64(C.STEP, "m")
+    out = {"role": "day_profile_diagnostic_only", "targets": {}}
+    for index, name in enumerate(C.TARGETS):
+        _, _, valid, err = _target_error(pred, truth, index)
+        days = times.astype("datetime64[D]")
+        origin_days = np.broadcast_to(origins.normalize().to_numpy().astype("datetime64[D]")[:, None], err.shape)
+        by_target, by_origin = {}, {}
+        for day in np.unique(days):
+            e = err[days == day]
+            mask = np.isfinite(e)
+            by_target[str(pd.Timestamp(day).date())] = {"cells": int((valid & (days == day)).sum()),
+                                                        "score": float(100. * (1. - np.mean(e[mask]))) if mask.any() else None}
+        for day in np.unique(origin_days):
+            e = err[origin_days == day]
+            mask = np.isfinite(e)
+            by_origin[str(pd.Timestamp(day).date())] = {"cells": int((valid & (origin_days == day)).sum()),
+                                                        "score": float(100. * (1. - np.mean(e[mask]))) if mask.any() else None}
+        target_scores = [v["score"] for v in by_target.values() if v["score"] is not None]
+        origin_scores = [v["score"] for v in by_origin.values() if v["score"] is not None]
+        def quantiles(values):
+            if not values:
+                return {}
+            return {"count": len(values), "p10": float(np.percentile(values, 10)), "p25": float(np.percentile(values, 25)),
+                    "median": float(np.median(values)), "p90": float(np.percentile(values, 90)),
+                    "min": float(np.min(values)), "max": float(np.max(values))}
+        out["targets"][name] = {"by_target_date": by_target, "by_origin_date": by_origin,
+                                "target_date_quantiles": quantiles(target_scores),
+                                "origin_date_quantiles": quantiles(origin_scores)}
+    return out
+
+
+def split_decomposition(pred, truth, band_edges=(0., 250., 300., 330., 360., 400.)):
+    """把 generator_1 误差分解为“总量项 + 分组份额项”，并给出分区间归因。
+    恒等式 p1-y1 = (s_p-s_y)*p_all + s_y*(p_all-y_all)，只作事后诊断，不进入模型输入。"""
+    pred, truth = np.asarray(pred, float), np.asarray(truth, float)
+    if pred.shape != truth.shape or pred.ndim != 3 or pred.shape[2] != 2:
+        raise ValueError("分解需要两目标的预测和真值")
+    pa, ya = pred[..., 1], truth[..., 1]
+    p1, y1 = pred[..., 0], truth[..., 0]
+    ok = np.isfinite(pa) & (pa > 0.) & np.isfinite(ya) & (ya > 0.) & np.isfinite(p1) & np.isfinite(y1)
+    s_p = np.where(ok, p1 / np.where(ok, pa, 1.), np.nan)
+    s_y = np.where(ok, y1 / np.where(ok, ya, 1.), np.nan)
+    share = np.where(ok, (s_p - s_y) * pa, np.nan)
+    level = np.where(ok, s_y * (pa - ya), np.nan)
+
+    def summarize(mask):
+        n = int(mask.sum())
+        if not n:
+            return {"cells": 0, "share_fraction": None, "mean_abs_share_mw": None, "mean_abs_level_mw": None,
+                    "share_attribution": None, "bias_share_mw": None, "bias_level_mw": None,
+                    "generator_1_score": None, "truth_share_ratio": None}
+        total = np.abs(share[mask]) + np.abs(level[mask])
+        err = (np.abs(p1[mask] - y1[mask]) / np.where(y1[mask] > 0., y1[mask], 1.))
+        return {"cells": n, "share_fraction": float(n / ok.sum()),
+                "mean_abs_share_mw": float(np.mean(np.abs(share[mask]))),
+                "mean_abs_level_mw": float(np.mean(np.abs(level[mask]))),
+                "share_attribution": float(np.sum(np.abs(share[mask])) / np.sum(total)) if np.sum(total) > 0. else None,
+                "bias_share_mw": float(np.mean(share[mask])), "bias_level_mw": float(np.mean(level[mask])),
+                "generator_1_score": float(100. * (1. - np.mean(err))),
+                "truth_share_ratio": float(np.mean(s_y[mask]))}
+
+    edges = list(band_edges) + [np.inf]
+    bands = {}
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        bands[f"({lo:g},{hi:g}]"] = summarize(ok & (ya > lo) & (ya <= hi))
+    # 份额差 |s_p-s_y| 是 generator_1 得分的主要控制量；分档曲线便于判断当前窗口处在哪一段。
+    gap_edges = (0., .01, .02, .03, .05, .08, .12, np.inf)
+    gap_bands = {}
+    gap = np.abs(np.where(ok, s_p - s_y, np.nan))
+    for lo, hi in zip(gap_edges[:-1], gap_edges[1:]):
+        gap_bands[f"[{lo:.2f},{hi:.2f})"] = summarize(ok & (gap >= lo) & (gap < hi))
+    return {"role": "error_decomposition_diagnostic_only", "identity": "p1-y1=(s_p-s_y)*p_all+s_y*(p_all-y_all)",
+            "cells": int(ok.sum()), "overall": summarize(ok), "by_truth_generator_all_mw": bands,
+            "by_abs_share_gap": gap_bands, "mean_abs_share_gap": float(np.mean(gap[ok])) if ok.any() else None}
+
+
+def joint_error_bands(pred, truth, gap_edges=(0., .02, .04, .06, .08, .12, np.inf),
+                      level_edges=(0., .05, .10, .15, .25, np.inf)):
+    """份额差 × 总量相对误差的二维分档得分。
+    单项分档会把相互抵消的份额项与总量项重复计入，联合表才能回答“本窗口的单元格实际落在
+    哪一区、该区得分是多少”，只作事后诊断。最差档必须开口，否则会静默丢掉最差的单元格。"""
+    pred, truth = np.asarray(pred, float), np.asarray(truth, float)
+    if pred.shape != truth.shape or pred.ndim != 3 or pred.shape[2] != 2:
+        raise ValueError("联合分档需要两目标的预测和真值")
+    p1, pa, y1, ya = pred[..., 0], pred[..., 1], truth[..., 0], truth[..., 1]
+    ok = np.isfinite(ya) & (ya > 0.) & np.isfinite(pa) & (pa > 0.) & np.isfinite(p1) & (p1 > 0.) & np.isfinite(y1) & (y1 > 0.)
+    gap = np.where(ok, p1 / np.where(ok, pa, 1.) - y1 / np.where(ok, ya, 1.), np.nan)
+    level = np.where(ok, pa / np.where(ok, ya, 1.) - 1., np.nan)
+    err = np.where(ok, np.abs(p1 - y1) / np.where(ok, y1, 1.), np.nan)
+    table = {}
+    for glo, ghi in zip(gap_edges[:-1], gap_edges[1:]):
+        for llo, lhi in zip(level_edges[:-1], level_edges[1:]):
+            mask = ok & (np.abs(gap) >= glo) & (np.abs(gap) < ghi) & (np.abs(level) >= llo) & (np.abs(level) < lhi)
+            n = int(mask.sum())
+            key = f"gap[{glo:.2f},{ghi:.2f}) level[{llo:.2f},{lhi:.2f})"
+            table[key] = {"cells": n, "cell_share": float(n / ok.sum()) if ok.any() else None,
+                          "score": float(100. * (1. - np.mean(err[mask]))) if n else None,
+                          "mean_abs_gap": float(np.mean(np.abs(gap[mask]))) if n else None,
+                          "mean_abs_level_error": float(np.mean(np.abs(level[mask]))) if n else None}
+    return {"role": "joint_error_bands_diagnostic_only", "cells": int(ok.sum()),
+            "gap_edges": list(gap_edges), "level_edges": list(level_edges), "table": table}
+
+
+def score_reference_pack(pred, truth, origins):
+    """把一次历史回放的多口径敏感性、提前量、日级分布、误差分解与零值盲区汇总成参考包。
+    主指标不变；这些量用于判断本地分数能代表哪种工况，官方口径仍未知。"""
+    return {"role": "scoring_reference_diagnostic_only", "official_score_replicated": False,
+            "aggregation": aggregation_variants(pred, truth, origins),
+            "leads": lead_profiles(pred, truth),
+            "days": day_profiles(pred, truth, origins),
+            "decomposition": split_decomposition(pred, truth),
+            "joint_bands": joint_error_bands(pred, truth)}
+
+
+def compare_bands(pred, baseline, truth):
+    """在同一批单元格上对比模型与冻结画像基线（朴素）的分档得分与误差贡献。
+    1-MAPE 主要由低真值档驱动；只有分档对比才能看出模型在关键档是否真的优于基线。"""
+    pred, baseline, truth = (np.asarray(x, float) for x in (pred, baseline, truth))
+    if pred.shape != truth.shape or baseline.shape != truth.shape or pred.ndim != 3:
+        raise ValueError("分档对比需要形状一致的模型、基线预测与真值")
+
+    def rel(p, y, mask):
+        return np.abs(p[mask] - y[mask]) / y[mask]
+
+    ranges = ((0., 30., 60., 100., 150., 200., np.inf), (0., 100., 200., 300., 440., np.inf))
+    out = {"role": "band_vs_baseline_diagnostic_only", "official_mapping": "unknown", "targets": {}}
+    for index, name in enumerate(C.TARGETS):
+        p, b, y = pred[..., index], baseline[..., index], truth[..., index]
+        valid = np.isfinite(y) & (y > 0.)
+        if not valid.any():
+            out["targets"][name] = {"status": "NO_OBSERVED_TRUTH"}
+            continue
+        total_model = float(np.sum(rel(p, y, valid)))
+        total_base = float(np.sum(rel(b, y, valid)))
+        bands = {}
+        for lo, hi in zip(ranges[index][:-1], ranges[index][1:]):
+            mask = valid & (y > lo) & (y <= hi)
+            if not mask.any():
+                continue
+            bands[f"({lo:g},{hi:g}]"] = {
+                "cells": int(mask.sum()), "cell_share": float(mask.sum() / valid.sum()),
+                "model_score": float(100. * (1. - np.mean(rel(p, y, mask)))),
+                "baseline_score": float(100. * (1. - np.mean(rel(b, y, mask)))),
+                "delta": float(100. * (np.mean(rel(b, y, mask)) - np.mean(rel(p, y, mask)))),
+                "model_error_share": float(np.sum(rel(p, y, mask)) / total_model) if total_model else None,
+                "baseline_error_share": float(np.sum(rel(b, y, mask)) / total_base) if total_base else None}
+        out["targets"][name] = {
+            "model_score": float(100. * (1. - np.mean(rel(p, y, valid)))),
+            "baseline_score": float(100. * (1. - np.mean(rel(b, y, valid)))),
+            "by_observed_target_mw": bands,
+            "note": "基线为冻结同槽画像（不训练）；delta 为正表示模型该档优于基线"}
+    return out
+
+
+def score_uncertainty(pred, truth, origins, replicates=4000, seed=20261029):
+    """按目标日块自助法估计本窗口得分的抽样不确定性。
+    21 天窗口的日均分数波动较大，几分的窗口差异里有多少是抽样噪声必须量化，
+    否则容易把噪声当成模型改进。块重采样保留日内相关性，固定种子保证可复现。"""
+    pred, truth = np.asarray(pred, float), np.asarray(truth, float)
+    origins = pd.DatetimeIndex(origins)
+    if pred.shape != truth.shape or pred.ndim != 3 or pred.shape[0] != len(origins):
+        raise ValueError("不确定性估计需要与起报网格一致的预测和真值")
+    times = origins.to_numpy()[:, None] + np.arange(1, pred.shape[1] + 1)[None, :] * np.timedelta64(C.STEP, "m")
+    days = times.astype("datetime64[D]")
+    rng = np.random.default_rng(seed)
+    out = {"role": "score_uncertainty_diagnostic_only", "method": "target_day_block_bootstrap",
+           "replicates": int(replicates), "seed": int(seed), "targets": {}}
+    for index, name in enumerate(C.TARGETS):
+        y, p = truth[..., index], pred[..., index]
+        valid = np.isfinite(y) & (y > 0.)
+        err = np.where(valid, np.abs(p - y) / np.where(valid, y, 1.), 0.)
+        sums, counts = [], []
+        for day in np.unique(days):
+            mask = (days == day) & valid
+            if mask.any():
+                sums.append(float(err[mask].sum()))
+                counts.append(int(mask.sum()))
+        if not sums:
+            out["targets"][name] = {"status": "NO_OBSERVED_TRUTH"}
+            continue
+        sums, counts = np.asarray(sums), np.asarray(counts)
+        draws = rng.integers(0, len(sums), size=(replicates, len(sums)))
+        scores = 100. * (1. - sums[draws].sum(axis=1) / counts[draws].sum(axis=1))
+        out["targets"][name] = {"days": int(len(sums)),
+                                "point": float(100. * (1. - sums.sum() / counts.sum())),
+                                "standard_error": float(np.std(scores, ddof=1)),
+                                "p2_5": float(np.percentile(scores, 2.5)),
+                                "p97_5": float(np.percentile(scores, 97.5)),
+                                "half_width": float((np.percentile(scores, 97.5) - np.percentile(scores, 2.5)) / 2.),
+                                "note": "区分几分的窗口差异须先看该标准误；不是官网分数方差"}
+    return out
+
+
+def paired_delta_uncertainty(candidate, baseline, truth, origins, replicates=4000, seed=20261029):
+    """候选与基线在同一批单元格上的配对差值及其按目标日块自助标准误。
+    绝对水平的标准误不能用于判断改进量：同窗同格配对时日内噪声会相互抵消。"""
+    candidate, baseline, truth = (np.asarray(x, float) for x in (candidate, baseline, truth))
+    origins = pd.DatetimeIndex(origins)
+    if candidate.shape != truth.shape or baseline.shape != truth.shape or candidate.ndim != 3:
+        raise ValueError("配对差值需要形状一致的候选、基线与真值")
+    times = origins.to_numpy()[:, None] + np.arange(1, candidate.shape[1] + 1)[None, :] * np.timedelta64(C.STEP, "m")
+    days = times.astype("datetime64[D]")
+    rng = np.random.default_rng(seed)
+    out = {"role": "paired_delta_uncertainty_diagnostic_only", "method": "target_day_block_bootstrap",
+           "replicates": int(replicates), "seed": int(seed), "targets": {}}
+    for index, name in enumerate(C.TARGETS):
+        y = truth[..., index]
+        valid = np.isfinite(y) & (y > 0.)
+        pc, pb = candidate[..., index], baseline[..., index]
+        err_c = np.where(valid, np.abs(pc - y) / np.where(valid, y, 1.), 0.)
+        err_b = np.where(valid, np.abs(pb - y) / np.where(valid, y, 1.), 0.)
+        sums, counts = [], []
+        for day in np.unique(days):
+            mask = (days == day) & valid
+            if mask.any():
+                sums.append([float(err_c[mask].sum()), float(err_b[mask].sum())])
+                counts.append(int(mask.sum()))
+        if not sums:
+            out["targets"][name] = {"status": "NO_OBSERVED_TRUTH"}
+            continue
+        sums, counts = np.asarray(sums), np.asarray(counts)
+        draws = rng.integers(0, len(sums), size=(replicates, len(sums)))
+        total = counts[draws].sum(axis=1)
+        score_c = 100. * (1. - sums[draws, 0].sum(axis=1) / total)
+        score_b = 100. * (1. - sums[draws, 1].sum(axis=1) / total)
+        delta = score_c - score_b
+        out["targets"][name] = {
+            "delta_point": float(100. * (sums[:, 1].sum() - sums[:, 0].sum()) / counts.sum()),
+            "delta_standard_error": float(np.std(delta, ddof=1)),
+            "delta_p2_5": float(np.percentile(delta, 2.5)),
+            "delta_p97_5": float(np.percentile(delta, 97.5)),
+            "candidate_level_se": float(np.std(score_c, ddof=1)),
+            "baseline_level_se": float(np.std(score_b, ddof=1)),
+            "days": int(len(sums)),
+            "note": "正差值表示候选优于基线；水平标准误与差值标准误不可混用"}
+    return out
 
 
 def score_resources(pred, truth):

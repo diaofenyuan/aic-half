@@ -8,7 +8,7 @@ DATA_ROOT = Path(os.environ.get("AIC_DATA_ROOT", ROOT / "data"))
 OUTPUT_ROOT = ROOT / "outputs"
 EXPERIMENT_ROOT = ROOT / "tmp" / "tmp_outputs"
 SCHEMA = "lgbm_core_v3"
-LOAD_VERSION = "load_group_shape_v3"
+LOAD_VERSION = "load_group_shape_v4"
 CPU_THREADS = min(16, os.cpu_count() or 1)
 STEP = 15
 DT = .25
@@ -61,7 +61,7 @@ LOAD_RECIPE = {"short": "shared", "long": "shared", "loss": "relative_l1",
                    # w4 水平偏低探针 +0.6、w6 爬升窗 +1.0；91 天出现 w4 崩到 78.6 的敏感点，
                    # 故取 12 周整数窗口而不追 77 天峰值）。长期仍用 112 天，水平由短期对齐。
                    "short": {"short": "segmented", "feature_set": "memory+dynamics+missingness+relative",
-                             "phase": "fixed", "days": 84,
+                             "phase": "fixed", "days": 84, "stride": 1, "leaves": 63,
                              "representation": "group_difference", "consistency_alpha": .3,
                              # 短期远端向同起报点长期预测收缩（权重按步递增 1/8..1）。
                              # 长期水平已完全取自短期（short_level_alpha=1.0），不再有
@@ -70,9 +70,9 @@ LOAD_RECIPE = {"short": "shared", "long": "shared", "loss": "relative_l1",
                              "shrink_to_long": 1.0,
                              # 仅在总负荷预测高于训练截止前同槽画像时作单向下调。
                              "profile_upper_guard": {"ratio": 1.02, "scale": 0.97},
-                             "decay_days": 28, "learning_rate": .03, "rounds": 640, "aux_weight_target":"small"},
+                             "decay_days": 28, "learning_rate": .015, "rounds": 1600, "aux_weight_target":"small"},
                    # 长期全程遮挡下相对误差权重会系统性压低水平（四窗实测 w4 少 85MW），改用等权 L1。
-                   "long": {"long": "segmented", "feature_set": "base+relative+mechanism", "phase": "rotating",
+                   "long": {"long": "segmented", "feature_set": "base+relative+mechanism", "phase": "rotating", "stride": 1,
                             "weight_power": 0.0,
                             # 长期 g1 冻结画像整体下调 5%，
                             # 四窗实测 85.11→85.95（w1/w2/w3 改善，w4 水平偏高下跌 3.4）。

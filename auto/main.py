@@ -367,6 +367,29 @@ def record_errors(record):
         return ["记录无法核验：" + str(exc)]
 
 
+def adoption_signal(report):
+    """把配对差值与日块自助标准误一起记入裁决，避免把噪声幅度当成改进。
+    只记录信号强度，不改变 improved 的点估计口径；缺配对预测时返回空并显式说明。"""
+    windows = (report.get("window_summary") or {}).get("windows") or {}
+    noise = (report.get("window_summary") or {}).get("window_mean_uncertainty") or {}
+    out = {"role": "adoption_signal_diagnostic_only",
+           "note": "点估计口径不变；distinguishable 只表示配对差值是否超过 1.96 倍配对标准误",
+           "level_se": {key: value.get("se_of_window_mean") for key, value in noise.items()},
+           "paired": {}}
+    for span in ("short", "long"):
+        pairs = [(row.get(f"{span}_paired") or {}).get("generator_1") for row in windows.values()]
+        pairs = [p for p in pairs if isinstance(p, dict) and p.get("delta") is not None]
+        if not pairs:
+            out["paired"][span] = {"status": "NO_PAIRED_PREDICTIONS"}
+            continue
+        mean_delta = sum(p["delta"] for p in pairs) / len(pairs)
+        mean_se = math.sqrt(sum((p.get("se") or 0.) ** 2 for p in pairs) / len(pairs)) / math.sqrt(len(pairs))
+        out["paired"][span] = {"windows": len(pairs), "mean_delta": mean_delta, "mean_se": mean_se,
+                               "delta_over_noise": (mean_delta / mean_se) if mean_se > 0. else None,
+                               "distinguishable_from_zero": bool(mean_se > 0. and abs(mean_delta) > 1.96 * mean_se)}
+    return out
+
+
 def finalize(folder, state, active):
     existing = next((r for r in state["records"] if r["id"] == active["id"]), None)
     if existing is not None:
@@ -418,7 +441,8 @@ def finalize(folder, state, active):
     report["selection"] = {"eligible": bool(valid), "improved": bool(improved), "comparison_parent": reference_id,
                            "branch_parent": active.get("parent_id"),
                            "primary_delta": score - previous["primary"] if previous and isinstance(score, (float, int)) else None,
-                           "slice_deltas": deltas}
+                           "slice_deltas": deltas,
+                           "signal": adoption_signal(report)}
     write(report_path, report)
     if report.get("window_summary"):
         append_once(folder / "windows.jsonl", {"tag": active["id"], **report["window_summary"],
