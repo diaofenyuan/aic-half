@@ -38,19 +38,21 @@ def setup_log(ctx):
 
 
 def evaluate_load(data,origins,recipe,quick=False):
-    start=pd.DatetimeIndex(origins)[0]
+    origins=pd.DatetimeIndex(origins)
+    start,end=origins[0],origins[-1]
     train=data.prefix(start-pd.Timedelta(minutes=15))
     train.require_training(start-pd.Timedelta(minutes=15))
     short=main_s.train_short(train,recipe,quick,LOG.info)
     long=main_l.train_long(train,recipe,quick,LOG.info)
     view=prediction_view(data,start)
     ps,pl=main_s.predict_deployed(short,long,view,origins)
-    ys,yl=truth_cube(data,origins,range(1,9)),truth_cube(data,origins,range(1,97))
+    ys,yl=truth_cube(data,origins,range(1,9),window_end=end),truth_cube(data,origins,range(1,97),window_end=end)
     ns=main_s.naive_profile(train,origins,range(1,9),train.index[-1])
     nl=main_s.naive_profile(train,origins,range(1,97),train.index[-1])
     metrics={"short":score_load(ps,ys),"long":score_load(pl,yl),
              "short_horizons":score_horizons(ps,ys),"long_horizons":score_horizons(pl,yl),
              "naive_short":score_load(ns,ys),"naive_long":score_load(nl,yl),
+             "scoring_window":{"start":str(start),"end":str(end),"target_times_clipped":True},
              "max_training_target":str(train.index[-1]),"information":"process_only;21day_target_blackout"}
     return short,long,ps,pl,metrics
 
@@ -236,6 +238,20 @@ def self_check(ctx):
         pass
     else:
         raise AssertionError("非有限预测不能通过缩小评分分母获得假增益")
+    from data_cleaning.quality import score_resources, audit_resource_forecasts
+    score_origins=data.index[-4:-1]
+    limited=truth_cube(data,score_origins,[1,2],window_end=score_origins[-1])
+    assert np.isnan(limited[-1]).all() and np.isnan(limited[-2,1]).all()
+    assert np.allclose(limited[0,0],data.labels.loc[score_origins[1]],equal_nan=True)
+    missing_resource=score_resources([10.,np.nan],[10.,100.])
+    assert missing_resource['wape'] is None and not missing_resource['score_valid']
+    assert missing_resource['cells']==2 and missing_resource['missing_prediction_cells']==1
+    mixed_resource=score_resources([12.,5.,np.nan],[10.,0.,np.nan])
+    assert mixed_resource['score_valid'] and np.isclose(mixed_resource['wape'],.7)
+    assert mixed_resource['zero_false_volume']==5.*C.DT
+    missing_day=audit_resource_forecasts([{'times':score_origins[:2],'components':{}}],
+        pd.DataFrame({'resource':[10.,100.]},index=score_origins[:2]))['resource']
+    assert not missing_day['score_valid'] and missing_day['missing_prediction_cells']==2
     assert not any("holder" in x or "generator" in x or "load_" in x for x in base.columns)
     sample=project_load(np.array([[-10.,300.],[210.,0.],[100.,150.],[0.,0.]]))
     assert (sample[:,0]>=0).all() and (sample[:,0]<=200).all() and (sample[:,1]>=sample[:,0]).all()
@@ -244,6 +260,11 @@ def self_check(ctx):
     previous=np.array([30.,30.,30.,30.,75.,75.])
     beta=np.array([.0003,.001,.0006])
     stock=np.array([150000.,100000.])
+    bound=main_opt.inventory_feasibility_bound(inputs,previous,beta,stock)
+    assert bound['bound_available'] and not bound['normal_plan_infeasible_proven']
+    deficit_inputs=dict(inputs,available=np.zeros((96,2)))
+    impossible=main_opt.inventory_feasibility_bound(deficit_inputs,previous,beta,np.array([-100000.,-100000.]))
+    assert impossible['normal_plan_infeasible_proven']
     # 历史组合可能未出现单一气种；合法可用量不应被经验最低份额拒绝。
     support={'available':True,'equations':[[-1.,0.,.02],[0.,-1.,.02],[1.,1.,-.15]],
         'source':'synthetic_historical_share','train_end':'2025-05-31 23:45:00'}
@@ -298,6 +319,12 @@ def self_check(ctx):
         'benefit_floor_cny':float(controlled['prices']@controlled['power'].sum(axis=1)*1000*C.DT)}
     if not validate_day(controlled)['passed']:
         raise AssertionError('联合控制独立核验未通过')
+    controlled['inventory_precheck']=main_opt.inventory_feasibility_bound(
+        controlled,controlled['previous_power'],controlled['beta'],controlled['stocks'][0])
+    assert validate_day(controlled)['checks']['inventory_precheck_fidelity']
+    tampered_bound=deepcopy(controlled)
+    tampered_bound['inventory_precheck']['normal_plan_infeasible_proven']=True
+    assert not validate_day(tampered_bound)['checks']['inventory_precheck_fidelity']
     assert validate_day(controlled)['details']['historical_gas_support']['outside_steps']==96
     bad_optional=deepcopy(controlled);bad_optional['optional_caps'][0,1]+=10.
     assert not validate_day(bad_optional)['checks']['optional_calibration_fidelity']
@@ -339,7 +366,10 @@ def self_check(ctx):
     day["stocks"][4,0]+=100.
     assert not validate_day(day)["checks"]["holder_balance"]
     report={"status":"SELF_CHECK_PASSED","features":len(base.columns),"checks":[
-        "future_perturbation","target_and_gas_blackout","label_object_blackout","reject_nonfinite_score","no_holder_load_features","capacity_projection",
+        "future_perturbation","target_and_gas_blackout","label_object_blackout","reject_nonfinite_score",
+        "score_target_window_boundary","reject_missing_resource_prediction","resource_zero_and_missing_truth",
+        "optimistic_inventory_infeasibility_bound","independent_infeasibility_claim_mutation",
+        "reject_missing_daily_resource_component","no_holder_load_features","capacity_projection",
         "synthetic_milp","independent_balance_mutation","group_refinement_fixed_resources_and_terminal",
         "joint_control_validation","independent_benefit_floor_mutation","initial_boundary_failure_attribution",
         "process_resource_causality_mutation","no_fixed_gas_ratio","local_initial_condition_vs_official_unknown",

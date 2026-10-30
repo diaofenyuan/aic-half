@@ -315,7 +315,11 @@ def residual_profile(data, issue, times):
     slot = pd.DatetimeIndex(times).hour*4+pd.DatetimeIndex(times).minute//15
     values = profile.reindex(slot).fillna(float(valid.median())).to_numpy()
     return values, {"closed_samples":len(valid),"slot_samples":valid.groupby(begin.hour*4+begin.minute//15).size().to_dict(),
-                    "basis":"causal_28day_slot_median_inferred","last_closed_at":str(valid.index[-1])}
+                    "basis":"causal_28day_slot_median_inferred","last_closed_at":str(valid.index[-1]),
+                    "available_as_of":str(pd.Timestamp(issue)),
+                    "observation_age_hours":float((pd.Timestamp(issue)-valid.index[-1]).total_seconds()/3600.),
+                    "support_first_closed_at":str(valid.index[0]),
+                    "unobserved_residual_identified":False,"uncertainty_coverage_calibrated":False}
 
 
 def calibrate_optional_prefix(pred,data,issue):
@@ -859,6 +863,32 @@ def _replay_stocks(start,inputs,gas):
     return np.array(stocks),np.array(vents)
 
 
+def inventory_feasibility_bound(inputs,initial,beta,stock0):
+    """仅用乐观库存上界证明正常计划无解；上界通过不代表存在可行计划。"""
+    available=np.asarray(inputs['available'],float);split=np.asarray(inputs['split'],float)
+    optional=np.asarray(inputs['optional_caps'],float);initial=np.asarray(initial,float)
+    beta=np.asarray(beta,float);stock0=np.asarray(stock0,float)
+    result={'scope':'current_inferred_resource_model','bound_available':False,
+        'normal_plan_infeasible_proven':False,'official_reconstruction_certified':False}
+    if (available.shape!=(96,2) or split.shape!=(96,2) or optional.shape!=(96,2) or
+        initial.shape!=(6,) or beta.shape!=(3,) or stock0.shape!=(2,) or
+        not np.isfinite(np.r_[available.ravel(),split.ravel(),optional.ravel(),initial,beta,stock0]).all() or
+        (split<0.).any() or not np.allclose(split.sum(axis=1),1.) or
+        (optional<0.).any() or (initial<0.).any() or (beta<0.).any() or beta[0]<=0.):
+        return result
+    minimum_power=np.maximum(initial.sum()-C.POLICY['generate_ramp'][1]*np.arange(1,97),0.)
+    minimum_blast=np.maximum((minimum_power-optional@beta[1:])/beta[0],0.)
+    # 忽略单机、额外情景和溢流只会放宽库存上界，不能把本来可行的计划判无解。
+    upper=stock0+C.DT*np.cumsum(available-split*minimum_blast[:,None],axis=0)
+    low=np.asarray(C.CAPACITY)*C.POLICY['plan'][0]-C.POLICY['stock_tolerance']
+    unavoidable=np.flatnonzero((upper<low).any(axis=1))
+    result.update(bound_available=True,normal_plan_infeasible_proven=bool(len(unavoidable)),
+        planning_low_step_indices=unavoidable.tolist(),
+        optimistic_inventory_upper_m3=upper.tolist(),
+        basis='normal_aggregate_ramp_and_maximum_optional_gas; all_omitted_constraints_make_bound_optimistic')
+    return result
+
+
 def optimize_daily(bundle,data,origins,quick=False,progress=None):
     control=validate_dispatch_calibration(bundle)
     validate_process_resource(bundle)
@@ -908,9 +938,25 @@ def optimize_daily(bundle,data,origins,quick=False,progress=None):
                 'available_m3h':bridge_available,'split':bridge_split,'vent_m3':bridge_vent,
                 'resource_components':bridge_source},
             state_reset_m3=anchor-previous_state if previous_state is not None else None)
+        context['state_transition']={
+            'inventory_source':'observed_at_publication','observed_at':str(issue),
+            'previous_plan_stock_at_issue_m3':None if previous_state is None else previous_state.copy(),
+            'command_source':('previous_published_command' if previous_gas is not None else
+                              'observed_prefix_initialization' if np.isfinite(q0).all() else 'unobserved_initial_command'),
+            'reset_is_material_flow':False,'reset_is_identified_resource_error':False,
+            'historical_anchor_matches_optimized_execution':None}
         inventory=bool(np.isfinite(bridge).all() and inputs["resource_mode"]=="net_inferred")
+        precheck=inventory_feasibility_bound(inputs,initial,beta,bridge) if inventory else {
+            'bound_available':False,'normal_plan_infeasible_proven':False}
+        context['inventory_precheck']=precheck
         options=dict(mapping=mapping,support=support,scenarios=scenarios,risk=inventory_risk(data,issue))
-        solution,solver=solve_milp(inputs,initial,beta,bridge,price,inventory=inventory,**options)
+        if precheck['normal_plan_infeasible_proven']:
+            solution=None
+            solver={'status':'INFEASIBLE_RESOURCE_UPPER_BOUND','message':'乐观库存上界仍低于规划下限，直接进入显式恢复导出',
+                'status_code':None,'seconds':0.,'inventory_constraints':True,'normal_solve_skipped':True,
+                'infeasibility_scope':'current_inferred_resource_model'}
+        else:
+            solution,solver=solve_milp(inputs,initial,beta,bridge,price,inventory=inventory,**options)
         fallback=not inventory or solution is None or bool(warnings)
         if solution is None and inventory:
             recovery_options=dict(options,risk=None)
@@ -971,6 +1017,11 @@ def optimize_daily(bundle,data,origins,quick=False,progress=None):
              "official_acceptance_status":"unknown",
              "failed_publications":failures,"fallback_publications":sum(d["fallback_used"] for d in days),
              "group_refined_publications":sum(d.get("refinement",{}).get("applied",False) for d in days),
+             "normal_solves_skipped_by_proven_bound":sum(d['solver'].get('normal_solve_skipped',False) for d in days),
+             "state_transition_basis":"daily_observed_reanchor_with_published_command_continuity",
+             "state_reset_is_identified_resource_error":False,
+             "maximum_residual_observation_age_hours":max((d['reserve']['observation_age_hours'] for d in days
+                 if 'observation_age_hours' in d.get('reserve',{})),default=None),
              "plan_revenue_cny":sum(d["plan_revenue_cny"] for d in days),
              "planned_vent_m3":sum(d["planned_vent_m3"] for d in days),
              "holder_boundary_diagnostics":{
