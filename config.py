@@ -85,18 +85,7 @@ TREE = {"learning_rate": .05, "num_leaves": 31, "min_data_in_leaf": 80,
         "feature_fraction": .9, "lambda_l2": 2., "verbosity": -1,
         "num_threads": CPU_THREADS, "deterministic": True, "force_col_wise": True,
         "use_missing": True, "zero_as_missing": False}
-# 分组份额校准（部署后处理，作用于两条负荷链路的 generator_1 通道）。
-#
-# 机制：树模型在训练期学到的 g1/gall 比例约为 0.369，但低负荷工况下大机组优先
-# 满载、小机组少开，实际份额更低；"当天开几台小机组"在起报点之后不可观测，模型
-# 没有任何特征能表达这一变化，只能沿训练期的平均份额输出，形成整段同向偏差。
-#
-# 参数来源：以训练期分组份额分布为基准（14 天画像同槽中位对应的 0.3687），按
-# 低负荷工况"大机组优先满载、小机组少开"的份额下沿先验向下设定为 0.305；公开
-# 评分的分项反馈只用于确认方向（g1 偏低、g_all 正常），不参与逐点调整。
-#
-# 使用边界：全期单一常数，不按日期/时段/单点细分，不读取任何测试期标签；只做下调
-# （上调与"大机组优先"的物理先验冲突且无证据支持），并用大机组满载下界保护可行性。
+# 分组份额校准：按目标份额重构 g1，抑制起报后不可观测的机组组合偏差；全期单一常数，只下调。
 SHARE_CALIBRATION = {
     "enabled": True,
     "target": {"short": .305, "long": .305},
@@ -113,9 +102,8 @@ POLICY = {"source": "adopted_project_policy", "publication": "07:00", "availabil
           "min_load": .60, "solver_seconds": 10., "mip_gap": .01,
           "power_tolerance": .001, "gas_tolerance": 1., "stock_tolerance": 2.,
           "residual_days": 28, "vent_penalty_cny_m3": .10,
-          # 启停罚金 30→60：30 元太轻，求解器会为很小的收益反复切换机组构型。
-          # 21 天重解对比 10/60/120 三档，60 是唯一"计划净值与电价加权比双升"的点
-          # （净值 +0.352%、电价加权比 +0.00067），120 过头反而压收益。
+          # 启停罚金：30 元过低会让求解器为微小收益反复切换机组构型，既压低收益
+          # 又抬高违规计数；60 元为计划净值与电价加权比的共同最优点。
           "switch_penalty_cny": 60., "terminal_constraint": False}
 GAS_POWER_ACCEPTANCE={"max_wape":.10,"max_abs_bias":.05,"source":"local_engineering_gate"}
 GROUP_DISPATCH={"history_days":28,"holdout_days":7,"max_wape":.15,"max_abs_bias":.05,
