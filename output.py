@@ -161,22 +161,9 @@ def save_models(root,short,long,resource,contract=None):
           "runtime":{name:importlib.metadata.version(name) for name in ("numpy","pandas","lightgbm","scipy","scikit-learn")},
           "contract":contract or {}}
     meta["load"]=_save_load_bundles(root,short,long)
-    folder=root/"resource"
-    folder.mkdir(parents=True,exist_ok=True)
-    records={}
-    for name,model in resource.models.items():
-        path=folder/(name+".txt")
-        path.write_text(model.model_to_string(),encoding="utf-8")
-        records[name]={"file":f"resource/{name}.txt","sha256":file_hash(path)}
-    meta["resource"]={"features":resource.features,"train_end":resource.train_end,"beta":resource.beta,
-                       "diagnostics":resource.diagnostics,"models":records}
-    from main_opt import validate_process_resource
-    validate_process_resource(resource)
-    meta['resource']['process_meta']=resource.process_meta
-    if resource.process_meta['available']:
-        path=folder/'shared_process.txt'
-        path.write_text(resource.process_model.model_to_string(),encoding='utf-8')
-        meta['resource']['process_model']={'file':'resource/shared_process.txt','sha256':file_hash(path)}
+    meta["resource"]=save_resource(root,resource)
+    if resource.bootstrap is not None:
+        meta['bootstrap_resource']=save_resource(root/'bootstrap',resource.bootstrap)
     write_json(root/"model_meta.json",meta)
     return meta
 
@@ -189,7 +176,36 @@ def load_models(run):
     if meta.get("preprocessing_sha256") not in (None,file_hash(C.CODE_ROOT/"data_cleaning/pipeline.py")):
         raise ValueError("预处理实现已改变，禁止以新特征变换加载旧模型")
     bundles=_load_bundles(root,meta)
-    r=meta["resource"]
+    resource=load_resource(root,meta['resource'])
+    if 'bootstrap_resource' in meta:
+        resource.bootstrap=load_resource(root/'bootstrap',meta['bootstrap_resource'])
+    return (*bundles,resource,meta)
+
+
+
+def save_resource(root,resource):
+    root=Path(root)
+    folder=root/"resource"
+    folder.mkdir(parents=True,exist_ok=True)
+    records={}
+    for name,model in resource.models.items():
+        path=folder/(name+".txt")
+        path.write_text(model.model_to_string(),encoding="utf-8")
+        records[name]={"file":f"resource/{name}.txt","sha256":file_hash(path)}
+    record={"features":resource.features,"train_end":resource.train_end,"beta":resource.beta,
+                       "diagnostics":resource.diagnostics,"models":records}
+    from main_opt import validate_process_resource
+    validate_process_resource(resource)
+    record['process_meta']=resource.process_meta
+    if resource.process_meta['available']:
+        path=folder/'shared_process.txt'
+        path.write_text(resource.process_model.model_to_string(),encoding='utf-8')
+        record['process_model']={'file':'resource/shared_process.txt','sha256':file_hash(path)}
+    return record
+
+
+def load_resource(root,r):
+    root=Path(root)
     if "group_mapping" not in r["diagnostics"]:
         raise ValueError("新版归档必须包含分组气电标定和留出验证")
     resource=ResourceBundle(features=r["features"],train_end=r["train_end"],beta=r["beta"],diagnostics=r["diagnostics"])
@@ -213,8 +229,7 @@ def load_models(run):
         if model.feature_name()!=resource.features:
             raise ValueError("资源特征契约错误")
         resource.models[name]=model
-    return (*bundles,resource,meta)
-
+    return resource
 
 def prediction_frame(origins,pred):
     out={"datetime":pd.DatetimeIndex(origins).strftime("%Y-%m-%d %H:%M:%S")}
@@ -276,7 +291,8 @@ def verify_run(root):
     evidence=[]
     for day in days:
         p,q=np.asarray(day["power"]),np.asarray(day["gas"])
-        evidence.extend(np.column_stack((q,p[:,:4].sum(axis=1),p.sum(axis=1))).tolist())
+        mask=np.asarray(day.get('export_mask',np.ones(len(q),bool)),bool)
+        evidence.extend(np.column_stack((q,p[:,:4].sum(axis=1),p.sum(axis=1)))[mask].tolist())
     linked=len(evidence)==len(exported) and np.allclose(exported.iloc[:,1:].to_numpy(),np.array(evidence),atol=.000002,rtol=0.)
     sequence=validate_plan_sequence(days)
     actual=bool(days) and all(x["passed"] for x in constraints) and sequence["passed"]
@@ -286,6 +302,10 @@ def verify_run(root):
     source_ok=all((source/name).is_file() and file_hash(source/name)==digest
                   for name,digest in fingerprint.items())
     checked=verify_zip(root)
+    if report.get('full_window'):
+        files['configured_full_window']=bool(origins.equals(pd.date_range(C.TEST_START,C.TEST_END,freq='15min')) and
+            effective.equals(pd.date_range(C.OPT_START,C.OPT_END,freq='15min')))
+        files['passed'] &= files['configured_full_window']
     return {"archive_passed":bool(files["passed"] and linked and source_ok and checked["passed"]),
             "source_passed":source_ok,"zip":checked,
             "constraints_passed":actual,"files":files,"csv_evidence_equal":linked,

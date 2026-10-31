@@ -176,16 +176,22 @@ def reload_check(ctx,short,long,resource,data,origins,training_contract=None):
         z=main_opt.predict_process_resource(loaded_r,data,issue)
         differences['process_resource']=float(np.max(np.abs(a-z)))
         if differences['process_resource']>.000001:raise ValueError('资源过程模型保存重载不一致')
+    if resource.bootstrap is not None:
+        issue=pd.Timestamp(C.OPT_START).normalize()-pd.Timedelta(days=1)+pd.Timedelta(hours=7)
+        a=main_opt.forecast_resources(resource.bootstrap,data,issue)
+        z=main_opt.forecast_resources(loaded_r.bootstrap,data,issue)
+        differences['bootstrap_resource']=float(np.max(np.abs(a['available']-z['available'])))
+        if differences['bootstrap_resource']>1e-6:raise ValueError('首端资源模型保存重载不一致')
     return differences
 
 
-def infer(ctx,quick=False,reuse=None,opt_only=False):
+def infer(ctx,quick=False,reuse=None,opt_only=False,train_bootstrap=False):
     tick=time.perf_counter()
     if reuse:
         short,long,resource,meta=output.load_models(reuse)
         if not ctx["experimental"] and (meta.get("training_quick") or meta.get("contract",{}).get("role")!="final"):
             raise ValueError("正式运行不得复用quick或历史开发模型")
-        LOG.info("严格复用新版兼容模型，不训练或重新标定：%s",reuse)
+        LOG.info("复用兼容负荷与常规资源模型：%s",reuse)
     else:
         meta={}
         train=prepare_data(cutoff=C.TRAIN_END)
@@ -202,6 +208,21 @@ def infer(ctx,quick=False,reuse=None,opt_only=False):
     if data.labels.loc[C.TEST_START:C.TEST_END].notna().any().any():
         raise ValueError("测试标签隔离失败")
     view=prediction_view(data,C.TEST_START)
+    bootstrap_issue=pd.Timestamp(C.OPT_START).normalize()-pd.Timedelta(days=1)+pd.Timedelta(hours=7)
+    bootstrap_trained=False
+    bootstrap_seconds=0.
+    if resource.bootstrap is None:
+        if opt_only and not train_bootstrap:
+            raise ValueError('首端资源模型缺失；opt仅重算时需复用含首端模型的运行，首次可显式--train-bootstrap')
+        cutoff=bootstrap_issue-pd.Timedelta(minutes=C.STEP)
+        LOG.info('首端预案资源训练：截止%s；不重训负荷模型',cutoff)
+        bootstrap_tick=time.perf_counter()
+        resource.bootstrap=main_opt.fit_resources(prepare_data(cutoff=cutoff),quick,LOG.info)
+        bootstrap_seconds=time.perf_counter()-bootstrap_tick
+        resource.bootstrap.diagnostics['training_source']=ctx['hashes']
+        bootstrap_trained=True
+    if not ctx['experimental'] and resource.bootstrap.diagnostics['training_budget']['quick']:
+        raise ValueError('正式运行不得复用quick首端资源模型')
     reload=reload_check(ctx,short,long,resource,view,origins,meta.get("contract"))
     if opt_only:
         source=Path(reuse)
@@ -219,7 +240,11 @@ def infer(ctx,quick=False,reuse=None,opt_only=False):
     else:
         LOG.info("推理：%s个起报点；测试标签不计算本地分数",len(origins))
         ps,pl=main_s.predict_deployed(short,long,view,origins,C.LOAD_RECIPE)
-    schedule,days,opt=main_opt.optimize_daily(resource,view,origins,quick,LOG.info)
+    effective_end=origins[-1].normalize()+pd.Timedelta(days=1,hours=7) if quick else pd.Timestamp(C.OPT_END)
+    effective=pd.date_range(C.OPT_START,effective_end,freq='15min')
+    dispatch_tick=time.perf_counter()
+    schedule,days,opt=main_opt.optimize_daily(resource,view,origins,quick,LOG.info,(C.OPT_START,str(effective_end)))
+    dispatch_seconds=time.perf_counter()-dispatch_tick
     opt["price_weighted_load"]=price_weighted_load(days)
     if opt_only:
         s=schedule.copy()
@@ -227,10 +252,11 @@ def infer(ctx,quick=False,reuse=None,opt_only=False):
         s.to_csv(ctx["root"]/"opt_result.csv",index=False,float_format="%.6f",encoding="utf-8")
     else:
         output.write_results(ctx["root"],origins,ps,pl,schedule)
-    coverage=validate_result_files(ctx["root"],origins,schedule.datetime)
+    coverage=validate_result_files(ctx["root"],origins,effective)
     if not coverage["passed"]:
         raise ValueError("三表导出契约未通过："+json.dumps(coverage,ensure_ascii=False))
-    full=len(origins)==2016 and len(schedule)==2016 and len(days)==21
+    full=bool(origins.equals(pd.date_range(C.TEST_START,C.TEST_END,freq='15min')) and
+              pd.DatetimeIndex(schedule.datetime).equals(pd.date_range(C.OPT_START,C.OPT_END,freq='15min')))
     passed=bool(full and not ctx["experimental"] and coverage["passed"] and opt["constraint_validation_passed"])
     report={"run_id":ctx["run_id"],"schema":C.SCHEMA,"mode":"opt" if opt_only else "infer",
             "status":"COMPLETE" if passed else "COMPLETE_WITH_CONSTRAINT_FAILURES" if not opt["constraint_validation_passed"] else "EXPERIMENT_COMPLETE",
@@ -241,7 +267,11 @@ def infer(ctx,quick=False,reuse=None,opt_only=False):
             "threshold_basis":{"capacity":"data_dictionary.xlsx 数据说明!A21",
                 "safety_ratio":"contest_problem_statement","planning_margin":"project_policy",
                 "anchor_disqualification_official_rule":"unspecified"},
-            "upload_ready":coverage["passed"],"training_performed":not bool(reuse),"prediction_performed":not opt_only,
+            "upload_ready":coverage["passed"],"training_performed":not bool(reuse) or bootstrap_trained,
+            "load_training_performed":not bool(reuse),"bootstrap_training_performed":bootstrap_trained,
+            "bootstrap_train_end":resource.bootstrap.train_end,"prediction_performed":not opt_only,
+            "bootstrap_training_seconds":bootstrap_seconds,"dispatch_seconds":dispatch_seconds,
+            "opt_result_reused":False,
             "reused_models_from":str(reuse) if reuse else None,"recipe":short.recipe,
             "share_calibration":C.SHARE_CALIBRATION,
             "prediction_score":{"status":"NO_OBSERVED_TEST_TRUTH","score":None,
@@ -331,6 +361,15 @@ def self_check(ctx):
         'bridge':{'gas_m3h':[1100000.,0.,0.],'available_m3h':[550000.,550000.],'split':[.5,.5]}}
     ramp_check=validate_day(ramp_day)
     assert ramp_check['passed'] and np.isclose(ramp_check['details']['max_aggregate_change_mw'][1],66.)
+    from copy import deepcopy
+    extended=deepcopy(ramp_day)
+    for key in ('gas','power','available','split','vent','optional_caps'):
+        extended[key]=np.tile(np.asarray(ramp_day[key])[0],(163,1))
+    extended['stocks']=np.tile(stock,(164,1))
+    extended['times']=pd.date_range(ramp_issue+pd.Timedelta(minutes=15),periods=163,freq='15min')
+    assert validate_day(extended)['passed']
+    broken=deepcopy(extended);broken['power'][96,0]+=10.
+    assert not validate_day(broken)['passed']
     solved,solver=main_opt.solve_milp(inputs,previous,beta,stock,np.full(96,.53),
                                       support=support,scenarios=[beta*10.])
     if solved is None:
@@ -402,7 +441,7 @@ def self_check(ctx):
     controlled['joint_control']['price_frontier']={
         'benefit_floor_cny':float(controlled['prices']@controlled['power'].sum(axis=1)*1000*C.DT)}
     if not validate_day(controlled)['passed']:
-        raise AssertionError('联合控制独立核验未通过')
+        raise AssertionError(validate_day(controlled))
     assert validate_day(controlled)['details']['historical_gas_support']['outside_steps']==96
     assert validate_day(controlled)['details']['mapping_sensitivity']['mapped_capacity_exceedances']>0
     controlled['joint_control']['reserve_risk']={'target_m3':[150000.,100000.],
@@ -475,6 +514,7 @@ def main(argv=None):
     p.add_argument("--quick",action="store_true")
     p.add_argument("--experiment",action="store_true")
     p.add_argument("--reuse-run",type=Path)
+    p.add_argument("--train-bootstrap",action="store_true",help="首次生成2111行时，显式训练首端预案所需的更早资源模型")
     p.add_argument("--run-dir",type=Path)
     p.add_argument("--run-id")
     p.add_argument("--threads",type=int,default=C.CPU_THREADS,help="CPU线程总预算，默认16，避免嵌套过量并行")
@@ -510,7 +550,7 @@ def main(argv=None):
         elif args.command=="run":
             report=run_backtest(ctx,args.quick)
         else:
-            report=infer(ctx,args.quick,args.reuse_run,args.command=="opt")
+            report=infer(ctx,args.quick,args.reuse_run,args.command=="opt",args.train_bootstrap)
         LOG.info("完成：%s；本地可提交=%s",report["status"],report.get("submittable",False))
         return 2 if report.get("status")=="COMPLETE_WITH_CONSTRAINT_FAILURES" else 0
     except Exception as exc:

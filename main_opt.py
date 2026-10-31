@@ -24,6 +24,7 @@ class ResourceBundle:
     diagnostics: dict = field(default_factory=dict)
     process_model: object = None
     process_meta: dict = field(default_factory=dict)
+    bootstrap: object = None
 
 
 def resource_labels(data):
@@ -342,7 +343,7 @@ def calibrate_optional_prefix(pred,data,issue):
     return diagnostics
 
 
-def forecast_resources(bundle,data,issue,base=None):
+def forecast_resources(bundle,data,issue,base=None,steps=96):
     issue = pd.Timestamp(issue)
     if pd.Timestamp(bundle.train_end) >= issue:
         raise ValueError("资源模型训练截止越过发布时间")
@@ -358,7 +359,29 @@ def forecast_resources(bundle,data,issue,base=None):
     missing = [name for name in ("budget_blast","budget_coke","budget_converter") if name not in pred]
     if missing:
         raise ValueError("资源代理模型缺失："+",".join(missing))
-    times = pd.date_range(issue+pd.Timedelta(minutes=15),periods=96,freq="15min")
+    if not 1<=steps<=163:
+        raise ValueError("调度跨度必须在1至163步之间")
+    times = pd.date_range(issue+pd.Timedelta(minutes=15),periods=steps,freq="15min")
+    tail_diag={"applied":False}
+    if steps>96:
+        history=resource_labels(data.prefix(issue)).loc[issue-pd.Timedelta(days=C.OPT_TAIL['history_days']):]
+        slot=history.index.hour*4+history.index.minute//15
+        target=times[96:].hour*4+times[96:].minute//15
+        tail_diag={"applied":True,"source":C.OPT_TAIL['source'],"first_horizon":97,
+                   "last_horizon":steps,"max_observed_at":str(issue),"components":{}}
+        for name,values in pred.items():
+            valid=history[name].dropna()
+            if valid.empty:
+                raise ValueError("尾部画像缺少合法历史："+name)
+            profile=history[name].groupby(slot).median()
+            tail=profile.reindex(target).fillna(float(valid.median())).to_numpy()
+            pred[name]=np.r_[values,tail]
+            tail_diag['components'][name]={"history_start":str(valid.index[0]),
+                "history_end":str(valid.index[-1]),"samples":len(valid),
+                "slot_samples":history[name].groupby(slot).count().to_dict(),
+                "profile_m3h":profile.fillna(float(valid.median())).to_dict(),"fallback_median_m3h":float(valid.median())}
+    else:
+        pred={name:values[:steps] for name,values in pred.items()}
     reserve,diag = residual_profile(data,issue,times)
     net = all(x in pred for x in ("blast_13","blast_45","known_demand")) and np.isfinite(reserve).all()
     if net:
@@ -374,7 +397,7 @@ def forecast_resources(bundle,data,issue,base=None):
             if np.isfinite(heaters).all():
                 inferred=predict_process_resource(bundle,data,issue)
                 prior=pred['blast_13'].copy()
-                pred['blast_13']=inferred[:,:3].sum(axis=1)
+                pred['blast_13'][:min(steps,96)]=inferred[:min(steps,96),:3].sum(axis=1)
                 g=np.column_stack((pred['blast_13'],pred['blast_45']))
                 total=g.sum(axis=1)
                 process_diag={"applied":True,"basis":"shared_process_LGBM_inferred", "missing_furnaces":missing_furnaces,
@@ -400,7 +423,7 @@ def forecast_resources(bundle,data,issue,base=None):
             b = known[["gas_blast_furnace_4","gas_blast_furnace_5"]].sum(axis=1,min_count=2)
             inferred_ratio = (a/(a+b)).dropna()
             ratio = float(inferred_ratio.median()) if len(inferred_ratio) else .5
-        split = np.tile([ratio,1.-ratio],(96,1))
+        split = np.tile([ratio,1.-ratio],(steps,1))
         available = split*pred["budget_blast"][:,None]
         mode = "historical_consumption_proxy"
     optional_diag=calibrate_optional_prefix(pred,data,issue)
@@ -408,7 +431,8 @@ def forecast_resources(bundle,data,issue,base=None):
     return {"issued_at":str(issue),"times":times,"available":available,"split":split,
             "optional_caps":optional,"budget_blast":pred["budget_blast"],"resource_mode":mode,
             "reserve":diag,"components":pred,"max_observed_at":str(issue),"process_resource":process_diag,
-            "optional_consumption_calibration":optional_diag}
+            "optional_consumption_calibration":optional_diag,"tail_resource":tail_diag,
+            "resource_train_end":bundle.train_end}
 
 
 def bridge_resources(bundle,data,issue,inputs):
@@ -527,26 +551,23 @@ def _solve_joint(inputs,initial,beta,stock0,prices,inventory=True,export_shortfa
         raise ValueError('库存模型不得借用导出缺气松弛')
     if recovery_export and (not inventory or export_shortfall):
         raise ValueError('库存恢复只允许作为显式的库存轨迹导出分支')
-    n=96; cap=np.asarray(C.UNITS);beta=np.asarray(beta)
-    p=np.arange(576).reshape(n,6);on=np.arange(576,1152).reshape(n,6)
-    q=np.arange(1152,1440).reshape(n,3);h=np.arange(1440,1634).reshape(97,2)
-    switch=np.arange(1634,2210).reshape(n,6)
-    err=np.arange(2210,2306);change=np.arange(2306,2402)
-    tail=2402
-    shortfall=np.arange(2403,2499) if export_shortfall else None
-    base_size=2499 if export_shortfall else 2403
-    reserve=np.arange(base_size,base_size+192).reshape(96,2) if inventory and risk is not None else None
-    size=base_size+192 if reserve is not None else base_size
-    recovery_slack=np.arange(size,size+192).reshape(96,2) if recovery_export else None
-    if recovery_export:size+=192
-    unsafe_step=np.arange(size,size+96) if recovery_export else None
-    if recovery_export:size+=96
-    safety_gap=np.arange(size,size+192).reshape(96,2) if recovery_export else None
-    if recovery_export:size+=192
-    recovery_vent=np.arange(size,size+192).reshape(96,2) if recovery_export else None
-    if recovery_export:size+=192
-    vent_active=np.arange(size,size+192).reshape(96,2) if recovery_export else None
-    if recovery_export:size+=192
+    n=len(prices); cap=np.asarray(C.UNITS);beta=np.asarray(beta)
+    cursor=0
+    def allocate(shape):
+        nonlocal cursor
+        count=int(np.prod(shape));ids=np.arange(cursor,cursor+count).reshape(shape)
+        cursor+=count
+        return ids
+    p=allocate((n,6));on=allocate((n,6));q=allocate((n,3));h=allocate((n+1,2))
+    switch=allocate((n,6));err=allocate((n,));change=allocate((n,));tail=int(allocate((1,))[0])
+    shortfall=allocate((n,)) if export_shortfall else None
+    reserve=allocate((n,2)) if inventory and risk is not None else None
+    recovery_slack=allocate((n,2)) if recovery_export else None
+    unsafe_step=allocate((n,)) if recovery_export else None
+    safety_gap=allocate((n,2)) if recovery_export else None
+    recovery_vent=allocate((n,2)) if recovery_export else None
+    vent_active=allocate((n,2)) if recovery_export else None
+    size=cursor
     cost=np.zeros(size);lo=np.zeros(size);hi=np.full(size,np.inf);integer=np.zeros(size)
     hi[p]=cap;hi[on]=1.;integer[on]=1.;hi[switch]=1.
     hi[q[:,1:]]=inputs['optional_caps']
@@ -562,7 +583,7 @@ def _solve_joint(inputs,initial,beta,stock0,prices,inventory=True,export_shortfa
             # 已知不安全初态可能无法在首步恢复；软变量只衡量失败，独立核验仍按原边界判定。
             lo[h[1:]]=-np.inf
             hi[h[1:]]=np.asarray(C.CAPACITY)*.90
-            cost[recovery_slack]=max(float(np.max(prices)),.01)*1000.*beta[0]*96.
+            cost[recovery_slack]=max(float(np.max(prices)),.01)*1000.*beta[0]*n
             hi[unsafe_step]=1.;integer[unsafe_step]=1.
             hi[vent_active]=1.;integer[vent_active]=1.
             cost[recovery_vent]=C.POLICY['vent_penalty_cny_m3']*C.DT
@@ -584,7 +605,7 @@ def _solve_joint(inputs,initial,beta,stock0,prices,inventory=True,export_shortfa
     cost[tail]=float(np.max(prices))*1000*C.DT
     if reserve is not None:
         # 以有限库存的发电机会价值定价风险；保持软目标，不修改逐柜安全边界。
-        cost[reserve]=beta[0]*1000*float(np.max(prices))/96.
+        cost[reserve]=beta[0]*1000*float(np.max(prices))/n
     if export_shortfall:
         hi[q[:,0]]=440./beta[0]
         cost[shortfall]=max(float(np.max(prices)),.01)*1000*C.DT*beta[0]*100.
@@ -721,9 +742,9 @@ def _solve_joint(inputs,initial,beta,stock0,prices,inventory=True,export_shortfa
     if recovery_export:meta['status']='EXPORT_RECOVERY_WITH_REPORTED_VIOLATIONS'
     x=result.x
     if recovery_export:meta['recovery_economic_cost']=float(cost@x)
-    out={'power':x[p],'gas':x[q],'stocks':x[h] if inventory else np.full((97,2),np.nan),
-         'vent':x[recovery_vent] if recovery_export else np.zeros((96,2)),
-         'export_shortfall_m3h':x[shortfall] if export_shortfall else np.zeros(96),
+    out={'power':x[p],'gas':x[q],'stocks':x[h] if inventory else np.full((n+1,2),np.nan),
+         'vent':x[recovery_vent] if recovery_export else np.zeros((n,2)),
+         'export_shortfall_m3h':x[shortfall] if export_shortfall else np.zeros(n),
          'joint_control':{'terminal_resource_excess_mw':float(x[tail]),'group_mapping_used':trusted,
                           'empirical_gas_support':support,'ramp_scenarios':[list(b) for b in scenarios],
                           'reserve_risk':risk,'price_ratio_parameter':price_ratio,'benefit_floor_cny':benefit_floor}}
@@ -772,31 +793,33 @@ def solve_milp(*args, **kwargs):
 
 def fallback_arrays(inputs,previous,beta):
     """最终导出分支保留真实失败；不把不确定柜位补成中位库存。"""
-    p=np.tile(previous,(96,1))
-    q=np.zeros((96,3))
+    n=len(inputs["times"])
+    p=np.tile(previous,(n,1))
+    q=np.zeros((n,3))
     mix=np.column_stack((inputs["budget_blast"],inputs["optional_caps"]))
-    for k in range(96):
+    for k in range(n):
         energy=float(mix[k]@beta)
         if energy>0.:
             q[k]=mix[k]*(p[k].sum()/energy)
         elif beta[0]>0.:
             q[k,0]=p[k].sum()/beta[0]
-    return {"power":p,"gas":q,"stocks":np.full((97,2),np.nan),"vent":np.full((96,2),np.nan)}
+    return {"power":p,"gas":q,"stocks":np.full((n+1,2),np.nan),"vent":np.full((n,2),np.nan)}
 
 
 def _replay_stocks(start,inputs,gas):
+    n=len(gas)
     if not np.isfinite(start).all():
-        return np.full((97,2),np.nan),np.full((96,2),np.nan)
+        return np.full((n+1,2),np.nan),np.full((n,2),np.nan)
     stocks=[np.asarray(start,float)]
     vents=[]
-    for k in range(96):
+    for k in range(n):
         raw=stocks[-1]+C.DT*(inputs["available"][k]-inputs["split"][k]*gas[k,0])
         vent=np.maximum(raw-.90*np.array(C.CAPACITY),0.)/C.DT
         stocks.append(raw-C.DT*vent);vents.append(vent)
     return np.array(stocks),np.array(vents)
 
 
-def optimize_daily(bundle,data,origins,quick=False,progress=None):
+def optimize_daily(bundle,data,origins,quick=False,progress=None,output_window=None):
     control=validate_dispatch_calibration(bundle)
     validate_process_resource(bundle)
     mapping=bundle.diagnostics['group_mapping']
@@ -805,17 +828,34 @@ def optimize_daily(bundle,data,origins,quick=False,progress=None):
     dates=pd.DatetimeIndex(origins).normalize().unique()
     if quick:
         dates=dates[:2]
+    if output_window is not None:
+        start,end=map(pd.Timestamp,output_window)
+        first=start.normalize()+pd.Timedelta(hours=7)
+        if first>=start:
+            first-=pd.Timedelta(days=1)
+        last=dates[-1]+pd.Timedelta(hours=7)
+        dates=pd.date_range(first,last,freq='1D')-pd.Timedelta(hours=7)
+        if bundle.bootstrap is None or pd.Timestamp(bundle.bootstrap.train_end)>=first:
+            raise ValueError('2111行首端预案缺少发布时间之前训练的资源模型')
     base=build_features(data)
     beta=np.asarray(bundle.beta)
     records,days=[],[]
     previous,previous_gas,previous_state=None,None,None
     for date in dates:
         issue=date+pd.Timedelta(hours=7)
-        inputs=forecast_resources(bundle,data,issue,base)
+        active=bundle.bootstrap if output_window is not None and issue==first else bundle
+        control=validate_dispatch_calibration(active)
+        validate_process_resource(active)
+        mapping=active.diagnostics['group_mapping']
+        support=control['support'] if control['support'].get('available') else None
+        scenarios=[x['coefficients_mw_per_m3h'] for x in control['mapping_scenarios']]
+        beta=np.asarray(active.beta)
+        steps=int((end-issue)/pd.Timedelta(minutes=15)) if output_window is not None and date==dates[-1] else 96
+        inputs=forecast_resources(active,data,issue,base,steps=steps)
         price=prices_at(data,inputs["times"])
         warnings=[]
         try:
-            initial,initial_meta=initial_power(data,issue,bundle,previous)
+            initial,initial_meta=initial_power(data,issue,active,previous)
         except ValueError as exc:
             # 首日无可辨识初态时仅作完整导出，并把未知初态作为验收失败。
             initial=np.zeros(6)
@@ -825,7 +865,7 @@ def optimize_daily(bundle,data,origins,quick=False,progress=None):
         anchor=row[list(C.HOLDERS)].to_numpy(float)
         anchor_ok=bool(np.isfinite(anchor).all())
         q0=row[list(C.USE)].to_numpy(float) if previous_gas is None else previous_gas.copy()
-        bridge_available,bridge_split,bridge_source=bridge_resources(bundle,data,issue,inputs)
+        bridge_available,bridge_split,bridge_source=bridge_resources(active,data,issue,inputs)
         if np.isfinite(q0).all() and anchor_ok:
             raw=anchor+C.DT*(bridge_available-bridge_split*q0[0])
             bridge_vent=np.maximum(raw-.9*np.array(C.CAPACITY),0.)
@@ -865,14 +905,17 @@ def optimize_daily(bundle,data,origins,quick=False,progress=None):
             solution["stocks"],solution["vent"]=_replay_stocks(bridge,inputs,solution["gas"])
         day=dict(inputs,**solution,previous_power=initial,anchor=anchor,anchor_observed=anchor_ok,
                  bridge_stock=bridge,beta=beta,solver=solver,initial_state=initial_meta,
-                 gas_power_validation=bundle.diagnostics["gas_power"]["holdout"],
+                 gas_power_validation=active.diagnostics["gas_power"]["holdout"],
                  bridge={"start":str(issue),"end":str(inputs["times"][0]),"gas_m3h":q0,
                          "available_m3h":bridge_available,"split":bridge_split,"vent_m3":bridge_vent,
                          'resource_components':bridge_source},
                  state_reset_m3=anchor-previous_state if previous_state is not None else None,
                  warnings=warnings,fallback_used=fallback)
+        day['export_mask']=np.asarray((inputs['times']>=start)&(inputs['times']<=end) if output_window is not None else np.ones(steps,bool))
+        if output_window is not None:
+            day['export_window']={'start':str(start),'end':str(end)}
         day["validation"]=validate_day(day)
-        mapping=bundle.diagnostics.get("group_mapping")
+        mapping=active.diagnostics.get("group_mapping")
         if mapping is None:
             raise ValueError("归档缺少新版分组标定，不能静默迁移旧模型")
         if mapping["trusted"]:
@@ -884,10 +927,13 @@ def optimize_daily(bundle,data,origins,quick=False,progress=None):
                 day["refinement"]={"applied":False,"reason":"fixed_trajectory_infeasible"}
         else:
             day["refinement"]={"applied":False,"reason":"mapping_holdout_gate_failed"}
-        day["plan_revenue_cny"]=float(np.sum(price*solution["power"].sum(axis=1))*250.)
-        day["planned_vent_m3"]=float(np.nansum(solution["vent"])*C.DT)
-        day["export_resource_shortfall_m3"]=float(np.sum(solution.get("export_shortfall_m3h",0.))*C.DT)
+        exported=day['export_mask']
+        day["plan_revenue_cny"]=float(np.sum(price[exported]*solution["power"][exported].sum(axis=1))*250.)
+        day["planned_vent_m3"]=float(np.nansum(solution["vent"][exported])*C.DT)
+        day["export_resource_shortfall_m3"]=float(np.sum(np.asarray(solution.get("export_shortfall_m3h",np.zeros(steps)))[exported])*C.DT)
         for k,when in enumerate(inputs["times"]):
+            if not exported[k]:
+                continue
             records.append([when,*solution["gas"][k],solution["power"][k,:4].sum(),solution["power"][k].sum()])
         days.append(day)
         previous=solution["power"][-1].copy()
@@ -922,6 +968,9 @@ def optimize_daily(bundle,data,origins,quick=False,progress=None):
              "physical_model_basis":"adopted_project_policy_inferred_resources",
              "field_safety_certified":False,"replay_complete":False,
              "execution_revenue":None,"note":"计划轨迹不冒充官方柜位重建或真实执行收益"}
+    summary['opt_result_reused']=False
+    summary['output_window']=output_window
+    summary['tail_resource_policy']=C.OPT_TAIL
     return schedule,days,summary
 
 
@@ -972,11 +1021,12 @@ def fit_group_mapping(data):
 def refine_group_day(day,mapping,previous=None,smooth=0.,margin=.001):
     if pd.Timestamp(mapping["train_end"])>=pd.Timestamp(day["issued_at"]):
         raise ValueError("分组标定越过发布时刻")
-    power=np.arange(576).reshape(96,6)
-    on=np.arange(576,1152).reshape(96,6)
-    error=np.arange(1152,1248)
-    change=np.arange(1248,1344)
-    size=1344
+    n=len(day["gas"])
+    power=np.arange(6*n).reshape(n,6)
+    on=np.arange(6*n,12*n).reshape(n,6)
+    error=np.arange(12*n,13*n)
+    change=np.arange(13*n,14*n)
+    size=14*n
     cost=np.zeros(size);lower=np.zeros(size);upper=np.full(size,np.inf);integer=np.zeros(size)
     cap=np.array(C.UNITS)
     upper[power]=cap;upper[on]=1.;integer[on]=1.
@@ -989,7 +1039,7 @@ def refine_group_day(day,mapping,previous=None,smooth=0.,margin=.001):
     previous=np.asarray(day["previous_power"] if previous is None else previous)
     total=np.asarray(day["power"]).sum(axis=1)
     rows=LinearRows(size)
-    for k in range(96):
+    for k in range(n):
         rows.add([(power[k,i],1.) for i in range(6)],low=total[k],high=total[k])
         for i in range(6):
             rows.add([(power[k,i],1.),(on[k,i],-cap[i])],high=0.)

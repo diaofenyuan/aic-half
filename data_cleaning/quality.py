@@ -546,12 +546,20 @@ def price_weighted_load(days):
     """独立计算各日计划的电价加权负荷比，不推定线上分数换算。"""
     daily = []
     numerator = denominator = 0.
+    exported_prices=[]
+    load_sum=0.
     for day in days:
         prices = np.asarray(day["prices"], float)
         power = np.asarray(day["power"], float)
         if prices.ndim != 1 or power.shape != (len(prices), len(C.UNITS)) or not np.isfinite(prices).all() or not np.isfinite(power).all():
             raise ValueError("价格指标需要完整的计划电价和逐台负荷")
         load = power.sum(axis=1)
+        mask=np.asarray(day.get('export_mask',np.ones(len(prices),bool)),bool)
+        prices,load=prices[mask],load[mask]
+        if not len(prices):
+            continue
+        exported_prices.extend(prices)
+        load_sum+=float(load.sum())
         num = float(prices @ load)
         den = float(prices.mean() * load.sum())
         ratio = num/den if den > 0. else None
@@ -559,8 +567,9 @@ def price_weighted_load(days):
                       "price_mean": float(prices.mean()), "load_sum_mw": float(load.sum())})
         numerator += num
         denominator += den
+    denominator=float(np.mean(exported_prices))*load_sum if exported_prices else 0.
     return {"ratio": numerator/denominator if denominator > 0. else None,
-            "daily": daily, "basis": "published_plan_price_mean_over_96_steps",
+            "daily": daily, "basis": "exported_effective_grid_price_mean",
             "official_score_mapping": "unknown", "is_executed_revenue": False}
 
 
@@ -577,6 +586,7 @@ def _optional_calibration_checks(day):
     checks['optional_calibration_contract'] &= set(trace)==set(expected['components'])
     if not checks['optional_calibration_contract']:
         return checks
+    n=len(day['gas'])
     issue=pd.Timestamp(day['issued_at']);steps=expected['history_steps']
     start=issue-pd.Timedelta(minutes=(steps-1)*15)
     caps=np.asarray(day['optional_caps'],float)
@@ -586,12 +596,12 @@ def _optional_calibration_checks(day):
         checks['optional_calibration_causality'] &= bool(pd.Timestamp(item['observed_from'])==start and
             pd.Timestamp(item['observed_through'])==issue and not item['future_truth_used'] and not item['used_for_training'])
         valid=bool(observed.shape==(steps,) and np.isfinite(observed).all() and (observed>=0.).all())
-        fidelity=bool(original.shape==(96,) and np.isfinite(original).all() and (original>=0.).all() and
+        fidelity=bool(original.shape==(n,) and np.isfinite(original).all() and (original>=0.).all() and
             item['applied']==valid and not item['missing_consumption_filled'] and item['source']==expected['source'])
         reconstructed=original.copy()
         if valid and fidelity:
             current=float(np.median(observed));reference=float(np.median(original[:steps]));delta=current-reference
-            reconstructed=np.maximum(original+delta*np.exp2(-np.arange(1,97)/expected['decay_steps']),0.)
+            reconstructed=np.maximum(original+delta*np.exp2(-np.arange(1,n+1)/expected['decay_steps']),0.)
             fidelity &= bool(abs(item['observed_median_m3h']-current)<1e-6 and
                 abs(item['original_forecast_reference_m3h']-reference)<1e-6 and
                 abs(item['initial_delta_m3h']-delta)<1e-6 and item['decay_steps']==expected['decay_steps'])
@@ -599,7 +609,7 @@ def _optional_calibration_checks(day):
             fidelity &= item.get('reason')=='CURRENT_LEGAL_CONSUMPTION_OBSERVATION_UNAVAILABLE'
         j={'budget_coke':0,'budget_converter':1}[name]
         values=np.asarray(day['components'][name],float)
-        checks['optional_calibration_fidelity'] &= bool(fidelity and caps.shape==(96,2) and
+        checks['optional_calibration_fidelity'] &= bool(fidelity and caps.shape==(n,2) and
             np.allclose(values,reconstructed,atol=1e-6,rtol=0.) and
             np.allclose(caps[:,j],reconstructed,atol=1e-6,rtol=0.))
     return checks
@@ -614,7 +624,7 @@ def _validate_day(day):
                 "problems": ["MISSING_TRAJECTORY:" + ",".join(absent)]}
     q, p = np.asarray(day["gas"], float), np.asarray(day["power"], float)
     n = len(q)
-    checks["shapes"] = q.shape == (n, 3) and p.shape == (n, 6) and n == 96
+    checks["shapes"] = q.shape == (n, 3) and p.shape == (n, 6) and 1 <= n <= 163
     if not checks["shapes"]:
         return {"passed": False, "checks": checks, "problems": ["TRAJECTORY_SHAPE"]}
     cap, tol = np.asarray(C.UNITS), C.POLICY["power_tolerance"]
@@ -640,10 +650,10 @@ def _validate_day(day):
     checks["gas_power"] = bool(np.isfinite(beta).all() and np.max(np.abs(q@beta-p.sum(axis=1))) <= .01)
     a, split = np.asarray(day["available"], float), np.asarray(day["split"], float)
     h, vent, anchor = np.asarray(day["stocks"], float), np.asarray(day["vent"], float), np.asarray(day["anchor"], float)
-    checks["resource_shapes"] = a.shape == (96, 2) and split.shape == (96, 2)
+    checks["resource_shapes"] = a.shape == (n, 2) and split.shape == (n, 2)
     checks["net_resource_basis"] = day.get("resource_mode") == "net_inferred"
     checks["split"] = bool(np.isfinite(split).all() and (split >= 0.).all() and np.allclose(split.sum(axis=1), 1.))
-    valid_stock = h.shape == (97, 2) and np.isfinite(h).all() and np.isfinite(anchor).all()
+    valid_stock = h.shape == (n+1, 2) and np.isfinite(h).all() and np.isfinite(anchor).all()
     checks["observed_anchor"] = bool(day.get("anchor_observed") and np.isfinite(anchor).all())
     checks["holder_trajectory"] = bool(valid_stock)
     checks["anchor_safety"] = bool(np.isfinite(anchor).all() and
@@ -654,10 +664,10 @@ def _validate_day(day):
     # 这里只补充诊断，完整安全核验仍包含初态，不能据此给予恢复宽限或改写资格。
     safe_low, safe_high = np.array(C.CAPACITY)*.15-stocktol, np.array(C.CAPACITY)*.90+stocktol
     anchor_known = bool(np.isfinite(anchor).all())
-    trajectory_known = bool(h.shape == (97, 2) and np.isfinite(h).all())
+    trajectory_known = bool(h.shape == (n+1, 2) and np.isfinite(h).all())
     stages = {"anchor_known":anchor_known,"pre_command_stock_known":trajectory_known,
-              "post_execution_known_steps":96 if trajectory_known else 0,
-              "post_execution_unknown_steps":0 if trajectory_known else 96,
+              "post_execution_known_steps":n if trajectory_known else 0,
+              "post_execution_unknown_steps":0 if trajectory_known else n,
               "anchor_unsafe_holders":None,"pre_command_unsafe_holders":None,
               "post_execution_unsafe_steps":None,"post_execution_unsafe_steps_by_holder":None}
     if anchor_known:
@@ -673,7 +683,7 @@ def _validate_day(day):
     checks["overflow_rule"] = False
     checks["production_supply"] = False
     checks["planning_bounds"] = False
-    if valid_stock and checks["resource_shapes"] and vent.shape == (96, 2):
+    if valid_stock and checks["resource_shapes"] and vent.shape == (n, 2):
         raw = h[:-1] + C.DT*(a-split*q[:, :1])
         residual = h[1:]-raw+vent*C.DT
         checks["holder_balance"] = bool(np.max(np.abs(residual)) <= stocktol)
@@ -712,8 +722,8 @@ def _validate_day(day):
         checks['bridge_source_causality']=pd.Timestamp(bridge_source['max_observed_at'])<=pd.Timestamp(day['issued_at'])
         if missing.any():
             checks['bridge_source_causality'] &= pd.Timestamp(bridge_source['process_train_end'])<pd.Timestamp(day['issued_at'])
-    optional = np.asarray(day.get("optional_caps", np.full((96, 2), np.nan)), float)
-    checks["optional_gas_caps"] = bool(optional.shape == (96, 2) and np.isfinite(optional).all() and
+    optional = np.asarray(day.get("optional_caps", np.full((n, 2), np.nan)), float)
+    checks["optional_gas_caps"] = bool(optional.shape == (n, 2) and np.isfinite(optional).all() and
                                         (q[:, 1:] <= optional+gastol).all())
     checks.update(_optional_calibration_checks(day))
     checks["export_resource_shortfall"] = bool(np.max(np.asarray(day.get("export_shortfall_m3h",[0.]),float))<=gastol)
@@ -728,8 +738,34 @@ def _validate_day(day):
         checks['missing_process_not_zero_filled']=bool(not process['missing_gas_is_zero'] and not process['raw_process_values_overwritten'])
     if "times" in day:
         times=pd.DatetimeIndex(day["times"])
-        expected=pd.date_range(pd.Timestamp(day["issued_at"])+pd.Timedelta(minutes=15),periods=96,freq="15min")
+        expected=pd.date_range(pd.Timestamp(day["issued_at"])+pd.Timedelta(minutes=15),periods=n,freq="15min")
         checks["effective_grid"]=bool(np.array_equal(times.to_numpy(),expected.to_numpy()))
+    if 'resource_train_end' in day:
+        checks['resource_training_causality']=pd.Timestamp(day['resource_train_end'])<pd.Timestamp(day['issued_at'])
+    if 'export_window' in day:
+        window=day['export_window'];mask=np.asarray(day.get('export_mask',[]),bool)
+        expected_mask=(times>=pd.Timestamp(window['start']))&(times<=pd.Timestamp(window['end']))
+        checks['export_selection']=bool(mask.shape==(n,) and np.array_equal(mask,expected_mask))
+    tail=day.get('tail_resource',{})
+    if n>96 and 'resource_train_end' in day:
+        tail_ok=bool(tail.get('applied') and tail.get('source')==C.OPT_TAIL['source'] and
+            tail.get('first_horizon')==97 and tail.get('last_horizon')==n and
+            pd.Timestamp(tail.get('max_observed_at'))<=pd.Timestamp(day['issued_at']))
+        for name,values in day.get('components',{}).items():
+            detail=tail.get('components',{}).get(name,{})
+            end=pd.Timestamp(detail.get('history_end'))
+            tail_ok &= bool(pd.notna(end) and end<=pd.Timestamp(day['issued_at']) and detail.get('samples',0)>0)
+            profile=detail.get('profile_m3h',{})
+            slots=times[96:].hour*4+times[96:].minute//15
+            reconstructed=np.array([profile.get(int(k),profile.get(str(k),detail.get('fallback_median_m3h',np.nan))) for k in slots],float)
+            if name in ('budget_coke','budget_converter'):
+                trace=day.get('optional_consumption_calibration',{}).get(name,{})
+                if trace.get('applied'):
+                    reconstructed=np.maximum(reconstructed+float(trace['initial_delta_m3h'])*
+                        np.exp2(-np.arange(97,n+1)/C.OPTIONAL_USE_CALIBRATION['decay_steps']),0.)
+            tail_ok &= bool(np.isfinite(reconstructed).all() and
+                np.allclose(np.asarray(values)[96:],reconstructed,atol=1e-6,rtol=0.))
+        checks['tail_resource_causality_and_fidelity']=tail_ok
     fit=day.get("gas_power_validation")
     if fit is not None:
         checks["gas_power_calibration"]=bool(fit["passed"])
@@ -844,14 +880,20 @@ def validate_plan_sequence(days):
         issues=pd.DatetimeIndex([d["issued_at"] for d in days])
         checks["daily_publication_grid"]=bool(issues.equals(pd.date_range(issues[0],periods=len(days),freq="1D")))
         times=pd.DatetimeIndex([t for d in days for t in d["times"]])
-        expected=pd.date_range(issues[0]+pd.Timedelta(minutes=15),periods=len(days)*96,freq="15min")
+        expected=pd.date_range(issues[0]+pd.Timedelta(minutes=15),periods=len(times),freq="15min")
         checks["effective_grid"]=bool(times.equals(expected))
+        if 'export_window' in days[0]:
+            window=days[0]['export_window']
+            exported=pd.DatetimeIndex([t for d in days for t,m in zip(d['times'],d['export_mask']) if m])
+            checks['export_grid']=bool(all(d.get('export_window')==window for d in days) and
+                exported.equals(pd.date_range(window['start'],window['end'],freq='15min')))
         for prior,current in zip(days,days[1:]):
-            power=np.asarray(prior["power"],float)[-1]
-            gas=np.asarray(prior["gas"],float)[-1]
+            index=pd.DatetimeIndex(prior['times']).get_loc(pd.Timestamp(current['issued_at']))
+            power=np.asarray(prior["power"],float)[index]
+            gas=np.asarray(prior["gas"],float)[index]
             checks["previous_power_link"] &= bool(np.allclose(power,current["previous_power"],atol=C.POLICY["power_tolerance"],rtol=0.))
             checks["previous_gas_link"] &= bool(np.allclose(gas,current["previous_gas"],atol=C.POLICY["gas_tolerance"],rtol=0.))
-            expected_reset=np.asarray(current["anchor"],float)-np.asarray(prior["stocks"],float)[-2]
+            expected_reset=np.asarray(current["anchor"],float)-np.asarray(prior["stocks"],float)[index]
             actual_reset=np.asarray(current["state_reset_m3"],float)
             checks["stock_reset_link"] &= bool(np.allclose(expected_reset,actual_reset,atol=C.POLICY["stock_tolerance"],rtol=0.,equal_nan=True))
         return {"passed":bool(all(checks.values())),"checks":checks}
@@ -933,8 +975,10 @@ def historical_replay(data,days):
     reset=[]
     for day in days:
         issue=pd.Timestamp(day["issued_at"])
+        n=len(day["times"])
+        exported=np.asarray(day.get("export_mask",np.ones(n,bool)),bool)
         # 当日模型以07:00实测重锚；首段实际差额在闭合后才能供评分使用。
-        required=pd.date_range(issue,periods=98,freq="15min")
+        required=pd.date_range(issue,periods=n+2,freq="15min")
         f=data.frame.reindex(required)
         baseline=f[list(C.USE)].to_numpy(float)
         observed=f[list(C.HOLDERS)].to_numpy(float)
@@ -950,13 +994,16 @@ def historical_replay(data,days):
         else:
             state[:]=np.nan
         known=0
-        for k in range(96):
+        for k in range(n):
             valid=np.isfinite(state).all() and np.isfinite(observed[k+1:k+3]).all() and np.isfinite(baseline[k+1,0])
             if not valid:
-                counts["unknown_steps"]+=1
+                counts["unknown_steps"]+=int(exported[k])
                 state[:]=np.nan
                 continue
             state=state+observed[k+2]-observed[k+1]+C.DT*split[k]*(baseline[k+1,0]-command[k,0])
+            if not exported[k]:
+                state=np.minimum(state,.90*np.array(C.CAPACITY))
+                continue
             lower=.15*np.array(C.CAPACITY)
             low=state < lower-2.
             reference_low=observed[k+2] < lower-2.
