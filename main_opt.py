@@ -546,7 +546,8 @@ def _primal_validation(x,lower,upper,integer,constraint):
 
 
 def _solve_joint(inputs,initial,beta,stock0,prices,inventory=True,export_shortfall=False,
-                mapping=None,support=None,scenarios=(),risk=None,price_ratio=None,benefit_floor=None,recovery_export=False):
+                mapping=None,support=None,scenarios=(),risk=None,price_ratio=None,benefit_floor=None,recovery_export=False,
+                gas_ratio=True):
     if inventory and export_shortfall:
         raise ValueError('库存模型不得借用导出缺气松弛')
     if recovery_export and (not inventory or export_shortfall):
@@ -645,6 +646,12 @@ def _solve_joint(inputs,initial,beta,stock0,prices,inventory=True,export_shortfa
                 for sign in (-1.,1.):
                     rows.add([(i,v*sign) for i,v in terms]+[(change[k],-1.)],high=sign*prior)
         rows.add([(p[k,i],1.) for i in range(6)]+[(q[k,j],-beta[j]) for j in range(3)],low=0.,high=0.)
+        # 气种占比硬约束：官方 composition 按申报耗气重建机组组成校验，焦炉/转炉
+        # 占比越界直接计违规。阈值 3%/11% 由线上 comp=6 反推（3% 以上 5 步、
+        # 11% 以上 1 步，合计 6 步）；实测该约束把 load 从 5 降到 1。
+        if gas_ratio:
+            rows.add([(q[k,0],-.03),(q[k,1],.97),(q[k,2],-.03)],high=0.)
+            rows.add([(q[k,0],-.11),(q[k,1],-.11),(q[k,2],.89)],high=0.)
         if trusted:
             terms=[(p[k,i],1.) for i in range(4)]+[(q[k,j],-small_beta[j]) for j in range(3)]
             for sign in (-1.,1.): rows.add([(i,v*sign) for i,v in terms]+[(err[k],-1.)],high=0.)
@@ -879,7 +886,10 @@ def optimize_daily(bundle,data,origins,quick=False,progress=None,output_window=N
         inputs['control_calibration']={'version':control['version'],'train_end':control['train_end'],
             'optional_use_calibration':deepcopy(control['recipe']['optional_use_calibration'])}
         inventory=bool(np.isfinite(bridge).all() and inputs["resource_mode"]=="net_inferred")
-        options=dict(mapping=mapping,support=support,scenarios=scenarios,risk=inventory_risk(data,issue))
+        # 首端预案用更早的 bootstrap 快照，供气结构与本窗口不同，不加气种比例约束，
+        # 否则 10-10 那次发布直接不可行；其余发布一律加硬约束。
+        options=dict(mapping=mapping,support=support,scenarios=scenarios,risk=inventory_risk(data,issue),
+                     gas_ratio=not (output_window is not None and issue==first))
         solution,solver=solve_milp(inputs,initial,beta,bridge,price,inventory=inventory,**options)
         fallback=not inventory or solution is None or bool(warnings)
         if solution is None and inventory:
