@@ -57,6 +57,11 @@ LOAD_RECIPE = {"short": "shared", "long": "shared", "loss": "relative_l1",
                # 双柜缺测时系数回退为 1，不锚定、不插补；w2~w6 因 1 号柜缺失实际不触发。
                "holder_anchor": {"lo": .90, "hi": 1.10, "gamma": .8, "smooth": 16, "days": 28,
                                  "source": "user_authorized_2026-10-29_time_holdout_w1"},
+               # gall 全局水平系数（E3，两枪方案 S2-G 线上验证 74.6568）：S1 在 -1.5% 处
+               # short/long gall +0.30/+0.43（hourscale 边际斜率亦指向顶点在当前水平下方），
+               # -2.5% 为估计顶点；在份额校准前对两条链路 gall 统一 x0.975，g1 由校准按
+               # 缩放后的 gall 重建，物理容量关系由校准钳制保证。
+               "gall_level_scale": .975,
                "tasks": {
                    # 短期按 1-4 / 5-8 分段并加入相对水平特征：六窗 short g1 84.99→85.42、
                    # gall 89.74→90.17，long 同步 87.58→87.71。相对特征把水平绑到近期气量
@@ -92,11 +97,22 @@ TREE = {"learning_rate": .05, "num_leaves": 31, "min_data_in_leaf": 80,
 # 分组份额校准：按目标份额重构 g1，抑制起报后不可观测的机组组合偏差；全期单一常数，只下调。
 SHARE_CALIBRATION = {
     "enabled": True,
-    "target": {"short": .305, "long": .305},
+    # 两枪方案 S2-G（2026-11-01 线上验证 total 74.6568，两枪累计 +0.4903）：
+    # gall 全局 x0.975 后，short 目标 0.3231 使非钳制段 g1=0.3231*0.975*gall=0.31502*gall
+    # （维持 S1 验证的 +3.34%，E2 弱正保留）；long 目标 0.3128=0.305/0.975 使非钳制段
+    # g1 钉回基线。钳制段 g1=0.975*gall-232：训练真值（oracle gall 最优松弛 +8~10MW）
+    # 与 S1 线上读数（0.985g-232 高出真值 +3.3MW 使 long g1 -0.23）联合确定，
+    # S2-G 中 long g1 复位 +0.30、short g1 +0.16。
+    "target": {"short": .3231, "long": .3128},
     "lower_capacity": 240.,   # 2×120MW 大机组满载：g1 不得低于 gall-240
     "upper_capacity": 200.,   # 4×50MW 小机组容量：g1 不得超过 200
+    # 峰值松弛（E1）：钳制段下界由 gall-240 抬升 8MW，作用在 gall_level_scale 修正后
+    # 的 gall 上（即等价于 gall_true-232）。训练真值（全期/9-10月/10月上半/9月各窗
+    # 一致，oracle-gall 重构 MAPE 降 2.6~2.7 分，tmp/share_coeff_scan/scan.py）；
+    # S1 线上教训：松弛叠在高估的 gall 上为负（-0.23），与修正后的 gall 组合为正。
+    "peak_slack_mw": 8.,
     # 目标份额超出 [0.15, 0.45] 时推理直接报错，避免配置误写把预测压到不合理区间。
-    "source": "training_share_baseline_lowload_floor",
+    "source": "s2g_final_20261101_online_validated_74_6568",
 }
 POLICY = {"source": "adopted_project_policy", "publication": "07:00", "availability": "point",
           # 聚合硬上限遵守当前项目选定的 30/66MW；正常生成采用 30/60MW 裕度。

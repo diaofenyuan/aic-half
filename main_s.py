@@ -516,6 +516,13 @@ def predict_deployed(short, long, prepared, origins, recipe=None):
             frame *= factor[:, None, None]
             frame[:, :, 0] = np.clip(frame[:, :, 0], 0., cap_small)
             frame[:, :, 1] = np.clip(frame[:, :, 1], frame[:, :, 0], frame[:, :, 0]+cap_large)
+    # gall 全局水平系数（E3）：hourscale 线上边际斜率表明 gall 局部高估、指标顶点在
+    # 当前水平下方；在份额校准前统一缩放两条链路的 gall，g1 随后由校准按缩放后的
+    # gall 重建，缩放后的容量关系由校准钳制与 reconcile 保证。
+    gscale=float(recipe.get("gall_level_scale",1.) or 1.)
+    if gscale!=1.:
+        ps[:,:,1]*=gscale
+        pl[:,:,1]*=gscale
     # 分组份额校准放在最后：它按 gall 重构 g1，必须在所有水平/形状后处理之后执行，
     # 否则后续缩放会把目标份额重新拉开。
     ps, pl = calibrate_group_share(ps, pl, recipe.get("share_calibration"))
@@ -560,7 +567,10 @@ def calibrate_group_share(short_pred,long_pred,cfg=None):
 
     参数由 `config.SHARE_CALIBRATION` 给出，只做下调、全期单一常数，不按日期或
     时段细分，也不读取测试期标签。份额下调幅度受 `max_share_drop` 限制，避免配置
-    误写把预测压到不合理区间。
+    误写把预测压到不合理区间。`peak_slack_mw` 把钳制段下界从 gall-240 抬升固定
+    兆瓦数（训练真值显示该下界系统性低估高负荷段 g1；下界抬高后大机组出力
+    gall-g1 仍不超过 240，物理可行），gall>432 时下界超过 upper，clip 自然落在
+    upper=200，仍满足全部容量关系。
     """
     cfg=C.SHARE_CALIBRATION if cfg is None else cfg
     out=[]
@@ -572,11 +582,12 @@ def calibrate_group_share(short_pred,long_pred,cfg=None):
             continue
         lower_cap=float(cfg.get("lower_capacity",240.))
         upper_cap=float(cfg.get("upper_capacity",200.))
+        slack=float(cfg.get("peak_slack_mw",0.) or 0.)
         if not 0.15<=float(target)<=0.45:
             raise ValueError("分组份额目标超出合理区间，拒绝静默使用异常配置")
         gall=arr[:, :, 1]
         proposed=float(target)*gall
-        lower=np.maximum(gall-lower_cap,0.)
+        lower=np.maximum(gall-lower_cap+slack,0.)
         upper=np.minimum(gall,upper_cap)
         arr[:, :, 0]=np.clip(proposed,lower,upper)
         out.append(arr)

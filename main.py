@@ -328,10 +328,12 @@ def self_check(ctx):
     assert np.isclose(price_weighted_load([price_day])['ratio'],350./300.)
     sample=project_load(np.array([[-10.,300.],[210.,0.],[100.,150.],[0.,0.]]))
     assert (sample[:,0]>=0).all() and (sample[:,0]<=200).all() and (sample[:,1]>=sample[:,0]).all()
-    # 分组份额校准：高负荷段被"大机组满载"下界抬起，低负荷段按目标份额，关闭时逐值不变。
+    # 分组份额校准：高负荷段被"大机组满载+峰值松弛"下界抬起，低负荷段按目标份额，关闭时逐值不变。
+    # S2-G 配方（gall x0.975、short 0.3231、long 0.3128、松弛 8MW）下的期望值：
+    # short: 200->0.3231*200=64.62（下界0）；300->96.93（下界76 不绑定）；440->clip(142.164,216,200)=200。
     probe=np.array([[[80.,200.],[120.,300.],[200.,440.]]])
     cal_s,cal_l=main_s.calibrate_group_share(probe,probe,C.SHARE_CALIBRATION)
-    assert np.allclose(cal_s[:,:,0],[61.,91.5,200.],atol=1e-6)
+    assert np.allclose(cal_s[:,:,0],[64.62,96.93,200.],atol=1e-6)
     assert (cal_s[:,:,0]<=cal_s[:,:,1]).all() and (cal_s[:,:,1]<=cal_s[:,:,0]+240.).all()
     off_s,off_l=main_s.calibrate_group_share(probe,probe,{"enabled":False})
     assert np.allclose(off_s,probe) and np.allclose(off_l,probe)
