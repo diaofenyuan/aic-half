@@ -1,4 +1,4 @@
-"""统一入口：新版独立树模型、历史验证、冻结推理与每日调度。"""
+"""负荷预测与发电优化统一入口，组织训练、回测、推理及归档校验。"""
 import argparse
 import json
 import logging
@@ -329,7 +329,7 @@ def self_check(ctx):
     sample=project_load(np.array([[-10.,300.],[210.,0.],[100.,150.],[0.,0.]]))
     assert (sample[:,0]>=0).all() and (sample[:,0]<=200).all() and (sample[:,1]>=sample[:,0]).all()
     # 分组份额校准：高负荷段被"大机组满载+峰值松弛"下界抬起，低负荷段按目标份额，关闭时逐值不变。
-    # S2-G 配方（gall x0.975、short 0.3231、long 0.3128、松弛 8MW）下的期望值：
+    # 当前固定配方（全厂系数 0.975、短长期份额 0.3231/0.3128、下界校正 8MW）的期望值：
     # short: 200->0.3231*200=64.62（下界0）；300->96.93（下界76 不绑定）；440->clip(142.164,216,200)=200。
     probe=np.array([[[80.,200.],[120.,300.],[200.,440.]]])
     cal_s,cal_l=main_s.calibrate_group_share(probe,probe,C.SHARE_CALIBRATION)
@@ -346,7 +346,7 @@ def self_check(ctx):
     support={'available':True,'equations':[[-1.,0.,.02],[0.,-1.,.02],[1.,1.,-.15]],
         'source':'synthetic_historical_share','train_end':'2025-05-31 23:45:00'}
     # 核验仍按聚合硬上限 30/66；正常计划生成沿用 30MW 小机组边界（不排除合法启停），
-    # 总负荷正常生成使用选定回档配方的 60MW 裕度。
+    # 总负荷正常生成保留 60MW 裕度。
     assert C.POLICY['ramp']==(30.,66.) and C.POLICY['generate_ramp']==(30.,60.)
     ramp_issue=pd.Timestamp('2025-06-01 07:00:00')
     ramp_prior=np.array([30.,30.,30.,30.,72.,72.])
@@ -511,15 +511,16 @@ def self_check(ctx):
 
 
 def main(argv=None):
-    p=argparse.ArgumentParser(description="AIC半决赛：独立LightGBM与双柜每日MILP")
-    p.add_argument("command",nargs="?",default="infer",choices=("infer","opt","run","doctor","self-check","verify"))
-    p.add_argument("--quick",action="store_true")
-    p.add_argument("--experiment",action="store_true")
-    p.add_argument("--reuse-run",type=Path)
-    p.add_argument("--train-bootstrap",action="store_true",help="首次生成2111行时，显式训练首端预案所需的更早资源模型")
-    p.add_argument("--run-dir",type=Path)
-    p.add_argument("--run-id")
-    p.add_argument("--threads",type=int,default=C.CPU_THREADS,help="CPU线程总预算，默认16，避免嵌套过量并行")
+    p=argparse.ArgumentParser(description="AIC 半决赛煤气发电量预测与发电优化：LightGBM 预测与双气柜每日 MILP 调度")
+    p.add_argument("command",nargs="?",default="infer",choices=("infer","opt","run","doctor","self-check","verify"),
+                   help="运行模式，默认 infer：训练与推理；opt：仅重算调度；run：历史回测；doctor：数据检查；self-check：契约检查；verify：归档校验")
+    p.add_argument("--quick",action="store_true",help="使用小预算与缩减运行范围，结果写入实验目录")
+    p.add_argument("--experiment",action="store_true",help="将运行结果写入 tmp/tmp_outputs，源码快照写入 tmp_main")
+    p.add_argument("--reuse-run",type=Path,help="已有兼容运行的根目录，仅适用于 infer 或 opt")
+    p.add_argument("--train-bootstrap",action="store_true",help="允许 opt 在归档缺少首端资源模型时训练该模型；其他模型不重训")
+    p.add_argument("--run-dir",type=Path,help="待校验运行的根目录，verify 模式必填")
+    p.add_argument("--run-id",help="新的运行标识，仅允许字母、数字、下划线和连字符，禁止覆盖已有目录")
+    p.add_argument("--threads",type=int,default=C.CPU_THREADS,help="统一 CPU 线程预算，默认为本机逻辑处理器数与 16 的较小值")
     args=p.parse_args(argv)
     if not 1<=args.threads<=min(16,__import__("os").cpu_count() or 1):
         p.error("线程预算必须在1至本机可用16线程范围内")

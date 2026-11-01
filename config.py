@@ -1,4 +1,4 @@
-"""新版配置：赛事事实、项目选择与模型配方集中定义。"""
+"""集中定义数据契约、模型配方、调度参数及其来源。"""
 from pathlib import Path
 import os
 
@@ -43,73 +43,46 @@ HOLDER_INPUT_VERSION = os.environ.get("AIC_HOLDER_VERSION", "historical_raw")
 HOLDER_SCALES = {"historical_raw": (10000., 1.), "official_m3": (1., 1.)}
 LOAD_RECIPE = {"short": "shared", "long": "shared", "loss": "relative_l1",
                "days": 112, "stride": 2, "rounds": 320, "leaves": 31, "seed": 2026,
-               # 画像窗口 14 天：六窗（含 05-06 月爬升窗）实测，窗口越短水平越贴当前，
-               # 14 天长期 g1 86.72 vs 28 天 84.33、42 天 78.77，10 天起开始变差。
+               # 采用近期同日内时段画像，平衡生产水平变化与样本覆盖。
                "profile_days": 14,
-               # 画像时段环形平滑：96 个时段的中位数只有 14 个样本，形状噪声会直接进入
-               # 长期 g1 与 factor 形状。3 点核 0.25/0.5/0.25 在六窗上对 long g1 全窗为正
-               # （86.714→86.753、macro 87.777→87.806）；5 点核过平滑，短期回落。
+               # 环形平滑降低同槽中位数的采样噪声，保持日内形状连续。
                "profile_smooth": [.25, .5, .25],
-               # 柜位平衡锚（用户 2026-10-29 明确授权放宽本条信息边界）：用起报点前已观测的
-               # 发生量-热风炉-高炉用户-混合量与双柜净变化反推“当前发出去的气”，相对其
-               # 28 天滚动中位做有界缩放，抑制整日状态级偏移。w1 时间留出（前段定参、
-               # 后 11 天验证）：short macro 88.456→89.817、long 87.526→87.990。
-               # 双柜缺测时系数回退为 1，不锚定、不插补；w2~w6 因 1 号柜缺失实际不触发。
+               # 水平后处理使用起报点已观测的过程收支与双柜变化，执行有界缩放。
+               # 该估计不作为真实发电耗气；双柜观测无效时系数回退为 1，不插补库存。
                "holder_anchor": {"lo": .90, "hi": 1.10, "gamma": .8, "smooth": 16, "days": 28,
                                  "source": "user_authorized_2026-10-29_time_holdout_w1"},
-               # gall 全局水平系数（E3，两枪方案 S2-G 线上验证 74.6568）：S1 在 -1.5% 处
-               # short/long gall +0.30/+0.43（hourscale 边际斜率亦指向顶点在当前水平下方），
-               # -2.5% 为估计顶点；在份额校准前对两条链路 gall 统一 x0.975，g1 由校准按
-               # 缩放后的 gall 重建，物理容量关系由校准钳制保证。
+               # 两条链路统一缩放全厂负荷，再由分组校准重构小机组组负荷。
                "gall_level_scale": .975,
                "tasks": {
-                   # 短期按 1-4 / 5-8 分段并加入相对水平特征：六窗 short g1 84.99→85.42、
-                   # gall 89.74→90.17，long 同步 87.58→87.71。相对特征把水平绑到近期气量
-                   # 而不是历史画像，避免起报后水平漂移时整段错位；采用依据为历史窗口对照。
-                   # 短期训练窗口 112→84 天（六窗 short macro 87.79→88.04，5/6 窗改善，
-                   # w4 水平偏低探针 +0.6、w6 爬升窗 +1.0；91 天出现 w4 崩到 78.6 的敏感点，
-                   # 故取 12 周整数窗口而不追 77 天峰值）。长期仍用 112 天，水平由短期对齐。
+                   # 短期逐提前量训练，使用近期过程水平、动态变化与缺失状态特征。
                    "short": {"short": "segmented", "feature_set": "memory+dynamics+missingness+relative",
                              "phase": "fixed", "days": 84, "stride": 1, "leaves": 63,
                              "representation": "group_difference", "consistency_alpha": .3,
                              # 短期远端向同起报点长期预测收缩（权重按步递增 1/8..1）。
-                             # 长期水平已完全取自短期（short_level_alpha=1.0），不再有
-                             # “被长期更差的水平拖住”的耦合风险；权重从 0.8 加到 1.0
-                             # 单调改善（六窗 g1 85.61→85.75→85.81→85.87），故取满。
                              "shrink_to_long": 1.0,
                              # 仅在总负荷预测高于训练截止前同槽画像时作单向下调。
                              "profile_upper_guard": {"ratio": 1.02, "scale": 0.97},
                              "decay_days": 28, "learning_rate": .015, "rounds": 1600, "aux_weight_target":"small"},
-                   # 长期全程遮挡下相对误差权重会系统性压低水平（四窗实测 w4 少 85MW），改用等权 L1。
+                   # 长期使用等权 L1，动态水平与冻结日内形状分离建模。
                    "long": {"long": "segmented", "feature_set": "base+relative+mechanism", "phase": "rotating", "stride": 1,
                             "weight_power": 0.0,
-                            # 长期 g1 冻结画像整体下调 5%，
-                            # 四窗实测 85.11→85.95（w1/w2/w3 改善，w4 水平偏高下跌 3.4）。
+                            # 冻结画像仅形成中间基线，部署出口继续执行分组份额重构。
                             "baseline_scale": [0.95, 1.0],
-                            # 长期 generator_all 的水平完全取短期模型（形状仍用长期），
-                            # 六窗 gall 89.60→90.23；短期水平本身已被画像锚定。
+                            # 长期全厂水平由短期均值有界校正，保留长期日内形状。
                             "short_level_alpha": 1.0,
                             "target_kinds": ["direct", "factor"], "tree_weights": [0., 1.]}}}
 TREE = {"learning_rate": .05, "num_leaves": 31, "min_data_in_leaf": 80,
         "feature_fraction": .9, "lambda_l2": 2., "verbosity": -1,
         "num_threads": CPU_THREADS, "deterministic": True, "force_col_wise": True,
         "use_missing": True, "zero_as_missing": False}
-# 分组份额校准：按目标份额重构 g1，抑制起报后不可观测的机组组合偏差；全期单一常数，只下调。
+# 分组份额校准在最终出口重构小机组组负荷，参数不按测试日期或时段细分。
 SHARE_CALIBRATION = {
     "enabled": True,
-    # 两枪方案 S2-G（2026-11-01 线上验证 total 74.6568，两枪累计 +0.4903）：
-    # gall 全局 x0.975 后，short 目标 0.3231 使非钳制段 g1=0.3231*0.975*gall=0.31502*gall
-    # （维持 S1 验证的 +3.34%，E2 弱正保留）；long 目标 0.3128=0.305/0.975 使非钳制段
-    # g1 钉回基线。钳制段 g1=0.975*gall-232：训练真值（oracle gall 最优松弛 +8~10MW）
-    # 与 S1 线上读数（0.985g-232 高出真值 +3.3MW 使 long g1 -0.23）联合确定，
-    # S2-G 中 long g1 复位 +0.30、short g1 +0.16。
+    # 目标份额作用于水平校准后的全厂负荷，随后按大小机组容量限制取值。
     "target": {"short": .3231, "long": .3128},
     "lower_capacity": 240.,   # 2×120MW 大机组满载：g1 不得低于 gall-240
     "upper_capacity": 200.,   # 4×50MW 小机组容量：g1 不得超过 200
-    # 峰值松弛（E1）：钳制段下界由 gall-240 抬升 8MW，作用在 gall_level_scale 修正后
-    # 的 gall 上（即等价于 gall_true-232）。训练真值（全期/9-10月/10月上半/9月各窗
-    # 一致，oracle-gall 重构 MAPE 降 2.6~2.7 分，tmp/share_coeff_scan/scan.py）；
-    # S1 线上教训：松弛叠在高估的 gall 上为负（-0.23），与修正后的 gall 组合为正。
+    # 经验校正将小机组组下界抬升固定功率；该数值不代表额外装机容量。
     "peak_slack_mw": 8.,
     # 目标份额超出 [0.15, 0.45] 时推理直接报错，避免配置误写把预测压到不合理区间。
     "source": "s2g_final_20261101_online_validated_74_6568",
@@ -122,8 +95,7 @@ POLICY = {"source": "adopted_project_policy", "publication": "07:00", "availabil
           "min_load": .60, "solver_seconds": 10., "mip_gap": .01,
           "power_tolerance": .001, "gas_tolerance": 1., "stock_tolerance": 2.,
           "residual_days": 28, "vent_penalty_cny_m3": .10,
-          # 启停罚金：30 元过低会让求解器为微小收益反复切换机组构型，既压低收益
-          # 又抬高违规计数；60 元为计划净值与电价加权比的共同最优点。
+          # 启停成本抑制由微小收益差异引起的机组状态频繁切换。
           "switch_penalty_cny": 60., "terminal_constraint": False}
 GAS_POWER_ACCEPTANCE={"max_wape":.10,"max_abs_bias":.05,"source":"local_engineering_gate"}
 GROUP_DISPATCH={"history_days":28,"holdout_days":7,"max_wape":.15,"max_abs_bias":.05,
